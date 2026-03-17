@@ -254,6 +254,17 @@ fn create_vmm_ioctl_seccomp_rule_hypervisor(
         HypervisorType::Kvm => create_vmm_ioctl_seccomp_rule_common_kvm(),
         #[cfg(feature = "mshv")]
         HypervisorType::Mshv => create_vmm_ioctl_seccomp_rule_common_mshv(),
+        #[allow(unreachable_patterns)]
+        _ => {
+            #[cfg(feature = "kvm")]
+            {
+                create_vmm_ioctl_seccomp_rule_common_kvm()
+            }
+            #[cfg(all(not(feature = "kvm"), feature = "mshv"))]
+            {
+                create_vmm_ioctl_seccomp_rule_common_mshv()
+            }
+        }
     }
 }
 
@@ -478,6 +489,17 @@ fn create_vmm_ioctl_seccomp_rule(
         HypervisorType::Kvm => create_vmm_ioctl_seccomp_rule_kvm(),
         #[cfg(feature = "mshv")]
         HypervisorType::Mshv => create_vmm_ioctl_seccomp_rule_mshv(),
+        #[allow(unreachable_patterns)]
+        _ => {
+            #[cfg(feature = "kvm")]
+            {
+                create_vmm_ioctl_seccomp_rule_kvm()
+            }
+            #[cfg(all(not(feature = "kvm"), feature = "mshv"))]
+            {
+                create_vmm_ioctl_seccomp_rule_mshv()
+            }
+        }
     }
 }
 
@@ -761,6 +783,17 @@ fn create_vcpu_ioctl_seccomp_rule_hypervisor(
         HypervisorType::Kvm => create_vcpu_ioctl_seccomp_rule_kvm(),
         #[cfg(feature = "mshv")]
         HypervisorType::Mshv => create_vcpu_ioctl_seccomp_rule_mshv(),
+        #[allow(unreachable_patterns)]
+        _ => {
+            #[cfg(feature = "kvm")]
+            {
+                create_vcpu_ioctl_seccomp_rule_kvm()
+            }
+            #[cfg(all(not(feature = "kvm"), feature = "mshv"))]
+            {
+                create_vcpu_ioctl_seccomp_rule_mshv()
+            }
+        }
     }
 }
 

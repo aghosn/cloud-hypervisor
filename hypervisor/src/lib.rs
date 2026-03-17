@@ -33,6 +33,9 @@ pub mod kvm;
 #[cfg(feature = "mshv")]
 pub mod mshv;
 
+#[cfg(all(feature = "themis", target_arch = "x86_64"))]
+pub mod themis;
+
 /// Hypervisor related module
 mod hypervisor;
 
@@ -70,6 +73,8 @@ pub enum HypervisorType {
     Kvm,
     #[cfg(feature = "mshv")]
     Mshv,
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    Themis,
 }
 
 pub fn new() -> std::result::Result<Arc<dyn Hypervisor>, HypervisorError> {
@@ -81,6 +86,11 @@ pub fn new() -> std::result::Result<Arc<dyn Hypervisor>, HypervisorError> {
     #[cfg(feature = "mshv")]
     if mshv::MshvHypervisor::is_available()? {
         return mshv::MshvHypervisor::new();
+    }
+
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    if themis::ThemisHypervisor::is_available()? {
+        return themis::ThemisHypervisor::new();
     }
 
     Err(HypervisorError::HypervisorCreate(anyhow!(
@@ -124,6 +134,8 @@ pub enum MpState {
     Kvm(kvm_bindings::kvm_mp_state),
     #[cfg(feature = "mshv")]
     Mshv, /* MSHV does not support MpState yet */
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    Themis,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,6 +151,8 @@ pub enum CpuState {
     Kvm(kvm::VcpuKvmState),
     #[cfg(feature = "mshv")]
     Mshv(mshv::VcpuMshvState),
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    Themis(themis::VcpuThemisState),
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -180,6 +194,8 @@ pub enum IrqRoutingEntry {
     Kvm(kvm_bindings::kvm_irq_routing_entry),
     #[cfg(feature = "mshv")]
     Mshv(mshv_bindings::mshv_user_irq_entry),
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    Themis(themis::ThemisIrqRoutingEntry),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -212,6 +228,8 @@ pub enum StandardRegisters {
     Kvm(kvm_bindings::kvm_riscv_core),
     #[cfg(any(feature = "mshv", feature = "mshv_emulator"))]
     Mshv(mshv_bindings::StandardRegisters),
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    Themis(themis::ThemisStandardRegisters),
 }
 
 macro_rules! set_x86_64_reg {
@@ -225,6 +243,8 @@ macro_rules! set_x86_64_reg {
                         StandardRegisters::Kvm(s) => s.$reg_name = val,
                         #[cfg(any(feature = "mshv", feature = "mshv_emulator"))]
                         StandardRegisters::Mshv(s) => s.$reg_name = val,
+                        #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+                        StandardRegisters::Themis(s) => s.$reg_name = val,
                         #[allow(unreachable_patterns)]
                         _ => { let _ = val; unreachable!("no x86_64 register backend available") },
                     }
@@ -245,6 +265,8 @@ macro_rules! get_x86_64_reg {
                         StandardRegisters::Kvm(s) => s.$reg_name,
                         #[cfg(any(feature = "mshv", feature = "mshv_emulator"))]
                         StandardRegisters::Mshv(s) => s.$reg_name,
+                        #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+                        StandardRegisters::Themis(s) => s.$reg_name,
                         #[allow(unreachable_patterns)]
                         _ => unreachable!("no x86_64 register backend available"),
                     }
