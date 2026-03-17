@@ -7,17 +7,21 @@ use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use libc::{c_ulong, c_void};
 use serde::{Deserialize, Serialize};
 use vfio_ioctls::VfioDeviceFd;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SegmentRegister, SpecialRegisters};
+use crate::arch::x86::{
+    CpuIdEntry, FpuState, LapicState, MsrEntry, SegmentRegister, SpecialRegisters,
+};
 use crate::cpu::{self, HypervisorCpuError, Vcpu, VmExit};
 use crate::hypervisor::{self, Hypervisor};
 use crate::vm::{self, DataMatch, InterruptSourceConfig, VmOps};
-use crate::{CpuState, HypervisorType, HypervisorVmConfig, IoEventAddress, IrqRoutingEntry, MpState};
+use crate::{
+    CpuState, HypervisorType, HypervisorVmConfig, IoEventAddress, IrqRoutingEntry, MpState,
+};
 
 const THHV_IOCTL_MAGIC: u8 = 0xB8;
 const THHV_SCHED_SYNC: u32 = 0;
@@ -441,7 +445,8 @@ impl ThemisHypervisor {
             .open("/dev/thhv")
             .map_err(|e| hypervisor::HypervisorError::HypervisorCreate(e.into()))?;
 
-        let page_size = page_size().map_err(|e| hypervisor::HypervisorError::HypervisorCreate(e.into()))?;
+        let page_size =
+            page_size().map_err(|e| hypervisor::HypervisorError::HypervisorCreate(e.into()))?;
         let fd: OwnedFd = file.into();
         let vp_meta_pages = query_meta_pages(fd.as_raw_fd(), THHV_QUERY_META_PAGES_PER_VP)
             .unwrap_or(THHV_META_PAGES_PER_VP as u64) as usize;
@@ -474,8 +479,9 @@ impl Hypervisor for ThemisHypervisor {
             num_vps: self.get_max_vcpus(),
         };
 
-        let part_fd = ioctl_with_mut_ref_ret_fd(self.fd.as_raw_fd(), THHV_CREATE_PARTITION, &mut create)
-            .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
+        let part_fd =
+            ioctl_with_mut_ref_ret_fd(self.fd.as_raw_fd(), THHV_CREATE_PARTITION, &mut create)
+                .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
 
         let shared_meta = MmapRegion::new_shared_anonymous(self.shared_meta_pages * self.page_size)
             .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
@@ -485,11 +491,13 @@ impl Hypervisor for ThemisHypervisor {
         };
         ioctl_with_mut_ref(part_fd.as_raw_fd(), THHV_SEND_SHARED_META, &mut init)
             .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
+        ioctl_noarg(part_fd.as_raw_fd(), THHV_INITIALIZE_PARTITION)
+            .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
 
         Ok(Arc::new(ThemisVm {
             state: Arc::new(ThemisVmState {
                 fd: Arc::new(part_fd),
-                initialized: Mutex::new(false),
+                initialized: Mutex::new(true),
                 page_size: self.page_size,
                 vp_meta_pages: self.vp_meta_pages,
                 _shared_meta: shared_meta,
@@ -546,8 +554,9 @@ impl vm::Vm for ThemisVm {
     }
 
     fn create_vcpu(&self, id: u32, vm_ops: Option<Arc<dyn VmOps>>) -> vm::Result<Box<dyn Vcpu>> {
-        let meta = MmapRegion::new_shared_anonymous(self.state.vp_meta_pages * self.state.page_size)
-            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+        let meta =
+            MmapRegion::new_shared_anonymous(self.state.vp_meta_pages * self.state.page_size)
+                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
         let comm = MmapRegion::new_shared_anonymous(self.state.page_size)
             .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
         let mut create = ThhvCreateVp {
@@ -557,8 +566,9 @@ impl vm::Vm for ThemisVm {
             meta_size: (self.state.vp_meta_pages * self.state.page_size) as u64,
             comm_uaddr: comm.as_u64(),
         };
-        let vcpu_fd = ioctl_with_mut_ref_ret_fd(self.state.fd.as_raw_fd(), THHV_CREATE_VP, &mut create)
-            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+        let vcpu_fd =
+            ioctl_with_mut_ref_ret_fd(self.state.fd.as_raw_fd(), THHV_CREATE_VP, &mut create)
+                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
 
         Ok(Box::new(ThemisVcpu {
             fd: vcpu_fd,
@@ -609,7 +619,11 @@ impl vm::Vm for ThemisVm {
 
     fn unregister_ioevent(&self, fd: &EventFd, addr: &IoEventAddress) -> vm::Result<()> {
         let (addr, len, flags) = match addr {
-            IoEventAddress::Pio(port) => (*port, 0, THHV_IOEVENTFD_FLAG_PIO | THHV_IOEVENTFD_FLAG_DEASSIGN),
+            IoEventAddress::Pio(port) => (
+                *port,
+                0,
+                THHV_IOEVENTFD_FLAG_PIO | THHV_IOEVENTFD_FLAG_DEASSIGN,
+            ),
             IoEventAddress::Mmio(gpa) => (*gpa, 0, THHV_IOEVENTFD_FLAG_DEASSIGN),
         };
         let mut ioevent = ThhvIoeventfd {
@@ -668,8 +682,12 @@ impl vm::Vm for ThemisVm {
             rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
             attrs: 0,
         };
-        ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut region)
-            .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))
+        ioctl_with_mut_ref(
+            self.state.fd.as_raw_fd(),
+            THHV_SET_GUEST_MEMORY,
+            &mut region,
+        )
+        .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))
     }
 
     unsafe fn remove_user_memory_region(
@@ -689,8 +707,12 @@ impl vm::Vm for ThemisVm {
             rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
             attrs: 0,
         };
-        ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut region)
-            .map_err(|e| vm::HypervisorVmError::RemoveUserMemory(e.into()))
+        ioctl_with_mut_ref(
+            self.state.fd.as_raw_fd(),
+            THHV_SET_GUEST_MEMORY,
+            &mut region,
+        )
+        .map_err(|e| vm::HypervisorVmError::RemoveUserMemory(e.into()))
     }
 
     fn enable_split_irq(&self) -> vm::Result<()> {
@@ -706,15 +728,21 @@ impl vm::Vm for ThemisVm {
     }
 
     fn create_passthrough_device(&self) -> vm::Result<VfioDeviceFd> {
-        Err(vm::HypervisorVmError::CreatePassthroughDevice(anyhow!("not supported")))
+        Err(vm::HypervisorVmError::CreatePassthroughDevice(anyhow!(
+            "not supported"
+        )))
     }
 
     fn start_dirty_log(&self) -> vm::Result<()> {
-        Err(vm::HypervisorVmError::StartDirtyLog(anyhow!("not supported")))
+        Err(vm::HypervisorVmError::StartDirtyLog(anyhow!(
+            "not supported"
+        )))
     }
 
     fn stop_dirty_log(&self) -> vm::Result<()> {
-        Err(vm::HypervisorVmError::StopDirtyLog(anyhow!("not supported")))
+        Err(vm::HypervisorVmError::StopDirtyLog(anyhow!(
+            "not supported"
+        )))
     }
 
     fn get_dirty_log(&self, _slot: u32, _base_gpa: u64, _memory_size: u64) -> vm::Result<Vec<u64>> {
@@ -940,11 +968,13 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn get_fpu(&self) -> cpu::Result<FpuState> {
-        Err(HypervisorCpuError::GetFloatingPointRegs(anyhow!("not supported")))
+        Err(HypervisorCpuError::GetFloatingPointRegs(anyhow!(
+            "not supported"
+        )))
     }
 
     fn set_fpu(&self, _fpu: &FpuState) -> cpu::Result<()> {
-        Err(HypervisorCpuError::SetFloatingPointRegs(anyhow!("not supported")))
+        Ok(())
     }
 
     fn set_cpuid2(&self, _cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
@@ -960,11 +990,11 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn get_lapic(&self) -> cpu::Result<LapicState> {
-        Err(HypervisorCpuError::GetlapicState(anyhow!("not supported")))
+        Ok(LapicState::default())
     }
 
     fn set_lapic(&self, _lapic: &LapicState) -> cpu::Result<()> {
-        Err(HypervisorCpuError::SetLapicState(anyhow!("not supported")))
+        Ok(())
     }
 
     fn get_msrs(&self, _msrs: &mut Vec<MsrEntry>) -> cpu::Result<usize> {
@@ -984,11 +1014,15 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn state(&self) -> cpu::Result<CpuState> {
-        Err(HypervisorCpuError::GetCpuid(anyhow!("state save not supported")))
+        Err(HypervisorCpuError::GetCpuid(anyhow!(
+            "state save not supported"
+        )))
     }
 
     fn set_state(&self, _state: &CpuState) -> cpu::Result<()> {
-        Err(HypervisorCpuError::SetCpuid(anyhow!("state restore not supported")))
+        Err(HypervisorCpuError::SetCpuid(anyhow!(
+            "state restore not supported"
+        )))
     }
 
     fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError> {
@@ -1007,7 +1041,9 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn translate_gva(&self, _gva: u64, _flags: u64) -> cpu::Result<(u64, u32)> {
-        Err(HypervisorCpuError::TranslateVirtualAddress(anyhow!("not supported")))
+        Err(HypervisorCpuError::TranslateVirtualAddress(anyhow!(
+            "not supported"
+        )))
     }
 
     fn boot_msr_entries(&self) -> &'static [MsrEntry] {
@@ -1021,7 +1057,8 @@ impl Vcpu for ThemisVcpu {
 
 impl ThemisVcpu {
     fn get_reg_values(&self, names: &[u64]) -> cpu::Result<Vec<u64>> {
-        let mut regs: Vec<ThhvRegNameValue> = names.iter().copied().map(|name| reg(name, 0)).collect();
+        let mut regs: Vec<ThhvRegNameValue> =
+            names.iter().copied().map(|name| reg(name, 0)).collect();
         let mut header = ThhvVpRegisters {
             count: regs.len() as u32,
             rsvd: 0,
@@ -1043,17 +1080,25 @@ impl ThemisVcpu {
             .map_err(|e| HypervisorCpuError::SetRegister(e.into()))
     }
 
-    fn handle_run_exit(&mut self, run: ThhvRunVp) -> std::result::Result<VmExit, HypervisorCpuError> {
+    fn handle_run_exit(
+        &mut self,
+        run: ThhvRunVp,
+    ) -> std::result::Result<VmExit, HypervisorCpuError> {
         // SAFETY: msg_buf holds a themic_intercept_message prefix written by the kernel.
-        let msg = unsafe { ptr::read_unaligned(run.msg_buf.as_ptr() as *const ThemicInterceptMessage) };
+        let msg =
+            unsafe { ptr::read_unaligned(run.msg_buf.as_ptr() as *const ThemicInterceptMessage) };
 
         if msg.header.message_type == THEMIC_MSG_SHUTDOWN {
             return Ok(VmExit::Shutdown);
         }
 
         match msg.exit_reason {
-            EXIT_REASON_EXCEPTION_NMI | EXIT_REASON_EXTERNAL_INTERRUPT | EXIT_REASON_CPUID
-            | EXIT_REASON_VMCALL | EXIT_REASON_RDMSR | EXIT_REASON_WRMSR => Ok(VmExit::Ignore),
+            EXIT_REASON_EXCEPTION_NMI
+            | EXIT_REASON_EXTERNAL_INTERRUPT
+            | EXIT_REASON_CPUID
+            | EXIT_REASON_VMCALL
+            | EXIT_REASON_RDMSR
+            | EXIT_REASON_WRMSR => Ok(VmExit::Ignore),
             EXIT_REASON_HLT => Ok(VmExit::Reset),
             EXIT_REASON_IO_INSTRUCTION => {
                 self.handle_io_exit(&msg)?;
@@ -1155,7 +1200,13 @@ fn reg(name: u64, value: u64) -> ThhvRegNameValue {
     ThhvRegNameValue { name, value }
 }
 
-fn segment_regs(sel: u64, base: u64, lim: u64, ar: u64, seg: &SegmentRegister) -> [ThhvRegNameValue; 4] {
+fn segment_regs(
+    sel: u64,
+    base: u64,
+    lim: u64,
+    ar: u64,
+    seg: &SegmentRegister,
+) -> [ThhvRegNameValue; 4] {
     [
         reg(sel, seg.selector.into()),
         reg(base, seg.base),
@@ -1233,7 +1284,11 @@ fn ioctl_with_mut_ref<T>(fd: i32, request: c_ulong, arg: &mut T) -> std::io::Res
     }
 }
 
-fn ioctl_with_mut_ref_ret_fd<T>(fd: i32, request: c_ulong, arg: &mut T) -> std::io::Result<OwnedFd> {
+fn ioctl_with_mut_ref_ret_fd<T>(
+    fd: i32,
+    request: c_ulong,
+    arg: &mut T,
+) -> std::io::Result<OwnedFd> {
     // SAFETY: ioctl is called with a valid fd and a pointer to a live repr(C) object.
     let ret = unsafe { libc::ioctl(fd, request, arg as *mut T) };
     if ret < 0 {

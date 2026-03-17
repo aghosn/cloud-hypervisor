@@ -854,6 +854,11 @@ impl Vm {
             hypervisor.hypervisor_type(),
             hypervisor::HypervisorType::Kvm
         );
+        #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+        let is_themis = matches!(
+            hypervisor.hypervisor_type(),
+            hypervisor::HypervisorType::Themis
+        );
 
         #[cfg(feature = "sev_snp")]
         let sev_snp_enabled = config.lock().unwrap().is_sev_snp_enabled();
@@ -933,6 +938,16 @@ impl Vm {
         if is_kvm {
             Self::init_kvm(
                 vm,
+                device_manager,
+                console_info.cloned(),
+                console_resize_pipe.cloned(),
+                original_termios.clone(),
+            )?;
+        }
+
+        #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+        if is_themis {
+            Self::init_themis(
                 device_manager,
                 console_info.cloned(),
                 console_resize_pipe.cloned(),
@@ -1058,6 +1073,28 @@ impl Vm {
             .map_err(Error::DeviceManager)?;
 
         vm.init().map_err(Error::InitializeVm)?;
+
+        device_manager
+            .lock()
+            .unwrap()
+            .create_devices(console_info, console_resize_pipe, original_termios, ic)
+            .map_err(Error::DeviceManager)?;
+
+        Ok(())
+    }
+
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    fn init_themis(
+        device_manager: &Arc<Mutex<DeviceManager>>,
+        console_info: Option<ConsoleInfo>,
+        console_resize_pipe: Option<Arc<File>>,
+        original_termios: Arc<Mutex<Option<termios>>>,
+    ) -> Result<()> {
+        let ic = device_manager
+            .lock()
+            .unwrap()
+            .create_interrupt_controller()
+            .map_err(Error::DeviceManager)?;
 
         device_manager
             .lock()

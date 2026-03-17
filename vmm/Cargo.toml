@@ -29,6 +29,7 @@ mshv = [
   "virtio-devices/mshv",
   "vm-device/mshv",
 ]
+themis = ["hypervisor/themis"]
 pvmemcontrol = ["devices/pvmemcontrol"]
 sev_snp = ["arch/sev_snp", "hypervisor/sev_snp", "virtio-devices/sev_snp"]
 tdx = ["arch/tdx", "hypervisor/tdx"]
