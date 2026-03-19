@@ -26,6 +26,7 @@ use crate::{
 const THHV_IOCTL_MAGIC: u8 = 0xB8;
 const THHV_SCHED_SYNC: u32 = 0;
 const THHV_MEM_F_UNMAP: u32 = 1 << 0;
+const THHV_MEM_F_ALIAS: u32 = 1 << 1;
 const THHV_MEM_R_READ: u32 = 1 << 0;
 const THHV_MEM_R_WRITE: u32 = 1 << 1;
 const THHV_MEM_R_EXEC: u32 = 1 << 2;
@@ -34,7 +35,7 @@ const THHV_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
 const THHV_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
 const THHV_IOEVENTFD_FLAG_DEASSIGN: u32 = 1 << 2;
 const THHV_META_PAGES_PER_VP: usize = 3;
-const THHV_META_PAGES_SHARED: usize = 3;
+const THHV_META_PAGES_SHARED: usize = 4;
 const THHV_QUERY_META_PAGES_PER_VP: u32 = 1;
 const THHV_QUERY_META_PAGES_SHARED: u32 = 2;
 
@@ -399,6 +400,13 @@ struct ThemisVmState {
     page_size: usize,
     vp_meta_pages: usize,
     _shared_meta: MmapRegion,
+    /// Guest memory regions recorded during create_user_memory_region but not
+    /// yet sent to the domain.  THHV_SET_GUEST_MEMORY is deferred until
+    /// ensure_initialized() so that cloud-hypervisor can finish writing
+    /// firmware/ACPI/kernel data into the mmap'd pages while dom0 still holds
+    /// EPT access.  Once SET_GUEST_MEMORY fires the capavisor removes those
+    /// pages from dom0's EPT, so all writes must complete before then.
+    pending_memory: Mutex<Vec<ThhvSetGuestMemory>>,
 }
 
 impl ThemisVmState {
@@ -408,8 +416,22 @@ impl ThemisVmState {
             return Ok(());
         }
 
+        // Flush all deferred SET_GUEST_MEMORY calls before sealing.
+        // After this point dom0 loses EPT access to dom1's guest pages.
+        let regions: Vec<ThhvSetGuestMemory> =
+            self.pending_memory.lock().unwrap().drain(..).collect();
+        eprintln!("[THEMIS-DBG] ensure_initialized: flushing {} memory regions", regions.len());
+        for (i, mut region) in regions.into_iter().enumerate() {
+            eprintln!("[THEMIS-DBG] SET_GUEST_MEMORY[{i}] gfn=0x{:x} size=0x{:x}", region.guest_pfn, region.size);
+            ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut region)
+                .context("deferred THHV_SET_GUEST_MEMORY failed")?;
+            eprintln!("[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
+        }
+
+        eprintln!("[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
         ioctl_noarg(self.fd.as_raw_fd(), THHV_INITIALIZE_PARTITION)
             .context("failed to initialize Themis partition")?;
+        eprintln!("[THEMIS-DBG] INITIALIZE_PARTITION done");
         *initialized = true;
         Ok(())
     }
@@ -433,6 +455,7 @@ pub struct ThemisVcpu {
     vm_ops: Option<Arc<dyn VmOps>>,
     _meta: MmapRegion,
     _comm: MmapRegion,
+    exit_log_count: std::collections::HashMap<u32, u32>,
 }
 
 impl ThemisHypervisor {
@@ -491,22 +514,64 @@ impl Hypervisor for ThemisHypervisor {
         };
         ioctl_with_mut_ref(part_fd.as_raw_fd(), THHV_SEND_SHARED_META, &mut init)
             .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
-        ioctl_noarg(part_fd.as_raw_fd(), THHV_INITIALIZE_PARTITION)
-            .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
+        // THHV_INITIALIZE_PARTITION (seal) is deferred until first run() via
+        // ensure_initialized().  This allows per-VP META pages to be sent via
+        // THHV_CREATE_VP while the domain is still unsealed, so the capavisor
+        // processes them as immediate GiveMetaMem updates rather than pending
+        // capabilities that would require a later ACCEPT before ADD_VP.
 
         Ok(Arc::new(ThemisVm {
             state: Arc::new(ThemisVmState {
                 fd: Arc::new(part_fd),
-                initialized: Mutex::new(true),
+                initialized: Mutex::new(false),
                 page_size: self.page_size,
                 vp_meta_pages: self.vp_meta_pages,
                 _shared_meta: shared_meta,
+                pending_memory: Mutex::new(Vec::new()),
             }),
         }))
     }
 
     fn get_supported_cpuid(&self) -> hypervisor::Result<Vec<CpuIdEntry>> {
-        Ok(Vec::new())
+        // Read the host CPUID directly. Cloud-hypervisor will patch the result
+        // (hypervisor bit, APIC IDs, topology, etc.) before passing it to the guest.
+        // We enumerate standard leaves 0..=max and extended leaves 0x8000_0000..=max.
+        let mut entries: Vec<CpuIdEntry> = Vec::new();
+
+        let collect = |entries: &mut Vec<CpuIdEntry>, leaf: u32, max_leaf: u32| {
+            for function in leaf..=max_leaf {
+                // Most leaves only have index 0; subleaf enumeration is handled
+                // by generate_common_cpuid for the leaves it cares about (0x4, 0x7, 0xb, etc.).
+                for index in 0u32..=3 {
+                    let result = unsafe {
+                        std::arch::x86_64::__cpuid_count(function, index)
+                    };
+                    // Skip entirely-zero sub-leaves (not present).
+                    if result.eax == 0 && result.ebx == 0 && result.ecx == 0 && result.edx == 0 {
+                        if index > 0 { break; }
+                    }
+                    entries.push(CpuIdEntry {
+                        function,
+                        index,
+                        flags: 0,
+                        eax: result.eax,
+                        ebx: result.ebx,
+                        ecx: result.ecx,
+                        edx: result.edx,
+                    });
+                }
+            }
+        };
+
+        let max_leaf = unsafe { std::arch::x86_64::__cpuid(0).eax };
+        collect(&mut entries, 0, max_leaf.min(0x20));
+
+        let max_ext = unsafe { std::arch::x86_64::__cpuid(0x8000_0000).eax };
+        if max_ext >= 0x8000_0000 {
+            collect(&mut entries, 0x8000_0000, max_ext.min(0x8000_0020));
+        }
+
+        Ok(entries)
     }
 
     fn get_max_vcpus(&self) -> u32 {
@@ -532,14 +597,17 @@ impl vm::Vm for ThemisVm {
     }
 
     fn register_irqfd(&self, fd: &EventFd, gsi: u32) -> vm::Result<()> {
+        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} fd={}", fd.as_raw_fd());
         let mut irqfd = ThhvIrqfd {
             fd: fd.as_raw_fd(),
             gsi,
             flags: 0,
             rsvd: 0,
         };
-        ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
-            .map_err(|e| vm::HypervisorVmError::RegisterIrqFd(e.into()))
+        let r = ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
+            .map_err(|e| vm::HypervisorVmError::RegisterIrqFd(e.into()));
+        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} result={r:?}");
+        r
     }
 
     fn unregister_irqfd(&self, fd: &EventFd, gsi: u32) -> vm::Result<()> {
@@ -577,6 +645,7 @@ impl vm::Vm for ThemisVm {
             vm_ops,
             _meta: meta,
             _comm: comm,
+            exit_log_count: std::collections::HashMap::new(),
         }))
     }
 
@@ -674,20 +743,20 @@ impl vm::Vm for ThemisVm {
         _readonly: bool,
         _log_dirty_pages: bool,
     ) -> vm::Result<()> {
-        let mut region = ThhvSetGuestMemory {
+        let region = ThhvSetGuestMemory {
             guest_pfn: guest_phys_addr >> 12,
             userspace_addr: userspace_addr as usize as u64,
             size: memory_size as u64,
-            flags: 0,
+            flags: THHV_MEM_F_ALIAS,
             rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
             attrs: 0,
         };
-        ioctl_with_mut_ref(
-            self.state.fd.as_raw_fd(),
-            THHV_SET_GUEST_MEMORY,
-            &mut region,
-        )
-        .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))
+        // Defer THHV_SET_GUEST_MEMORY until ensure_initialized() (just before
+        // first run()).  Cloud-hypervisor must finish all writes into dom1's
+        // guest memory (firmware, ACPI tables, etc.) before we hand those pages
+        // to the capavisor; the capavisor removes them from dom0's EPT on SEND.
+        self.state.pending_memory.lock().unwrap().push(region);
+        Ok(())
     }
 
     unsafe fn remove_user_memory_region(
@@ -1092,6 +1161,31 @@ impl ThemisVcpu {
             return Ok(VmExit::Shutdown);
         }
 
+        // Log first 3 occurrences of each exit reason (diagnostic; remove when stable).
+        let count = self.exit_log_count.entry(msg.exit_reason).or_insert(0);
+        if *count < 3 {
+            eprintln!(
+                "[THEMIS-DBG] exit reason={} rip={:#x} qual={:#x} port={} is_write={}",
+                msg.exit_reason, msg.guest_rip, msg.exit_qualification,
+                msg.port_number, msg.is_write
+            );
+            *count += 1;
+        }
+
+        // Exit reason 33 = VM-entry failure due to invalid guest state.
+        // Capavisor should have already panicked with a full VMCS dump, but
+        // if we somehow reach here it means the capavisor build is stale.
+        // Panic here too so the bug is never silently ignored.
+        const EXIT_REASON_VMENTRY_INVALID_GUEST: u32 = 33;
+        if msg.exit_reason == EXIT_REASON_VMENTRY_INVALID_GUEST {
+            panic!(
+                "[THEMIS] exit reason 33 (invalid guest state) reached CHV — \
+                 capavisor VMCS dump should be in serial log above. \
+                 vp={} rip={:#x} qual={:#x}",
+                self._vp_index, msg.guest_rip, msg.exit_qualification
+            );
+        }
+
         match msg.exit_reason {
             EXIT_REASON_EXCEPTION_NMI
             | EXIT_REASON_EXTERNAL_INTERRUPT
@@ -1099,7 +1193,11 @@ impl ThemisVcpu {
             | EXIT_REASON_VMCALL
             | EXIT_REASON_RDMSR
             | EXIT_REASON_WRMSR => Ok(VmExit::Ignore),
-            EXIT_REASON_HLT => Ok(VmExit::Reset),
+            // HLT: dom1 is idle (waiting for interrupt). The kernel driver already
+            // drained the domcomm RX ring (signaling any pending ioeventfds) before
+            // returning from THHV_RUN_VP. Return Ignore so the vCPU run loop retries;
+            // do_switch in capavisor will inject any pending interrupt via VMENTRY_INTR_INFO.
+            EXIT_REASON_HLT => Ok(VmExit::Ignore),
             EXIT_REASON_IO_INSTRUCTION => {
                 self.handle_io_exit(&msg)?;
                 Ok(VmExit::Ignore)

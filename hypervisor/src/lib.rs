@@ -78,6 +78,13 @@ pub enum HypervisorType {
 }
 
 pub fn new() -> std::result::Result<Arc<dyn Hypervisor>, HypervisorError> {
+    // Themis is checked before KVM — when /dev/thhv is present we always
+    // prefer the Themis backend, even if /dev/kvm is also available.
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    if themis::ThemisHypervisor::is_available()? {
+        return themis::ThemisHypervisor::new();
+    }
+
     #[cfg(feature = "kvm")]
     if kvm::KvmHypervisor::is_available()? {
         return kvm::KvmHypervisor::new();
@@ -86,11 +93,6 @@ pub fn new() -> std::result::Result<Arc<dyn Hypervisor>, HypervisorError> {
     #[cfg(feature = "mshv")]
     if mshv::MshvHypervisor::is_available()? {
         return mshv::MshvHypervisor::new();
-    }
-
-    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
-    if themis::ThemisHypervisor::is_available()? {
-        return themis::ThemisHypervisor::new();
     }
 
     Err(HypervisorError::HypervisorCreate(anyhow!(

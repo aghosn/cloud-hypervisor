@@ -123,11 +123,14 @@ use kvm::*;
 #[cfg(all(feature = "themis", target_arch = "x86_64"))]
 mod themis {
     pub const THHV_CREATE_PARTITION: u64 = 0xc020_b801;
+    pub const THHV_QUERY: u64 = 0xc010_b803;
     pub const THHV_INITIALIZE_PARTITION: u64 = 0x0000_b810;
     pub const THHV_CREATE_VP: u64 = 0xc020_b811;
     pub const THHV_SET_GUEST_MEMORY: u64 = 0x4028_b812;
     pub const THHV_IRQFD: u64 = 0x4010_b813;
     pub const THHV_IOEVENTFD: u64 = 0x4020_b814;
+    pub const THHV_SEND_SHARED_META: u64 = 0x4010_b817;
+    pub const THHV_SET_INTR_POLICY: u64 = 0x4008_b818;
     pub const THHV_RUN_VP: u64 = 0xc100_b820;
     pub const THHV_GET_VP_STATE: u64 = 0xc010_b821;
     pub const THHV_SET_VP_STATE: u64 = 0x4010_b822;
@@ -265,11 +268,14 @@ fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, Backen
 fn create_vmm_ioctl_seccomp_rule_common_themis() -> Result<Vec<SeccompRule>, BackendError> {
     Ok(or![
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_CREATE_PARTITION)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_QUERY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_INITIALIZE_PARTITION)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_CREATE_VP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_SET_GUEST_MEMORY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_IRQFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_IOEVENTFD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_SEND_SHARED_META)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_SET_INTR_POLICY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_RUN_VP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_GET_VP_STATE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_SET_VP_STATE)?],

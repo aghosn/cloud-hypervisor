@@ -138,6 +138,7 @@ impl InterruptSourceGroup for MsiInterruptGroup {
 
     fn trigger(&self, index: InterruptIndex) -> Result<()> {
         if let Some(route) = self.irq_routes.get(&index) {
+            eprintln!("[THEMIS-DBG] interrupt trigger index={index} gsi={}", route.gsi);
             return route.trigger();
         }
 
