@@ -44,7 +44,8 @@ const EXIT_REASON_EXTERNAL_INTERRUPT: u32 = 1;
 const EXIT_REASON_CPUID: u32 = 10;
 const EXIT_REASON_HLT: u32 = 12;
 const EXIT_REASON_VMCALL: u32 = 18;
-const EXIT_REASON_IO_INSTRUCTION: u32 = 28;
+const EXIT_REASON_CR_ACCESS: u32 = 28;     // Intel SDM: MOV to/from CR0/CR3/CR4/CR8, CLTS, LMSW
+const EXIT_REASON_IO_INSTRUCTION: u32 = 30; // Intel SDM: IN, INS, OUT, OUTS
 const EXIT_REASON_RDMSR: u32 = 31;
 const EXIT_REASON_WRMSR: u32 = 32;
 const EXIT_REASON_EPT_VIOLATION: u32 = 48;
@@ -868,6 +869,8 @@ impl Vcpu for ThemisVcpu {
             }
         };
 
+        eprintln!("[THEMIS-DBG] set_regs: rip=0x{:x} rbx=0x{:x} rflags=0x{:x}",
+            regs.rip, regs.rbx, regs.rflags);
         let regs = [
             reg(THHV_VP_REG_RAX, regs.rax),
             reg(THHV_VP_REG_RBX, regs.rbx),
@@ -888,8 +891,12 @@ impl Vcpu for ThemisVcpu {
             reg(THHV_VP_REG_RIP, regs.rip),
             reg(THHV_VP_REG_RFLAGS, regs.rflags),
         ];
-        self.set_reg_values(&regs)
-            .map_err(|e| HypervisorCpuError::SetStandardRegs(anyhow!(e.to_string())))
+        let result = self.set_reg_values(&regs)
+            .map_err(|e| HypervisorCpuError::SetStandardRegs(anyhow!(e.to_string())));
+        if let Err(ref e) = result {
+            eprintln!("[THEMIS-DBG] set_regs: THHV_SET_VP_STATE FAILED: {e}");
+        }
+        result
     }
 
     fn get_sregs(&self) -> cpu::Result<SpecialRegisters> {
@@ -1203,6 +1210,10 @@ impl ThemisVcpu {
                 self.handle_cpuid_exit(&msg)?;
                 Ok(VmExit::Ignore)
             }
+            EXIT_REASON_CR_ACCESS => {
+                self.handle_cr_access_exit(&msg)?;
+                Ok(VmExit::Ignore)
+            }
             // HLT: dom1 is idle (waiting for interrupt). The kernel driver already
             // drained the domcomm RX ring (signaling any pending ioeventfds) before
             // returning from THHV_RUN_VP. Return Ignore so the vCPU run loop retries;
@@ -1218,6 +1229,94 @@ impl ThemisVcpu {
             }
             _ => Ok(VmExit::Ignore),
         }
+    }
+
+    /// Handle a CR_ACCESS VM exit (exit reason 28, Intel SDM §27.1 Table C-1).
+    ///
+    /// The exit qualification encodes:
+    ///   bits  3:0  = CR number (0=CR0, 3=CR3, 4=CR4)
+    ///   bits  5:4  = access type (0=MOV to CR, 1=MOV from CR, 2=CLTS, 3=LMSW)
+    ///   bits 11:8  = source/dest register (Intel encoding, see below)
+    ///
+    /// Intel register encoding (qual bits 11:8):
+    ///   0=RAX 1=RCX 2=RDX 3=RBX 4=RSP 5=RBP 6=RSI 7=RDI 8-15=R8-R15
+    fn handle_cr_access_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
+        let qual    = msg.exit_qualification;
+        let cr_num  = (qual & 0xF) as u32;
+        let acc     = ((qual >> 4) & 0x3) as u32;
+        let reg_idx = ((qual >> 8) & 0xF) as u32;
+
+        // Map Intel qualification register index to THHV_VP_REG_* discriminant.
+        // Note: VpRegister ordering differs from Intel's.
+        let thhv_gpr = |idx: u32| -> u64 {
+            match idx {
+                0  => THHV_VP_REG_RAX,
+                1  => THHV_VP_REG_RCX,
+                2  => THHV_VP_REG_RDX,
+                3  => THHV_VP_REG_RBX,
+                4  => THHV_VP_REG_RSP,
+                5  => THHV_VP_REG_RBP,
+                6  => THHV_VP_REG_RSI,
+                7  => THHV_VP_REG_RDI,
+                8  => THHV_VP_REG_R8,
+                9  => THHV_VP_REG_R9,
+                10 => THHV_VP_REG_R10,
+                11 => THHV_VP_REG_R11,
+                12 => THHV_VP_REG_R12,
+                13 => THHV_VP_REG_R13,
+                14 => THHV_VP_REG_R14,
+                15 => THHV_VP_REG_R15,
+                _  => THHV_VP_REG_RAX,
+            }
+        };
+
+        if acc == 0 {
+            // MOV to CR: get source register value, write to the appropriate CR.
+            let src_reg  = thhv_gpr(reg_idx);
+            let src_val  = self.get_reg_values(&[src_reg])?[0];
+
+            match cr_num {
+                0 => {
+                    // When enabling paging (PG bit) while EFER.LME=1, also set EFER.LMA.
+                    let old_cr0 = self.get_reg_values(&[THHV_VP_REG_CR0])?[0];
+                    let pg_bit  = 1u64 << 31;
+                    let mut updates = vec![reg(THHV_VP_REG_CR0, src_val)];
+                    if (old_cr0 & pg_bit) == 0 && (src_val & pg_bit) != 0 {
+                        let efer = self.get_reg_values(&[THHV_VP_REG_EFER])?[0];
+                        if efer & (1 << 8) != 0 {
+                            // LME set → activate LMA now that PG is going on.
+                            updates.push(reg(THHV_VP_REG_EFER, efer | (1 << 10)));
+                        }
+                    }
+                    self.set_reg_values(&updates)?;
+                }
+                3 => {
+                    self.set_reg_values(&[reg(THHV_VP_REG_CR3, src_val)])?;
+                }
+                4 => {
+                    // Preserve VMXE (bit 13) — guest cannot clear it.
+                    self.set_reg_values(&[reg(THHV_VP_REG_CR4, src_val | (1u64 << 13))])?;
+                }
+                8 => { /* CR8 / TPR — ignore */ }
+                _ => {}
+            }
+        } else if acc == 1 {
+            // MOV from CR: read CR value and write to the destination register.
+            let cr_reg = match cr_num {
+                0 => Some(THHV_VP_REG_CR0),
+                3 => Some(THHV_VP_REG_CR3),
+                4 => Some(THHV_VP_REG_CR4),
+                _ => None,
+            };
+            if let Some(r) = cr_reg {
+                let cr_val  = self.get_reg_values(&[r])?[0];
+                self.set_reg_values(&[reg(thhv_gpr(reg_idx), cr_val)])?;
+            }
+        }
+        // CLTS (acc==2) and LMSW (acc==3) are rare; advance RIP and continue.
+
+        self.advance_rip(msg.guest_rip, msg.instruction_length)?;
+        Ok(())
     }
 
     fn handle_cpuid_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
