@@ -41,6 +41,7 @@ const THHV_QUERY_META_PAGES_SHARED: u32 = 2;
 
 const EXIT_REASON_EXCEPTION_NMI: u32 = 0;
 const EXIT_REASON_EXTERNAL_INTERRUPT: u32 = 1;
+const EXIT_REASON_TRIPLE_FAULT: u32 = 2;
 const EXIT_REASON_CPUID: u32 = 10;
 const EXIT_REASON_HLT: u32 = 12;
 const EXIT_REASON_VMCALL: u32 = 18;
@@ -1206,6 +1207,22 @@ impl ThemisVcpu {
             | EXIT_REASON_VMCALL
             | EXIT_REASON_RDMSR
             | EXIT_REASON_WRMSR => Ok(VmExit::Ignore),
+            EXIT_REASON_TRIPLE_FAULT => {
+                let cr0  = self.get_reg_values(&[THHV_VP_REG_CR0]).unwrap_or_default();
+                let cr3  = self.get_reg_values(&[THHV_VP_REG_CR3]).unwrap_or_default();
+                let cr4  = self.get_reg_values(&[THHV_VP_REG_CR4]).unwrap_or_default();
+                let efer = self.get_reg_values(&[THHV_VP_REG_EFER]).unwrap_or_default();
+                let rax  = self.get_reg_values(&[THHV_VP_REG_RAX]).unwrap_or_default();
+                eprintln!("[TRIPLE-FAULT] rip={:#x} cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} rax={:#x}",
+                    msg.guest_rip,
+                    cr0.first().copied().unwrap_or(0),
+                    cr3.first().copied().unwrap_or(0),
+                    cr4.first().copied().unwrap_or(0),
+                    efer.first().copied().unwrap_or(0),
+                    rax.first().copied().unwrap_or(0));
+                // Re-enter and let it loop so we can observe — will spam log but is diagnosable.
+                Ok(VmExit::Ignore)
+            }
             EXIT_REASON_CPUID => {
                 self.handle_cpuid_exit(&msg)?;
                 Ok(VmExit::Ignore)
@@ -1275,19 +1292,26 @@ impl ThemisVcpu {
             let src_reg  = thhv_gpr(reg_idx);
             let src_val  = self.get_reg_values(&[src_reg])?[0];
 
+            eprintln!("[CR-ACCESS] MOV CR{} = {:#x} @ rip={:#x}", cr_num, src_val, msg.guest_rip);
+
             match cr_num {
                 0 => {
                     // When enabling paging (PG bit) while EFER.LME=1, also set EFER.LMA.
+                    // Preserve host-forced FIXED0 bits (bits always set in old_cr0 due to mask).
                     let old_cr0 = self.get_reg_values(&[THHV_VP_REG_CR0])?[0];
+                    // Keep bits that the host must own (in FIXED0 mask) that guest wants to clear.
+                    let forced_bits = old_cr0 & !src_val;
+                    let new_cr0 = src_val | forced_bits;
                     let pg_bit  = 1u64 << 31;
-                    let mut updates = vec![reg(THHV_VP_REG_CR0, src_val)];
-                    if (old_cr0 & pg_bit) == 0 && (src_val & pg_bit) != 0 {
+                    let mut updates = vec![reg(THHV_VP_REG_CR0, new_cr0)];
+                    if (old_cr0 & pg_bit) == 0 && (new_cr0 & pg_bit) != 0 {
                         let efer = self.get_reg_values(&[THHV_VP_REG_EFER])?[0];
                         if efer & (1 << 8) != 0 {
                             // LME set → activate LMA now that PG is going on.
                             updates.push(reg(THHV_VP_REG_EFER, efer | (1 << 10)));
                         }
                     }
+                    eprintln!("[CR-ACCESS]   old_cr0={:#x} forced_bits={:#x} new_cr0={:#x}", old_cr0, forced_bits, new_cr0);
                     self.set_reg_values(&updates)?;
                 }
                 3 => {
