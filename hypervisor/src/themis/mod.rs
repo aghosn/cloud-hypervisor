@@ -53,6 +53,7 @@ const THEMIC_MSG_SHUTDOWN: u32 = 0x0004;
 
 const EPT_VIOLATION_DATA_READ: u64 = 1 << 0;
 const EPT_VIOLATION_DATA_WRITE: u64 = 1 << 1;
+const EPT_VIOLATION_EXECUTE: u64 = 1 << 2;
 
 const fn ioctl_code(dir: c_ulong, ty: u8, nr: u8, size: usize) -> c_ulong {
     (dir << 30) | ((size as c_ulong) << 16) | ((ty as c_ulong) << 8) | nr as c_ulong
@@ -456,6 +457,9 @@ pub struct ThemisVcpu {
     _meta: MmapRegion,
     _comm: MmapRegion,
     exit_log_count: std::collections::HashMap<u32, u32>,
+    /// CPUID policy set by CHV via set_cpuid2() before the first run.
+    /// Searched by (function, index) on every CPUID exit.
+    cpuid: std::sync::Mutex<Vec<CpuIdEntry>>,
 }
 
 impl ThemisHypervisor {
@@ -646,6 +650,7 @@ impl vm::Vm for ThemisVm {
             _meta: meta,
             _comm: comm,
             exit_log_count: std::collections::HashMap::new(),
+            cpuid: std::sync::Mutex::new(Vec::new()),
         }))
     }
 
@@ -1046,7 +1051,9 @@ impl Vcpu for ThemisVcpu {
         Ok(())
     }
 
-    fn set_cpuid2(&self, _cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
+    fn set_cpuid2(&self, cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
+        let mut guard = self.cpuid.lock().unwrap();
+        *guard = cpuid.to_vec();
         Ok(())
     }
 
@@ -1189,10 +1196,13 @@ impl ThemisVcpu {
         match msg.exit_reason {
             EXIT_REASON_EXCEPTION_NMI
             | EXIT_REASON_EXTERNAL_INTERRUPT
-            | EXIT_REASON_CPUID
             | EXIT_REASON_VMCALL
             | EXIT_REASON_RDMSR
             | EXIT_REASON_WRMSR => Ok(VmExit::Ignore),
+            EXIT_REASON_CPUID => {
+                self.handle_cpuid_exit(&msg)?;
+                Ok(VmExit::Ignore)
+            }
             // HLT: dom1 is idle (waiting for interrupt). The kernel driver already
             // drained the domcomm RX ring (signaling any pending ioeventfds) before
             // returning from THHV_RUN_VP. Return Ignore so the vCPU run loop retries;
@@ -1208,6 +1218,50 @@ impl ThemisVcpu {
             }
             _ => Ok(VmExit::Ignore),
         }
+    }
+
+    fn handle_cpuid_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
+        let leaf = msg.cpuid_rax as u32;
+        let subleaf = msg.cpuid_rcx as u32;
+
+        // Use the CPUID policy set by CHV (via set_cpuid2), which applies correct
+        // masking for vCPU count, topology, VMX hiding, etc.
+        // Fall back to raw hardware CPUID only if no policy has been set yet
+        // (e.g. early firmware execution before CHV installs the policy).
+        let (eax, ebx, ecx, edx) = {
+            let guard = self.cpuid.lock().unwrap();
+            if guard.is_empty() {
+                // No policy yet — pass through host CPUID as-is.
+                // SAFETY: CPUID is always available on x86_64 and has no side effects.
+                let r = unsafe { std::arch::x86_64::__cpuid_count(leaf, subleaf) };
+                (r.eax, r.ebx, r.ecx, r.edx)
+            } else {
+                // Search stored policy. Most leaves use index=0; indexed leaves
+                // (0x4, 0x7, 0xB, 0x1F, 0x8000001D) are stored with their exact
+                // sub-leaf index. Fall back to all-zeros for unknown leaves
+                // (matches hardware behaviour for leaves beyond max).
+                let entry = guard
+                    .iter()
+                    .find(|e| e.function == leaf && e.index == subleaf)
+                    .or_else(|| guard.iter().find(|e| e.function == leaf && e.index == 0))
+                    .copied();
+                match entry {
+                    Some(e) => (e.eax, e.ebx, e.ecx, e.edx),
+                    None => (0, 0, 0, 0),
+                }
+            }
+        };
+
+        self.set_reg_values(&[
+            reg(THHV_VP_REG_RAX, u64::from(eax)),
+            reg(THHV_VP_REG_RBX, u64::from(ebx)),
+            reg(THHV_VP_REG_RCX, u64::from(ecx)),
+            reg(THHV_VP_REG_RDX, u64::from(edx)),
+            reg(
+                THHV_VP_REG_RIP,
+                msg.guest_rip.wrapping_add(u64::from(msg.instruction_length)),
+            ),
+        ])
     }
 
     fn handle_io_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
@@ -1243,6 +1297,22 @@ impl ThemisVcpu {
     fn handle_mmio_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
         let is_write = msg.exit_qualification & EPT_VIOLATION_DATA_WRITE != 0;
         let is_read = msg.exit_qualification & EPT_VIOLATION_DATA_READ != 0;
+        let is_exec = msg.exit_qualification & EPT_VIOLATION_EXECUTE != 0;
+        // Bits 3:5 = 000 means the EPT entry has no permissions (GPA not mapped at all).
+        let ept_entry_present = (msg.exit_qualification >> 3) & 0x7 != 0;
+
+        if is_exec && !ept_entry_present {
+            // Execute fault on an unmapped page — EPT setup for this region failed.
+            return Err(HypervisorCpuError::RunVcpu(
+                anyhow::anyhow!(
+                    "EPT execute fault on unmapped GPA {:#x} (RIP {:#x} qual={:#x}): memory region not set up in child EPT",
+                    msg.guest_physical_address,
+                    msg.guest_rip,
+                    msg.exit_qualification,
+                )
+                .into(),
+            ));
+        }
 
         if is_write {
             if let Some(vm_ops) = &self.vm_ops {
