@@ -1359,14 +1359,28 @@ impl ThemisVcpu {
                 let r = unsafe { std::arch::x86_64::__cpuid_count(leaf, subleaf) };
                 (r.eax, r.ebx, r.ecx, r.edx)
             } else {
-                // Search stored policy. Most leaves use index=0; indexed leaves
-                // (0x4, 0x7, 0xB, 0x1F, 0x8000001D) are stored with their exact
-                // sub-leaf index. Fall back to all-zeros for unknown leaves
-                // (matches hardware behaviour for leaves beyond max).
+                // Search stored policy. Most leaves use index=0 only; indexed
+                // sub-leaf leaves (0x4, 0x7, 0xB, 0x1F, 0x8000001D) store each
+                // sub-leaf separately.
+                //
+                // For topology enumeration leaves (0xB, 0x1F) we must NOT fall
+                // back to sub-leaf 0 for an unknown sub-leaf: those leaves signal
+                // end-of-enumeration with ECX[15:8]=0 (level_type=0), which only
+                // appears when the caller queries a sub-leaf beyond the last valid
+                // one and gets all-zeros back.  Returning the sub-leaf-0 entry
+                // (ECX[15:8]≠0) for every missing sub-leaf causes Linux's topology
+                // scan to loop forever.
+                const INDEXED_LEAVES: &[u32] = &[0x4, 0xb, 0x1f, 0x8000_001d];
                 let entry = guard
                     .iter()
                     .find(|e| e.function == leaf && e.index == subleaf)
-                    .or_else(|| guard.iter().find(|e| e.function == leaf && e.index == 0))
+                    .or_else(|| {
+                        if INDEXED_LEAVES.contains(&leaf) {
+                            None // return (0,0,0,0) → end-of-enumeration
+                        } else {
+                            guard.iter().find(|e| e.function == leaf && e.index == 0)
+                        }
+                    })
                     .copied();
                 match entry {
                     Some(e) => (e.eax, e.ebx, e.ecx, e.edx),
@@ -1384,7 +1398,26 @@ impl ThemisVcpu {
                 THHV_VP_REG_RIP,
                 msg.guest_rip.wrapping_add(u64::from(msg.instruction_length)),
             ),
-        ])
+        ])?;
+        // Log CPUID exits; print on first visit and on loops.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_RIP: AtomicU64 = AtomicU64::new(0);
+            static REPEAT_COUNT: AtomicU64 = AtomicU64::new(0);
+            let prev = LAST_RIP.swap(msg.guest_rip, Ordering::Relaxed);
+            if prev == msg.guest_rip {
+                let n = REPEAT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n == 0 || n % 1000 == 0 {
+                    eprintln!("[CPUID-LOOP] rip={:#x} leaf={:#x}/{:#x} => eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} instr_len={} (n={})",
+                        msg.guest_rip, leaf, subleaf, eax, ebx, ecx, edx, msg.instruction_length, n);
+                }
+            } else {
+                REPEAT_COUNT.store(0, Ordering::Relaxed);
+                eprintln!("[CPUID] rip={:#x} leaf={:#x}/{:#x} => eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} instr_len={}",
+                    msg.guest_rip, leaf, subleaf, eax, ebx, ecx, edx, msg.instruction_length);
+            }
+        }
+        Ok(())
     }
 
     fn handle_io_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
