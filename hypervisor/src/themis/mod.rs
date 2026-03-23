@@ -1097,6 +1097,36 @@ impl Vcpu for ThemisVcpu {
         Ok(())
     }
 
+    fn tsc_khz(&self) -> cpu::Result<Option<u32>> {
+        // Try CPUID leaf 0x15: TSC/Crystal ratio (Intel SDM Vol. 3A §18.7.3).
+        // EBX/EAX is the TSC-to-crystal multiplier/denominator; ECX is the
+        // crystal frequency in Hz.  If ECX is 0 (common in older models) we
+        // fall back to the Tiger/Ice-Lake nominal 19.2 MHz crystal.
+        // SAFETY: CPUID is always available on x86_64.
+        let leaf15 = unsafe { std::arch::x86_64::__cpuid(0x15) };
+        if leaf15.eax != 0 && leaf15.ebx != 0 {
+            let crystal_hz = if leaf15.ecx != 0 {
+                leaf15.ecx as u64
+            } else {
+                19_200_000u64
+            };
+            let tsc_khz =
+                (crystal_hz * leaf15.ebx as u64 / leaf15.eax as u64 / 1000) as u32;
+            if tsc_khz > 0 {
+                return Ok(Some(tsc_khz));
+            }
+        }
+
+        // Try CPUID leaf 0x16: Processor Frequency Information.
+        // EAX[15:0] = processor base frequency in MHz.
+        let leaf16 = unsafe { std::arch::x86_64::__cpuid(0x16) };
+        if (leaf16.eax & 0xffff) != 0 {
+            return Ok(Some((leaf16.eax & 0xffff) * 1000));
+        }
+
+        Ok(None)
+    }
+
     fn state(&self) -> cpu::Result<CpuState> {
         Err(HypervisorCpuError::GetCpuid(anyhow!(
             "state save not supported"
@@ -1399,13 +1429,21 @@ impl ThemisVcpu {
                 msg.guest_rip.wrapping_add(u64::from(msg.instruction_length)),
             ),
         ])?;
-        // Log CPUID exits; print on first visit and on loops.
+        // Log CPUID exits. Print every new (rip, leaf, subleaf) tuple on first
+        // visit; suppress repeats of the *same* tuple but print a summary every
+        // 1000 iterations.  When the leaf/subleaf changes (even at the same rip)
+        // always print — this lets us trace what a "loop" is actually doing.
         {
             use std::sync::atomic::{AtomicU64, Ordering};
-            static LAST_RIP: AtomicU64 = AtomicU64::new(0);
+            static LAST_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
             static REPEAT_COUNT: AtomicU64 = AtomicU64::new(0);
-            let prev = LAST_RIP.swap(msg.guest_rip, Ordering::Relaxed);
-            if prev == msg.guest_rip {
+            // Pack (rip[31:0] XOR rip[63:32]) | leaf<<32 | subleaf<<48 into a
+            // single u64 key so we detect both rip-same/leaf-different and vice versa.
+            let key: u64 = (msg.guest_rip ^ (msg.guest_rip >> 32))
+                | ((leaf as u64) << 32)
+                | ((subleaf as u64) << 48);
+            let prev = LAST_KEY.swap(key, Ordering::Relaxed);
+            if prev == key {
                 let n = REPEAT_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n == 0 || n % 1000 == 0 {
                     eprintln!("[CPUID-LOOP] rip={:#x} leaf={:#x}/{:#x} => eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} instr_len={} (n={})",
