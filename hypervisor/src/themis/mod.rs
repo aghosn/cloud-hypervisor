@@ -192,6 +192,8 @@ struct ThhvCreateVp {
 struct ThhvInitializePartition {
     meta_uaddr: u64,
     meta_size: u64,
+    apic_access_uaddr: u64,
+    apic_access_size: u64,
 }
 
 #[repr(C)]
@@ -403,6 +405,9 @@ struct ThemisVmState {
     page_size: usize,
     vp_meta_pages: usize,
     _shared_meta: MmapRegion,
+    /// APIC-access sentinel page mapped at GPA 0xFEE00000 in the child domain.
+    /// Kept alive here so the pinned page is not freed while the domain runs.
+    _apic_access: MmapRegion,
     /// Guest memory regions recorded during create_user_memory_region but not
     /// yet sent to the domain.  THHV_SET_GUEST_MEMORY is deferred until
     /// ensure_initialized() so that cloud-hypervisor can finish writing
@@ -514,9 +519,13 @@ impl Hypervisor for ThemisHypervisor {
 
         let shared_meta = MmapRegion::new_shared_anonymous(self.shared_meta_pages * self.page_size)
             .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
+        let apic_access = MmapRegion::new_shared_anonymous(self.page_size)
+            .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
         let mut init = ThhvInitializePartition {
             meta_uaddr: shared_meta.as_u64(),
             meta_size: (self.shared_meta_pages * self.page_size) as u64,
+            apic_access_uaddr: apic_access.as_u64(),
+            apic_access_size: self.page_size as u64,
         };
         ioctl_with_mut_ref(part_fd.as_raw_fd(), THHV_SEND_SHARED_META, &mut init)
             .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
@@ -533,6 +542,7 @@ impl Hypervisor for ThemisHypervisor {
                 page_size: self.page_size,
                 vp_meta_pages: self.vp_meta_pages,
                 _shared_meta: shared_meta,
+                _apic_access: apic_access,
                 pending_memory: Mutex::new(Vec::new()),
             }),
         }))
