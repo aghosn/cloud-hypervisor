@@ -147,7 +147,7 @@ pub struct IoapicState {
 
 impl BusDevice for Ioapic {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
-        if data.len() != std::mem::size_of::<u32>() {
+        if data.len() < std::mem::size_of::<u32>() {
             warn!("Invalid read size on IOAPIC: {}", data.len());
             return;
         }
@@ -163,18 +163,24 @@ impl BusDevice for Ioapic {
             }
         };
 
-        LittleEndian::write_u32(data, value);
+        // IOAPIC registers are 32-bit; write into the first 4 bytes,
+        // zero the rest (handles 8-byte reads from the Themis MMIO path).
+        LittleEndian::write_u32(&mut data[..4], value);
+        for b in data[4..].iter_mut() {
+            *b = 0;
+        }
     }
 
     fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
-        if data.len() != std::mem::size_of::<u32>() {
+        if data.len() < std::mem::size_of::<u32>() {
             warn!("Invalid write size on IOAPIC: {}", data.len());
             return None;
         }
 
         debug!("IOAPIC_W @ offset 0x{offset:x}");
 
-        let value = LittleEndian::read_u32(data);
+        // IOAPIC registers are 32-bit; use only the lower 4 bytes.
+        let value = LittleEndian::read_u32(&data[..4]);
 
         match offset as u8 {
             IOREGSEL_OFF => self.reg_sel = value,

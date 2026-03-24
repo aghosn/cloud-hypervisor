@@ -464,6 +464,7 @@ pub struct ThemisVcpu {
     _meta: MmapRegion,
     _comm: MmapRegion,
     exit_log_count: std::collections::HashMap<u32, u32>,
+    mmio_exit_count: std::sync::atomic::AtomicU64,
     /// CPUID policy set by CHV via set_cpuid2() before the first run.
     /// Searched by (function, index) on every CPUID exit.
     cpuid: std::sync::Mutex<Vec<CpuIdEntry>>,
@@ -662,6 +663,7 @@ impl vm::Vm for ThemisVm {
             _meta: meta,
             _comm: comm,
             exit_log_count: std::collections::HashMap::new(),
+            mmio_exit_count: std::sync::atomic::AtomicU64::new(0),
             cpuid: std::sync::Mutex::new(Vec::new()),
         }))
     }
@@ -1377,9 +1379,9 @@ impl ThemisVcpu {
                 self.set_reg_values(&[reg(thhv_gpr(reg_idx), cr_val)])?;
             }
         }
-        // CLTS (acc==2) and LMSW (acc==3) are rare; advance RIP and continue.
+        // CLTS (acc==2) and LMSW (acc==3) are rare; continue without touching RIP.
+        // RIP was already advanced by the capavisor before forwarding the exit.
 
-        self.advance_rip(msg.guest_rip, msg.instruction_length)?;
         Ok(())
     }
 
@@ -1434,10 +1436,7 @@ impl ThemisVcpu {
             reg(THHV_VP_REG_RBX, u64::from(ebx)),
             reg(THHV_VP_REG_RCX, u64::from(ecx)),
             reg(THHV_VP_REG_RDX, u64::from(edx)),
-            reg(
-                THHV_VP_REG_RIP,
-                msg.guest_rip.wrapping_add(u64::from(msg.instruction_length)),
-            ),
+            // RIP already advanced by capavisor before forwarding the exit.
         ])?;
         // Log CPUID exits. Print every new (rip, leaf, subleaf) tuple on first
         // visit; suppress repeats of the *same* tuple but print a summary every
@@ -1481,7 +1480,7 @@ impl ThemisVcpu {
                     .pio_write(u64::from(msg.port_number), &data[..len])
                     .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
             }
-            self.advance_rip(msg.guest_rip, msg.instruction_length)?;
+            // RIP already advanced by capavisor.
             return Ok(());
         }
 
@@ -1495,7 +1494,8 @@ impl ThemisVcpu {
         let v = u32::from_le_bytes(data);
         let mask = 0xffff_ffffu32 >> (32 - len * 8);
         let eax = (msg.rax as u32 & !mask) | (v & mask);
-        self.advance_rip_and_set_rax(msg.guest_rip, msg.instruction_length, eax as u64)
+        // Only set RAX with the read result; RIP already advanced by capavisor.
+        self.set_reg_values(&[reg(THHV_VP_REG_RAX, eax as u64)])
     }
 
     fn handle_mmio_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
@@ -1504,6 +1504,19 @@ impl ThemisVcpu {
         let is_exec = msg.exit_qualification & EPT_VIOLATION_EXECUTE != 0;
         // Bits 3:5 = 000 means the EPT entry has no permissions (GPA not mapped at all).
         let ept_entry_present = (msg.exit_qualification >> 3) & 0x7 != 0;
+
+        // Count MMIO exits for diagnostics.
+        let mmio_count = self.mmio_exit_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if mmio_count < 20 || mmio_count % 100 == 0 {
+            eprintln!(
+                "[MMIO-DBG] #{} {} gpa={:#x} rip={:#x} rax={:#x}",
+                mmio_count,
+                if is_write { "W" } else if is_read { "R" } else { "?" },
+                msg.guest_physical_address,
+                msg.guest_rip,
+                msg.rax,
+            );
+        }
 
         if is_exec && !ept_entry_present {
             // Execute fault on an unmapped page — EPT setup for this region failed.
@@ -1525,46 +1538,25 @@ impl ThemisVcpu {
                     .mmio_write(msg.guest_physical_address, &data)
                     .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
             }
-            self.advance_rip(msg.guest_rip, msg.instruction_length)?;
+            // RIP already advanced by capavisor.
         } else if is_read {
             if let Some(vm_ops) = &self.vm_ops {
                 let mut data = [0u8; 8];
                 vm_ops
                     .mmio_read(msg.guest_physical_address, &mut data)
                     .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
-                self.advance_rip_and_set_rax(
-                    msg.guest_rip,
-                    msg.instruction_length,
-                    u64::from_le_bytes(data),
-                )?;
-            } else {
-                self.advance_rip(msg.guest_rip, msg.instruction_length)?;
+                // Use the register decoded by the capavisor from the MMIO instruction.
+                // `reserved` carries the THHV_VP_REG_* constant (0=RAX if not decoded).
+                let dest_reg = if msg.reserved != 0 {
+                    msg.reserved as u64
+                } else {
+                    THHV_VP_REG_RAX
+                };
+                self.set_reg_values(&[reg(dest_reg, u64::from_le_bytes(data))])?;
             }
         }
 
         Ok(())
-    }
-
-    fn advance_rip(&self, guest_rip: u64, instruction_length: u32) -> cpu::Result<()> {
-        self.set_reg_values(&[reg(
-            THHV_VP_REG_RIP,
-            guest_rip.wrapping_add(u64::from(instruction_length)),
-        )])
-    }
-
-    fn advance_rip_and_set_rax(
-        &self,
-        guest_rip: u64,
-        instruction_length: u32,
-        rax: u64,
-    ) -> cpu::Result<()> {
-        self.set_reg_values(&[
-            reg(
-                THHV_VP_REG_RIP,
-                guest_rip.wrapping_add(u64::from(instruction_length)),
-            ),
-            reg(THHV_VP_REG_RAX, rax),
-        ])
     }
 }
 
