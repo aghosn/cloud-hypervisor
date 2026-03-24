@@ -497,7 +497,6 @@ impl VmOps for VmOpsHandler {
 
 pub fn physical_bits(hypervisor: &dyn hypervisor::Hypervisor, max_phys_bits: u8) -> u8 {
     let host_phys_bits = get_host_cpu_phys_bits(hypervisor);
-
     cmp::min(host_phys_bits, max_phys_bits)
 }
 

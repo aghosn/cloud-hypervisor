@@ -1,3 +1,5 @@
+pub mod emulator;
+
 use std::any::Any;
 use std::fs::OpenOptions;
 use std::mem::size_of;
@@ -53,6 +55,7 @@ const EXIT_REASON_EPT_VIOLATION: u32 = 48;
 
 const THEMIC_MSG_SHUTDOWN: u32 = 0x0004;
 
+#[allow(dead_code)]
 const EPT_VIOLATION_DATA_READ: u64 = 1 << 0;
 const EPT_VIOLATION_DATA_WRITE: u64 = 1 << 1;
 const EPT_VIOLATION_EXECUTE: u64 = 1 << 2;
@@ -533,6 +536,13 @@ pub struct ThemisVcpu {
     cpuid: std::sync::Mutex<Vec<CpuIdEntry>>,
 }
 
+impl ThemisVcpu {
+    /// Access the VmOps callbacks (MMIO/PIO/guest-mem dispatch).
+    pub fn vm_ops(&self) -> Option<&Arc<dyn VmOps>> {
+        self.vm_ops.as_ref()
+    }
+}
+
 impl ThemisHypervisor {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> hypervisor::Result<Arc<dyn Hypervisor>> {
@@ -946,8 +956,6 @@ impl Vcpu for ThemisVcpu {
             }
         };
 
-        eprintln!("[THEMIS-DBG] set_regs: rip=0x{:x} rbx=0x{:x} rflags=0x{:x}",
-            regs.rip, regs.rbx, regs.rflags);
         let regs = [
             reg(THHV_VP_REG_RAX, regs.rax),
             reg(THHV_VP_REG_RBX, regs.rbx),
@@ -1562,31 +1570,29 @@ impl ThemisVcpu {
         self.set_reg_values(&[reg(THHV_VP_REG_RAX, eax as u64)])
     }
 
-    fn handle_mmio_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
-        let is_write = msg.exit_qualification & EPT_VIOLATION_DATA_WRITE != 0;
-        let is_read = msg.exit_qualification & EPT_VIOLATION_DATA_READ != 0;
+    fn handle_mmio_exit(&mut self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
         let is_exec = msg.exit_qualification & EPT_VIOLATION_EXECUTE != 0;
-        // Bits 3:5 = 000 means the EPT entry has no permissions (GPA not mapped at all).
         let ept_entry_present = (msg.exit_qualification >> 3) & 0x7 != 0;
 
         // Count MMIO exits for diagnostics.
         let mmio_count = self.mmio_exit_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if mmio_count < 20 || mmio_count % 100 == 0 {
+            let is_write = msg.exit_qualification & EPT_VIOLATION_DATA_WRITE != 0;
             eprintln!(
-                "[MMIO-DBG] #{} {} gpa={:#x} rip={:#x} rax={:#x}",
+                "[MMIO-EMU] #{} {} gpa={:#x} rip={:#x} insn=[{:02x},{:02x},{:02x},{:02x}]",
                 mmio_count,
-                if is_write { "W" } else if is_read { "R" } else { "?" },
+                if is_write { "W" } else { "R" },
                 msg.guest_physical_address,
                 msg.guest_rip,
-                msg.rax,
+                msg.instruction_bytes[0], msg.instruction_bytes[1],
+                msg.instruction_bytes[2], msg.instruction_bytes[3],
             );
         }
 
         if is_exec && !ept_entry_present {
-            // Execute fault on an unmapped page — EPT setup for this region failed.
             return Err(HypervisorCpuError::RunVcpu(
                 anyhow::anyhow!(
-                    "EPT execute fault on unmapped GPA {:#x} (RIP {:#x} qual={:#x}): memory region not set up in child EPT",
+                    "EPT execute fault on unmapped GPA {:#x} (RIP {:#x} qual={:#x})",
                     msg.guest_physical_address,
                     msg.guest_rip,
                     msg.exit_qualification,
@@ -1595,30 +1601,29 @@ impl ThemisVcpu {
             ));
         }
 
-        if is_write {
-            if let Some(vm_ops) = &self.vm_ops {
-                let data = msg.rax.to_le_bytes();
-                vm_ops
-                    .mmio_write(msg.guest_physical_address, &data)
-                    .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
-            }
-            // RIP already advanced by capavisor.
-        } else if is_read {
-            if let Some(vm_ops) = &self.vm_ops {
-                let mut data = [0u8; 8];
-                vm_ops
-                    .mmio_read(msg.guest_physical_address, &mut data)
-                    .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
-                // Use the register decoded by the capavisor from the MMIO instruction.
-                // `reserved` carries the THHV_VP_REG_* constant (0=RAX if not decoded).
-                let dest_reg = if msg.reserved != 0 {
-                    msg.reserved as u64
-                } else {
-                    THHV_VP_REG_RAX
-                };
-                self.set_reg_values(&[reg(dest_reg, u64::from_le_bytes(data))])?;
-            }
-        }
+        // Use the iced-x86 emulator to decode and emulate the faulting instruction.
+        // This handles MOV, MOVZX, CMP, MOVS, STOS, OR, etc. — far more than
+        // the old hand-rolled decoder in the capavisor.
+        let mut ctx = emulator::ThemisEmulatorContext {
+            vcpu: self,
+            mmio_gpa: msg.guest_physical_address,
+            insn_bytes: msg.instruction_bytes,
+        };
+
+        let mut emu = crate::arch::x86::emulator::Emulator::new(&mut ctx);
+        let new_state = emu
+            .emulate_first_insn(0, &msg.instruction_bytes)
+            .map_err(|e| {
+                eprintln!(
+                    "[MMIO-EMU] emulation failed: gpa={:#x} rip={:#x} insn={:02x?}: {e}",
+                    msg.guest_physical_address, msg.guest_rip, &msg.instruction_bytes[..8],
+                );
+                HypervisorCpuError::RunVcpu(anyhow::anyhow!("MMIO emulation failed: {e}").into())
+            })?;
+
+        // Write back GP registers + RIP (MMIO instructions don't modify CRs/sregs).
+        self.set_regs(&new_state.regs)
+            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("set_regs: {e}").into()))?;
 
         Ok(())
     }
