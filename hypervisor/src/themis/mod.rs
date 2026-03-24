@@ -408,6 +408,9 @@ struct ThemisVmState {
     /// APIC-access sentinel page mapped at GPA 0xFEE00000 in the child domain.
     /// Kept alive here so the pinned page is not freed while the domain runs.
     _apic_access: MmapRegion,
+    /// EventFd for the periodic timer interrupt injection.
+    /// Kept alive so the IRQFd registration in thhv.ko remains valid.
+    _timer_eventfd: Mutex<Option<EventFd>>,
     /// Guest memory regions recorded during create_user_memory_region but not
     /// yet sent to the domain.  THHV_SET_GUEST_MEMORY is deferred until
     /// ensure_initialized() so that cloud-hypervisor can finish writing
@@ -441,6 +444,66 @@ impl ThemisVmState {
             .context("failed to initialize Themis partition")?;
         eprintln!("[THEMIS-DBG] INITIALIZE_PARTITION done");
         *initialized = true;
+
+        // Start periodic timer interrupt injection (1 kHz).
+        // Dom1's APIC timer has no hardware emulation; this provides the
+        // scheduling ticks the guest kernel needs.  The EventFd is registered
+        // as an IRQFd so thhv.ko injects LOCAL_TIMER_VECTOR (0xEC) on each
+        // write.  A dedicated thread bridges a timerfd → EventFd.
+        const LOCAL_TIMER_VECTOR: u32 = 0xEC; // arch/x86/include/asm/irq_vectors.h
+
+        let evfd = EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|e| anyhow!("timer eventfd: {e}"))?;
+
+        let mut irqfd = ThhvIrqfd {
+            fd: evfd.as_raw_fd(),
+            gsi: LOCAL_TIMER_VECTOR,
+            flags: 0,
+            rsvd: 0,
+        };
+        ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
+            .context("failed to register timer irqfd")?;
+
+        let evfd_for_thread = evfd
+            .try_clone()
+            .map_err(|e| anyhow!("clone timer eventfd: {e}"))?;
+        std::thread::Builder::new()
+            .name("timer-inject".to_string())
+            .spawn(move || {
+                // Use timerfd for accurate 1 kHz cadence.
+                let tfd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+                if tfd < 0 {
+                    eprintln!("[THEMIS] timer thread: timerfd_create failed");
+                    return;
+                }
+                let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
+                spec.it_interval.tv_nsec = 1_000_000; // 1 ms
+                spec.it_value.tv_nsec = 1_000_000;
+                unsafe {
+                    libc::timerfd_settime(tfd, 0, &spec, std::ptr::null_mut());
+                }
+                let mut buf = [0u8; 8];
+                loop {
+                    let n = unsafe {
+                        libc::read(tfd, buf.as_mut_ptr() as *mut c_void, 8)
+                    };
+                    if n <= 0 {
+                        break;
+                    }
+                    if evfd_for_thread.write(1).is_err() {
+                        break;
+                    }
+                }
+                unsafe { libc::close(tfd) };
+            })
+            .context("failed to spawn timer thread")?;
+
+        eprintln!(
+            "[THEMIS-DBG] timer injection started: vector=0x{:X} @ 1 kHz",
+            LOCAL_TIMER_VECTOR
+        );
+        *self._timer_eventfd.lock().unwrap() = Some(evfd);
+
         Ok(())
     }
 }
@@ -544,6 +607,7 @@ impl Hypervisor for ThemisHypervisor {
                 vp_meta_pages: self.vp_meta_pages,
                 _shared_meta: shared_meta,
                 _apic_access: apic_access,
+                _timer_eventfd: Mutex::new(None),
                 pending_memory: Mutex::new(Vec::new()),
             }),
         }))
