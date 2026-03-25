@@ -448,64 +448,10 @@ impl ThemisVmState {
         eprintln!("[THEMIS-DBG] INITIALIZE_PARTITION done");
         *initialized = true;
 
-        // Start periodic timer interrupt injection (1 kHz).
-        // Dom1's APIC timer has no hardware emulation; this provides the
-        // scheduling ticks the guest kernel needs.  The EventFd is registered
-        // as an IRQFd so thhv.ko injects LOCAL_TIMER_VECTOR (0xEC) on each
-        // write.  A dedicated thread bridges a timerfd → EventFd.
-        const LOCAL_TIMER_VECTOR: u32 = 0xEC; // arch/x86/include/asm/irq_vectors.h
-
-        let evfd = EventFd::new(libc::EFD_NONBLOCK)
-            .map_err(|e| anyhow!("timer eventfd: {e}"))?;
-
-        let mut irqfd = ThhvIrqfd {
-            fd: evfd.as_raw_fd(),
-            gsi: LOCAL_TIMER_VECTOR,
-            flags: 0,
-            rsvd: 0,
-        };
-        ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
-            .context("failed to register timer irqfd")?;
-
-        let evfd_for_thread = evfd
-            .try_clone()
-            .map_err(|e| anyhow!("clone timer eventfd: {e}"))?;
-        std::thread::Builder::new()
-            .name("timer-inject".to_string())
-            .spawn(move || {
-                // Use timerfd for accurate 1 kHz cadence.
-                let tfd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
-                if tfd < 0 {
-                    eprintln!("[THEMIS] timer thread: timerfd_create failed");
-                    return;
-                }
-                let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
-                spec.it_interval.tv_nsec = 1_000_000; // 1 ms
-                spec.it_value.tv_nsec = 1_000_000;
-                unsafe {
-                    libc::timerfd_settime(tfd, 0, &spec, std::ptr::null_mut());
-                }
-                let mut buf = [0u8; 8];
-                loop {
-                    let n = unsafe {
-                        libc::read(tfd, buf.as_mut_ptr() as *mut c_void, 8)
-                    };
-                    if n <= 0 {
-                        break;
-                    }
-                    if evfd_for_thread.write(1).is_err() {
-                        break;
-                    }
-                }
-                unsafe { libc::close(tfd) };
-            })
-            .context("failed to spawn timer thread")?;
-
-        eprintln!(
-            "[THEMIS-DBG] timer injection started: vector=0x{:X} @ 1 kHz",
-            LOCAL_TIMER_VECTOR
-        );
-        *self._timer_eventfd.lock().unwrap() = Some(evfd);
+        // LAPIC timer emulation is set up per-vCPU in create_vcpu():
+        // timerfd + irqfd + background thread.  WRMSR 0x6E0 exits
+        // (trapped by the child MSR bitmap in capavisor) are handled
+        // in handle_wrmsr_exit() which reprograms the timerfd.
 
         Ok(())
     }
@@ -529,11 +475,15 @@ pub struct ThemisVcpu {
     vm_ops: Option<Arc<dyn VmOps>>,
     _meta: MmapRegion,
     _comm: MmapRegion,
-    exit_log_count: std::collections::HashMap<u32, u32>,
-    mmio_exit_count: std::sync::atomic::AtomicU64,
     /// CPUID policy set by CHV via set_cpuid2() before the first run.
     /// Searched by (function, index) on every CPUID exit.
     cpuid: std::sync::Mutex<Vec<CpuIdEntry>>,
+    /// LAPIC timer emulation: timerfd armed to the TSC deadline.
+    /// A background thread reads the timerfd and signals `timer_irq`.
+    timer_fd: OwnedFd,
+    /// EventFd registered as irqfd for LOCAL_TIMER_VECTOR (0xEC).
+    /// Signalled by the timer thread when the deadline fires.
+    _timer_irq: EventFd,
 }
 
 impl ThemisVcpu {
@@ -729,6 +679,64 @@ impl vm::Vm for ThemisVm {
             ioctl_with_mut_ref_ret_fd(self.state.fd.as_raw_fd(), THHV_CREATE_VP, &mut create)
                 .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
 
+        // ── LAPIC timer emulation ──
+        // Create a timerfd that the vCPU run-loop reprograms on each
+        // WRMSR IA32_TSC_DEADLINE (0x6E0).  A background thread bridges
+        // timerfd expirations to an irqfd → thhv injects vector 0xEC.
+        const LOCAL_TIMER_VECTOR: u32 = 0xEC;
+        let timer_fd = unsafe {
+            let fd = libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC);
+            if fd < 0 {
+                return Err(vm::HypervisorVmError::CreateVcpu(
+                    std::io::Error::last_os_error().into(),
+                ));
+            }
+            OwnedFd::from_raw_fd(fd)
+        };
+
+        let timer_irq = EventFd::new(libc::EFD_CLOEXEC)
+            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+
+        // Register the EventFd as an irqfd for vector 0xEC.
+        {
+            let mut irqfd = ThhvIrqfd {
+                fd: timer_irq.as_raw_fd(),
+                gsi: LOCAL_TIMER_VECTOR,
+                flags: 0,
+                rsvd: 0,
+            };
+            ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
+                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+        }
+
+        // Spawn a thread that waits on timerfd and signals the irqfd.
+        let irq_clone = timer_irq.try_clone().unwrap();
+        let timer_fd_dup = unsafe {
+            let raw = libc::dup(timer_fd.as_raw_fd());
+            assert!(raw >= 0, "dup(timer_fd) failed");
+            OwnedFd::from_raw_fd(raw)
+        };
+        std::thread::Builder::new()
+            .name(format!("lapic-timer-{id}"))
+            .spawn(move || {
+                let raw = timer_fd_dup.as_raw_fd();
+                let mut buf = [0u8; 8];
+                loop {
+                    let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut c_void, 8) };
+                    if n <= 0 {
+                        break;
+                    }
+                    let _ = irq_clone.write(1);
+                }
+                drop(timer_fd_dup);
+            })
+            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+
+        eprintln!(
+            "[THEMIS-DBG] vCPU {id}: LAPIC timer emulation ready (timerfd={}, irqfd vec=0x{LOCAL_TIMER_VECTOR:X})",
+            timer_fd.as_raw_fd()
+        );
+
         Ok(Box::new(ThemisVcpu {
             fd: vcpu_fd,
             _vp_index: id,
@@ -736,9 +744,9 @@ impl vm::Vm for ThemisVm {
             vm_ops,
             _meta: meta,
             _comm: comm,
-            exit_log_count: std::collections::HashMap::new(),
-            mmio_exit_count: std::sync::atomic::AtomicU64::new(0),
             cpuid: std::sync::Mutex::new(Vec::new()),
+            timer_fd,
+            _timer_irq: timer_irq,
         }))
     }
 
@@ -1290,15 +1298,14 @@ impl ThemisVcpu {
             return Ok(VmExit::Shutdown);
         }
 
-        // Log first 3 occurrences of each exit reason (diagnostic; remove when stable).
-        let count = self.exit_log_count.entry(msg.exit_reason).or_insert(0);
-        if *count < 3 {
+        // Temporary: log exit reason distribution
+        static EXIT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let en = EXIT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if en < 30 || en % 500 == 0 {
             eprintln!(
-                "[THEMIS-DBG] exit reason={} rip={:#x} qual={:#x} port={} is_write={}",
-                msg.exit_reason, msg.guest_rip, msg.exit_qualification,
-                msg.port_number, msg.is_write
+                "[THEMIS-EXIT] #{en} reason={} rip={:#x} msr_num={:#x}",
+                msg.exit_reason, msg.guest_rip, msg.msr_number
             );
-            *count += 1;
         }
 
         // Exit reason 33 = VM-entry failure due to invalid guest state.
@@ -1319,8 +1326,11 @@ impl ThemisVcpu {
             EXIT_REASON_EXCEPTION_NMI
             | EXIT_REASON_EXTERNAL_INTERRUPT
             | EXIT_REASON_VMCALL
-            | EXIT_REASON_RDMSR
-            | EXIT_REASON_WRMSR => Ok(VmExit::Ignore),
+            | EXIT_REASON_RDMSR => Ok(VmExit::Ignore),
+            EXIT_REASON_WRMSR => {
+                self.handle_wrmsr_exit(&msg);
+                Ok(VmExit::Ignore)
+            }
             EXIT_REASON_TRIPLE_FAULT => {
                 let cr0  = self.get_reg_values(&[THHV_VP_REG_CR0]).unwrap_or_default();
                 let cr3  = self.get_reg_values(&[THHV_VP_REG_CR3]).unwrap_or_default();
@@ -1359,6 +1369,98 @@ impl ThemisVcpu {
                 Ok(VmExit::Ignore)
             }
             _ => Ok(VmExit::Ignore),
+        }
+    }
+
+    /// Handle WRMSR exit — specifically IA32_TSC_DEADLINE (0x6E0) for LAPIC
+    /// timer emulation.  The guest wrote a TSC deadline value; we arm a
+    /// timerfd so the interrupt fires at the right wall-clock time.
+    ///
+    /// TSC_KHZ must match the value exposed to the guest via CPUID leaf 0x15.
+    fn handle_wrmsr_exit(&self, msg: &ThemicInterceptMessage) {
+        const IA32_TSC_DEADLINE: u32 = 0x6E0;
+        const TSC_KHZ: u64 = 3_000_000; // 3 GHz — matches CPUID 0x15
+
+        // Log ALL WRMSR exits (first 20 + every 100th) to verify trapping works.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WRMSR_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = WRMSR_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 20 || n % 100 == 0 {
+            eprintln!(
+                "[THEMIS-MSR] #{n} WRMSR msr={:#x} val={:#x} rip={:#x}",
+                msg.msr_number, msg.msr_value, msg.guest_rip
+            );
+        }
+
+        if msg.msr_number != IA32_TSC_DEADLINE {
+            return;
+        }
+
+        let deadline_tsc = msg.msr_value;
+
+        if deadline_tsc == 0 {
+            // Disarm: guest cancelled the timer.
+            let disarm = libc::itimerspec {
+                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+                it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            };
+            unsafe {
+                libc::timerfd_settime(
+                    self.timer_fd.as_raw_fd(), 0, &disarm, std::ptr::null_mut(),
+                );
+            }
+            return;
+        }
+
+        let now_tsc = unsafe { std::arch::x86_64::_rdtsc() };
+
+        // Debug: log timing for first 20 + every 100th
+        if n < 20 || n % 100 == 0 {
+            let diff = if deadline_tsc > now_tsc {
+                deadline_tsc - now_tsc
+            } else {
+                0
+            };
+            eprintln!(
+                "[THEMIS-TIMER] #{n} deadline={:#x} now={:#x} delta_tsc={} ({} us)",
+                deadline_tsc, now_tsc, diff, diff / (TSC_KHZ / 1_000_000)
+            );
+        }
+
+        if now_tsc >= deadline_tsc {
+            // Already expired — inject immediately via the irqfd.
+            // The timer thread's EventFd is backed by the same irqfd, but
+            // the fastest path is to arm the timerfd with a minimal delay.
+            let fire_now = libc::itimerspec {
+                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+                it_value: libc::timespec { tv_sec: 0, tv_nsec: 1 },
+            };
+            unsafe {
+                libc::timerfd_settime(
+                    self.timer_fd.as_raw_fd(), 0, &fire_now, std::ptr::null_mut(),
+                );
+            }
+            return;
+        }
+
+        let delta_tsc = deadline_tsc - now_tsc;
+        // delta_ns = delta_tsc * 1_000_000 / TSC_KHZ  (avoiding overflow)
+        let delta_ns = delta_tsc / (TSC_KHZ / 1_000_000);
+
+        let tv_sec = (delta_ns / 1_000_000_000) as i64;
+        let tv_nsec = (delta_ns % 1_000_000_000) as i64;
+
+        let arm = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: libc::timespec {
+                tv_sec,
+                tv_nsec: if tv_sec == 0 && tv_nsec == 0 { 1 } else { tv_nsec },
+            },
+        };
+        unsafe {
+            libc::timerfd_settime(
+                self.timer_fd.as_raw_fd(), 0, &arm, std::ptr::null_mut(),
+            );
         }
     }
 
@@ -1406,8 +1508,6 @@ impl ThemisVcpu {
             let src_reg  = thhv_gpr(reg_idx);
             let src_val  = self.get_reg_values(&[src_reg])?[0];
 
-            eprintln!("[CR-ACCESS] MOV CR{} = {:#x} @ rip={:#x}", cr_num, src_val, msg.guest_rip);
-
             match cr_num {
                 0 => {
                     // When enabling paging (PG bit) while EFER.LME=1, also set EFER.LMA.
@@ -1425,7 +1525,6 @@ impl ThemisVcpu {
                             updates.push(reg(THHV_VP_REG_EFER, efer | (1 << 10)));
                         }
                     }
-                    eprintln!("[CR-ACCESS]   old_cr0={:#x} forced_bits={:#x} new_cr0={:#x}", old_cr0, forced_bits, new_cr0);
                     self.set_reg_values(&updates)?;
                 }
                 3 => {
@@ -1510,32 +1609,6 @@ impl ThemisVcpu {
             reg(THHV_VP_REG_RDX, u64::from(edx)),
             // RIP already advanced by capavisor before forwarding the exit.
         ])?;
-        // Log CPUID exits. Print every new (rip, leaf, subleaf) tuple on first
-        // visit; suppress repeats of the *same* tuple but print a summary every
-        // 1000 iterations.  When the leaf/subleaf changes (even at the same rip)
-        // always print — this lets us trace what a "loop" is actually doing.
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static LAST_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
-            static REPEAT_COUNT: AtomicU64 = AtomicU64::new(0);
-            // Pack (rip[31:0] XOR rip[63:32]) | leaf<<32 | subleaf<<48 into a
-            // single u64 key so we detect both rip-same/leaf-different and vice versa.
-            let key: u64 = (msg.guest_rip ^ (msg.guest_rip >> 32))
-                | ((leaf as u64) << 32)
-                | ((subleaf as u64) << 48);
-            let prev = LAST_KEY.swap(key, Ordering::Relaxed);
-            if prev == key {
-                let n = REPEAT_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n == 0 || n % 1000 == 0 {
-                    eprintln!("[CPUID-LOOP] rip={:#x} leaf={:#x}/{:#x} => eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} instr_len={} (n={})",
-                        msg.guest_rip, leaf, subleaf, eax, ebx, ecx, edx, msg.instruction_length, n);
-                }
-            } else {
-                REPEAT_COUNT.store(0, Ordering::Relaxed);
-                eprintln!("[CPUID] rip={:#x} leaf={:#x}/{:#x} => eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} instr_len={}",
-                    msg.guest_rip, leaf, subleaf, eax, ebx, ecx, edx, msg.instruction_length);
-            }
-        }
         Ok(())
     }
 
@@ -1543,6 +1616,16 @@ impl ThemisVcpu {
         let len = usize::from(msg.access_size);
         if len == 0 || len > 4 {
             return Ok(());
+        }
+
+        // Debug: log first few IO exits to verify the path works.
+        static IO_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = IO_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 || (n < 200 && n % 50 == 0) {
+            eprintln!(
+                "[THEMIS-IO] #{} port=0x{:x} size={} write={} rax=0x{:x}",
+                n, msg.port_number, len, msg.is_write, msg.rax
+            );
         }
 
         if msg.is_write != 0 {
@@ -1574,21 +1657,6 @@ impl ThemisVcpu {
         let is_exec = msg.exit_qualification & EPT_VIOLATION_EXECUTE != 0;
         let ept_entry_present = (msg.exit_qualification >> 3) & 0x7 != 0;
 
-        // Count MMIO exits for diagnostics.
-        let mmio_count = self.mmio_exit_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if mmio_count < 20 || mmio_count % 100 == 0 {
-            let is_write = msg.exit_qualification & EPT_VIOLATION_DATA_WRITE != 0;
-            eprintln!(
-                "[MMIO-EMU] #{} {} gpa={:#x} rip={:#x} insn=[{:02x},{:02x},{:02x},{:02x}]",
-                mmio_count,
-                if is_write { "W" } else { "R" },
-                msg.guest_physical_address,
-                msg.guest_rip,
-                msg.instruction_bytes[0], msg.instruction_bytes[1],
-                msg.instruction_bytes[2], msg.instruction_bytes[3],
-            );
-        }
-
         if is_exec && !ept_entry_present {
             return Err(HypervisorCpuError::RunVcpu(
                 anyhow::anyhow!(
@@ -1610,6 +1678,8 @@ impl ThemisVcpu {
             insn_bytes: msg.instruction_bytes,
         };
 
+        let old_rip = msg.guest_rip;
+
         let mut emu = crate::arch::x86::emulator::Emulator::new(&mut ctx);
         let new_state = emu
             .emulate_first_insn(0, &msg.instruction_bytes)
@@ -1620,6 +1690,21 @@ impl ThemisVcpu {
                 );
                 HypervisorCpuError::RunVcpu(anyhow::anyhow!("MMIO emulation failed: {e}").into())
             })?;
+
+        // Debug: log first few MMIO emulations
+        static MMIO_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let mn = MMIO_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let new_rip = match &new_state.regs {
+            crate::StandardRegisters::Themis(r) => r.rip,
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        };
+        if mn < 20 || (mn < 500 && mn % 50 == 0) || mn % 1000 == 0 {
+            eprintln!(
+                "[MMIO-DBG] #{mn} gpa={:#x} old_rip={:#x} new_rip={:#x} insn={:02x?}",
+                msg.guest_physical_address, old_rip, new_rip, &msg.instruction_bytes[..6],
+            );
+        }
 
         // Write back GP registers + RIP (MMIO instructions don't modify CRs/sregs).
         self.set_regs(&new_state.regs)
