@@ -3,7 +3,7 @@ pub mod emulator;
 use std::any::Any;
 use std::fs::OpenOptions;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::ptr;
@@ -52,6 +52,7 @@ const EXIT_REASON_IO_INSTRUCTION: u32 = 30; // Intel SDM: IN, INS, OUT, OUTS
 const EXIT_REASON_RDMSR: u32 = 31;
 const EXIT_REASON_WRMSR: u32 = 32;
 const EXIT_REASON_EPT_VIOLATION: u32 = 48;
+const EXIT_REASON_APIC_ACCESS: u32 = 44;  // Intel SDM: APIC-access MMIO trap
 
 const THEMIC_MSG_SHUTDOWN: u32 = 0x0004;
 
@@ -147,6 +148,7 @@ const THHV_VP_REG_GDTR_LIM: u64 = 0x71;
 const THHV_VP_REG_IDTR_BASE: u64 = 0x72;
 const THHV_VP_REG_IDTR_LIM: u64 = 0x73;
 const THHV_VP_REG_APIC_BASE: u64 = 0xA0;
+const THHV_VP_REG_ACTIVITY_STATE: u64 = 0xB0;
 
 const STANDARD_REG_NAMES: [u64; 18] = [
     THHV_VP_REG_RAX,
@@ -425,6 +427,9 @@ struct ThemisVmState {
     /// configures MSI Address/Data.  Used by register_irqfd() to pass the
     /// correct injection vector to thhv (instead of the GSI number).
     gsi_vectors: Mutex<std::collections::HashMap<u32, u8>>,
+    /// Per-vCPU file descriptors (raw), indexed by vCPU ID.  Used for
+    /// cross-vCPU state updates (e.g., BSP sending SIPI to an AP).
+    vp_fds: Mutex<Vec<RawFd>>,
 }
 
 impl ThemisVmState {
@@ -574,6 +579,7 @@ impl Hypervisor for ThemisHypervisor {
                 _timer_eventfd: Mutex::new(None),
                 pending_memory: Mutex::new(Vec::new()),
                 gsi_vectors: Mutex::new(std::collections::HashMap::new()),
+                vp_fds: Mutex::new(Vec::new()),
             }),
         }))
     }
@@ -743,6 +749,33 @@ impl vm::Vm for ThemisVm {
             "[THEMIS-DBG] vCPU {id}: LAPIC timer emulation ready (timerfd={}, irqfd vec=0x{LOCAL_TIMER_VECTOR:X})",
             timer_fd.as_raw_fd()
         );
+
+        // Register VP fd for cross-vCPU state updates (SIPI delivery).
+        {
+            let raw_fd = vcpu_fd.as_raw_fd();
+            let mut fds = self.state.vp_fds.lock().unwrap();
+            // Grow to fit this vCPU ID.
+            while fds.len() <= id as usize {
+                fds.push(-1);
+            }
+            fds[id as usize] = raw_fd;
+        }
+
+        // Non-BSP vCPUs start in wait-for-SIPI state.  The thhv driver
+        // blocks VP_RUN until ACTIVITY_STATE is set back to 0 (by the
+        // BSP's SIPI handler in handle_run_exit).
+        if id > 0 {
+            let regs = [reg(THHV_VP_REG_ACTIVITY_STATE, 3)];
+            let mut regs = regs.to_vec();
+            let mut header = ThhvVpRegisters {
+                count: regs.len() as u32,
+                rsvd: 0,
+                regs: regs.as_mut_ptr() as usize as u64,
+            };
+            ioctl_with_mut_ref(vcpu_fd.as_raw_fd(), THHV_SET_VP_STATE, &mut header)
+                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+            eprintln!("[THEMIS-DBG] vCPU {id}: set ACTIVITY_STATE=3 (wait-for-SIPI)");
+        }
 
         Ok(Box::new(ThemisVcpu {
             fd: vcpu_fd,
@@ -1362,8 +1395,7 @@ impl ThemisVcpu {
                     cr4.first().copied().unwrap_or(0),
                     efer.first().copied().unwrap_or(0),
                     rax.first().copied().unwrap_or(0));
-                // Re-enter and let it loop so we can observe — will spam log but is diagnosable.
-                Ok(VmExit::Ignore)
+                Ok(VmExit::Reset)
             }
             EXIT_REASON_CPUID => {
                 self.handle_cpuid_exit(&msg)?;
@@ -1384,6 +1416,10 @@ impl ThemisVcpu {
             }
             EXIT_REASON_EPT_VIOLATION => {
                 self.handle_mmio_exit(&msg)?;
+                Ok(VmExit::Ignore)
+            }
+            EXIT_REASON_APIC_ACCESS => {
+                self.handle_apic_access_exit(&msg);
                 Ok(VmExit::Ignore)
             }
             _ => Ok(VmExit::Ignore),
@@ -1729,6 +1765,77 @@ impl ThemisVcpu {
             .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("set_regs: {e}").into()))?;
 
         Ok(())
+    }
+
+    /// Handle APIC-access exit forwarded by capavisor.
+    ///
+    /// Only ICR low writes (offset 0x300) are forwarded.  We parse the ICR
+    /// value to detect INIT (delivery mode 5) and Startup IPI (delivery mode 6).
+    /// For SIPI, we configure the target AP's CS:IP from the SIPI vector and
+    /// transition it from wait-for-SIPI to runnable via THHV_SET_VP_STATE.
+    fn handle_apic_access_exit(&self, msg: &ThemicInterceptMessage) {
+        let icr_val = msg.rax as u32;
+        let delivery_mode = (icr_val >> 8) & 0x7;
+        let dest_shorthand = (icr_val >> 18) & 0x3;
+        let vector = icr_val & 0xFF;
+
+        eprintln!(
+            "[APIC-ICR] vp={} icr={:#x} delivery_mode={} vector={:#x} shorthand={}",
+            self._vp_index, icr_val, delivery_mode, vector, dest_shorthand
+        );
+
+        // Delivery mode 5 = INIT.  Just log; thhv's wait-for-SIPI state
+        // is already set during create_vcpu.
+        if delivery_mode == 5 {
+            eprintln!("[APIC-ICR] INIT IPI — ignored (AP already in wait-for-SIPI)");
+            return;
+        }
+
+        // Delivery mode 6 = Startup IPI (SIPI).
+        if delivery_mode == 6 {
+            // Determine target vCPU.  For shorthand=0 (no shorthand), the
+            // destination APIC ID is in bits 31:24 of ICR high (offset 0x310).
+            // Since we only get the ICR low write, we assume destination =
+            // APIC ID in the VAPIC page.  For 2-vCPU configurations, the
+            // target is always vCPU 1 (the only AP).
+            //
+            // TODO: Read ICR high from guest VAPIC page for full destination
+            // decoding.  For now, broadcast to all non-self vCPUs.
+            let fds = self.vm_state.vp_fds.lock().unwrap();
+            let my_id = self._vp_index as usize;
+
+            for (target_id, &target_fd) in fds.iter().enumerate() {
+                if target_id == my_id || target_fd < 0 {
+                    continue;
+                }
+
+                let startup_addr = (vector as u64) << 12;
+                let cs_selector = (vector as u64) << 8;
+
+                // Set CS:IP and ACTIVITY_STATE=0 on the target AP.
+                // thhv intercepts ACTIVITY_STATE=0 and wakes the blocked
+                // VP_RUN thread.
+                let regs = [
+                    reg(THHV_VP_REG_CS_SEL, cs_selector),
+                    reg(THHV_VP_REG_CS_BASE, startup_addr),
+                    reg(THHV_VP_REG_CS_LIM, 0xFFFF),
+                    reg(THHV_VP_REG_CS_AR, 0x009B),
+                    reg(THHV_VP_REG_RIP, 0),
+                    reg(THHV_VP_REG_ACTIVITY_STATE, 0),
+                ];
+                let mut regs = regs.to_vec();
+                let mut header = ThhvVpRegisters {
+                    count: regs.len() as u32,
+                    rsvd: 0,
+                    regs: regs.as_mut_ptr() as usize as u64,
+                };
+                let res = ioctl_with_mut_ref(target_fd, THHV_SET_VP_STATE, &mut header);
+                eprintln!(
+                    "[APIC-ICR] SIPI vector={:#x} → vCPU {} CS:IP={:#x}:{:#x} result={:?}",
+                    vector, target_id, cs_selector, 0, res
+                );
+            }
+        }
     }
 }
 
