@@ -231,7 +231,7 @@ struct ThhvIrqfd {
     fd: i32,
     gsi: u32,
     flags: u32,
-    rsvd: u32,
+    vector: u32,   // MSI vector to inject (0 = use gsi as vector)
 }
 
 #[repr(C)]
@@ -421,6 +421,10 @@ struct ThemisVmState {
     /// EPT access.  Once SET_GUEST_MEMORY fires the capavisor removes those
     /// pages from dom0's EPT, so all writes must complete before then.
     pending_memory: Mutex<Vec<ThhvSetGuestMemory>>,
+    /// GSI → MSI vector mapping.  Updated by set_gsi_routing() when the guest
+    /// configures MSI Address/Data.  Used by register_irqfd() to pass the
+    /// correct injection vector to thhv (instead of the GSI number).
+    gsi_vectors: Mutex<std::collections::HashMap<u32, u8>>,
 }
 
 impl ThemisVmState {
@@ -569,6 +573,7 @@ impl Hypervisor for ThemisHypervisor {
                 _apic_access: apic_access,
                 _timer_eventfd: Mutex::new(None),
                 pending_memory: Mutex::new(Vec::new()),
+                gsi_vectors: Mutex::new(std::collections::HashMap::new()),
             }),
         }))
     }
@@ -638,16 +643,18 @@ impl vm::Vm for ThemisVm {
     }
 
     fn register_irqfd(&self, fd: &EventFd, gsi: u32) -> vm::Result<()> {
-        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} fd={}", fd.as_raw_fd());
+        let vector = self.state.gsi_vectors.lock().unwrap()
+            .get(&gsi).copied().unwrap_or(0) as u32;
+        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} fd={}", fd.as_raw_fd());
         let mut irqfd = ThhvIrqfd {
             fd: fd.as_raw_fd(),
             gsi,
             flags: 0,
-            rsvd: 0,
+            vector,
         };
         let r = ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
             .map_err(|e| vm::HypervisorVmError::RegisterIrqFd(e.into()));
-        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} result={r:?}");
+        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} result={r:?}");
         r
     }
 
@@ -656,7 +663,7 @@ impl vm::Vm for ThemisVm {
             fd: fd.as_raw_fd(),
             gsi,
             flags: THHV_IRQFD_FLAG_DEASSIGN,
-            rsvd: 0,
+            vector: 0,
         };
         ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
             .map_err(|e| vm::HypervisorVmError::UnregisterIrqFd(e.into()))
@@ -703,7 +710,7 @@ impl vm::Vm for ThemisVm {
                 fd: timer_irq.as_raw_fd(),
                 gsi: LOCAL_TIMER_VECTOR,
                 flags: 0,
-                rsvd: 0,
+                vector: LOCAL_TIMER_VECTOR,
             };
             ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
                 .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
@@ -831,7 +838,18 @@ impl vm::Vm for ThemisVm {
         IrqRoutingEntry::Themis(entry)
     }
 
-    fn set_gsi_routing(&self, _entries: &[IrqRoutingEntry]) -> vm::Result<()> {
+    fn set_gsi_routing(&self, entries: &[IrqRoutingEntry]) -> vm::Result<()> {
+        let mut map = self.state.gsi_vectors.lock().unwrap();
+        map.clear();
+        for entry in entries {
+            if let IrqRoutingEntry::Themis(e) = entry {
+                if e.is_msi {
+                    let vector = (e.msi_data & 0xFF) as u8;
+                    eprintln!("[THEMIS-DBG] gsi_routing: gsi={} → msi_vector={}", e.gsi, vector);
+                    map.insert(e.gsi, vector);
+                }
+            }
+        }
         Ok(())
     }
 
