@@ -88,6 +88,8 @@ const THHV_SEND_SHARED_META: c_ulong = ioctl_iow::<ThhvInitializePartition>(THHV
 const THHV_RUN_VP: c_ulong = ioctl_iowr::<ThhvRunVp>(THHV_IOCTL_MAGIC, 0x20);
 const THHV_GET_VP_STATE: c_ulong = ioctl_iowr::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x21);
 const THHV_SET_VP_STATE: c_ulong = ioctl_iow::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x22);
+const THHV_SET_INTR_POLICY: c_ulong = ioctl_iow::<ThhvSetIntrPolicy>(THHV_IOCTL_MAGIC, 0x18);
+const THHV_INJECT_INTERRUPT: c_ulong = ioctl_iow::<ThhvInjectInterrupt>(THHV_IOCTL_MAGIC, 0x19);
 
 const THHV_VP_REG_RAX: u64 = 0x00;
 const THHV_VP_REG_RBX: u64 = 0x01;
@@ -233,7 +235,9 @@ struct ThhvIrqfd {
     fd: i32,
     gsi: u32,
     flags: u32,
-    vector: u32,   // MSI vector to inject (0 = use gsi as vector)
+    vector: u32,     // MSI vector to inject (0 = use gsi as vector)
+    vp_index: u32,   // Target VP for injection (0 = BSP)
+    rsvd: u32,
 }
 
 #[repr(C)]
@@ -256,6 +260,22 @@ impl Default for ThhvRunVp {
     fn default() -> Self {
         Self { msg_buf: [0; 256] }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ThhvSetIntrPolicy {
+    vector: u8,
+    visibility: u8,
+    pad: [u8; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ThhvInjectInterrupt {
+    vp_index: u32,
+    vector: u8,
+    pad: [u8; 3],
 }
 
 #[repr(C)]
@@ -430,6 +450,10 @@ struct ThemisVmState {
     /// Per-vCPU file descriptors (raw), indexed by vCPU ID.  Used for
     /// cross-vCPU state updates (e.g., BSP sending SIPI to an AP).
     vp_fds: Mutex<Vec<RawFd>>,
+    /// Per-vCPU software LAPIC register state (1024 × u32 = 4 KiB per vCPU).
+    /// Used when VIRTUALIZE_APIC_ACCESSES is not available: LAPIC MMIO
+    /// accesses cause EPT violations that are emulated here in software.
+    lapic_regs: Mutex<Vec<[u32; 1024]>>,
 }
 
 impl ThemisVmState {
@@ -580,6 +604,7 @@ impl Hypervisor for ThemisHypervisor {
                 pending_memory: Mutex::new(Vec::new()),
                 gsi_vectors: Mutex::new(std::collections::HashMap::new()),
                 vp_fds: Mutex::new(Vec::new()),
+                lapic_regs: Mutex::new(Vec::new()),
             }),
         }))
     }
@@ -657,6 +682,8 @@ impl vm::Vm for ThemisVm {
             gsi,
             flags: 0,
             vector,
+            vp_index: 0,
+            rsvd: 0,
         };
         let r = ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
             .map_err(|e| vm::HypervisorVmError::RegisterIrqFd(e.into()));
@@ -670,6 +697,8 @@ impl vm::Vm for ThemisVm {
             gsi,
             flags: THHV_IRQFD_FLAG_DEASSIGN,
             vector: 0,
+            vp_index: 0,
+            rsvd: 0,
         };
         ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
             .map_err(|e| vm::HypervisorVmError::UnregisterIrqFd(e.into()))
@@ -710,13 +739,15 @@ impl vm::Vm for ThemisVm {
         let timer_irq = EventFd::new(libc::EFD_CLOEXEC)
             .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
 
-        // Register the EventFd as an irqfd for vector 0xEC.
+        // Register the EventFd as an irqfd for vector 0xEC, targeting this vCPU.
         {
             let mut irqfd = ThhvIrqfd {
                 fd: timer_irq.as_raw_fd(),
                 gsi: LOCAL_TIMER_VECTOR,
                 flags: 0,
                 vector: LOCAL_TIMER_VECTOR,
+                vp_index: id as u32,
+                rsvd: 0,
             };
             ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
                 .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
@@ -775,6 +806,28 @@ impl vm::Vm for ThemisVm {
             ioctl_with_mut_ref(vcpu_fd.as_raw_fd(), THHV_SET_VP_STATE, &mut header)
                 .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
             eprintln!("[THEMIS-DBG] vCPU {id}: set ACTIVITY_STATE=3 (wait-for-SIPI)");
+        }
+
+        // Initialize per-vCPU software LAPIC state.
+        {
+            let mut lapic = self.state.lapic_regs.lock().unwrap();
+            while lapic.len() <= id as usize {
+                lapic.push([0u32; 1024]);
+            }
+            let regs = &mut lapic[id as usize];
+            regs[0x020 / 4] = (id as u32) << 24;        // APIC ID
+            regs[0x030 / 4] = 0x0005_0014;               // Version: v20, 6 LVT entries
+            regs[0x0D0 / 4] = 0;                          // LDR
+            regs[0x0E0 / 4] = 0xFFFF_FFFF;                // DFR: flat model
+            regs[0x0F0 / 4] = 0x0000_01FF;                // SVR: APIC enabled, vector 0xFF
+            // LVT entries: masked by default
+            regs[0x320 / 4] = 0x0001_0000;                // LVT Timer (masked)
+            regs[0x350 / 4] = 0x0001_0000;                // LVT LINT0 (masked)
+            regs[0x360 / 4] = 0x0001_0000;                // LVT LINT1 (masked)
+            regs[0x370 / 4] = 0x0001_0000;                // LVT Error (masked)
+            regs[0x340 / 4] = 0x0001_0000;                // LVT PerfMon (masked)
+            regs[0x330 / 4] = 0x0001_0000;                // LVT Thermal (masked)
+            regs[0x3E0 / 4] = 0x0000_000B;                // Timer DCR: divide by 1
         }
 
         Ok(Box::new(ThemisVcpu {
@@ -1352,10 +1405,12 @@ impl ThemisVcpu {
         // Temporary: log exit reason distribution
         static EXIT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let en = EXIT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if en < 30 || en % 500 == 0 {
+        // Always log AP exits (vp_index > 0) for the first 20 + every 5000th
+        let is_ap = self._vp_index > 0;
+        if en < 30 || en % 500 == 0 || (is_ap && (en < 39550 || en % 5000 == 0)) {
             eprintln!(
-                "[THEMIS-EXIT] #{en} reason={} rip={:#x} msr_num={:#x}",
-                msg.exit_reason, msg.guest_rip, msg.msr_number
+                "[THEMIS-EXIT] #{en} vp={} reason={} rip={:#x} msr_num={:#x}",
+                self._vp_index, msg.exit_reason, msg.guest_rip, msg.msr_number
             );
         }
 
@@ -1708,6 +1763,14 @@ impl ThemisVcpu {
     }
 
     fn handle_mmio_exit(&mut self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
+        // LAPIC MMIO fast-path: when VIRTUALIZE_APIC_ACCESSES is not
+        // supported, LAPIC accesses cause EPT violations.  Handle them
+        // here with per-vCPU software LAPIC state + instruction decode.
+        let gpa = msg.guest_physical_address;
+        if gpa >= 0xFEE0_0000 && gpa < 0xFEE0_1000 {
+            return self.handle_lapic_mmio(msg);
+        }
+
         let is_exec = msg.exit_qualification & EPT_VIOLATION_EXECUTE != 0;
         let ept_entry_present = (msg.exit_qualification >> 3) & 0x7 != 0;
 
@@ -1767,75 +1830,457 @@ impl ThemisVcpu {
         Ok(())
     }
 
-    /// Handle APIC-access exit forwarded by capavisor.
+    // ── Software LAPIC emulation (EPT-violation fallback) ──────────── //
+
+    /// Handle an EPT violation at the LAPIC MMIO range (0xFEE00000-0xFEE00FFF).
+    ///
+    /// When hardware VIRTUALIZE_APIC_ACCESSES is not available, the LAPIC page
+    /// is left unmapped in the child EPT.  All accesses cause EPT violations
+    /// that arrive here.  We decode the faulting instruction with iced-x86,
+    /// emulate the LAPIC register read/write, and advance RIP.
+    fn handle_lapic_mmio(&mut self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
+        use iced_x86::{Decoder, DecoderOptions, OpKind};
+
+        let offset = (msg.guest_physical_address & 0xFFF) as u32;
+        let is_write = (msg.exit_qualification >> 1) & 1 != 0;
+
+        // Decode the faulting instruction.
+        let mut decoder = Decoder::with_ip(
+            64,
+            &msg.instruction_bytes,
+            msg.guest_rip,
+            DecoderOptions::NONE,
+        );
+        let insn = decoder.decode();
+        let insn_len = insn.len() as u64;
+
+        if insn_len == 0 {
+            eprintln!(
+                "[LAPIC] failed to decode insn at RIP={:#x} bytes={:02x?}",
+                msg.guest_rip,
+                &msg.instruction_bytes[..8]
+            );
+            return Err(HypervisorCpuError::RunVcpu(
+                anyhow::anyhow!("LAPIC MMIO: instruction decode failed").into(),
+            ));
+        }
+
+        // Read current GP register state from the guest VMCS.
+        let gregs = self
+            .get_regs()
+            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("get_regs: {e}").into()))?;
+        let mut gregs = match gregs {
+            crate::StandardRegisters::Themis(r) => r,
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(HypervisorCpuError::RunVcpu(
+                    anyhow::anyhow!("unexpected register type").into(),
+                ))
+            }
+        };
+
+        if is_write {
+            // Extract the value being written from the source operand.
+            // Typical instruction: MOV dword [mem], reg  (op0=mem, op1=reg)
+            //                  or: MOV dword [mem], imm  (op0=mem, op1=imm)
+            let value = if insn.op_count() >= 2 {
+                match insn.op1_kind() {
+                    OpKind::Register => {
+                        Self::read_iced_reg(&gregs, insn.op1_register()) as u32
+                    }
+                    OpKind::Immediate32 | OpKind::Immediate32to64 => insn.immediate32(),
+                    OpKind::Immediate8 | OpKind::Immediate8to32 => insn.immediate8to32() as u32,
+                    OpKind::Immediate16 => insn.immediate16() as u32,
+                    _ => {
+                        eprintln!(
+                            "[LAPIC] unhandled write operand kind {:?} at RIP={:#x}",
+                            insn.op1_kind(),
+                            msg.guest_rip
+                        );
+                        0
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[LAPIC] write with {} operands at RIP={:#x}",
+                    insn.op_count(),
+                    msg.guest_rip
+                );
+                0
+            };
+
+            // Store in per-vCPU LAPIC register file.
+            {
+                let mut lapic = self.vm_state.lapic_regs.lock().unwrap();
+                let vp = self._vp_index as usize;
+                if vp < lapic.len() {
+                    lapic[vp][(offset / 4) as usize] = value;
+                }
+            }
+
+            // Handle side effects for specific registers.
+            match offset {
+                0x300 => {
+                    // ICR low write — detect INIT/SIPI.
+                    self.deliver_ipi(value);
+                }
+                0x0B0 => {
+                    // EOI — no action needed; interrupt injection uses VMENTRY.
+                }
+                _ => {}
+            }
+
+            // Debug: log first few LAPIC writes.
+            static LAPIC_W_LOG: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = LAPIC_W_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 30 || n % 500 == 0 {
+                eprintln!(
+                    "[LAPIC-W] #{n} vp={} offset={:#x} value={:#x}",
+                    self._vp_index, offset, value
+                );
+            }
+        } else {
+            // Read: return per-vCPU register value.
+            let value = {
+                let lapic = self.vm_state.lapic_regs.lock().unwrap();
+                let vp = self._vp_index as usize;
+                if vp < lapic.len() {
+                    lapic[vp][(offset / 4) as usize]
+                } else {
+                    0
+                }
+            };
+
+            // Store into destination register (op0 for MOV reg, [mem]).
+            if insn.op_count() >= 1 && insn.op0_kind() == OpKind::Register {
+                Self::write_iced_reg(&mut gregs, insn.op0_register(), value as u64);
+            }
+
+            static LAPIC_R_LOG: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = LAPIC_R_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 30 || n % 500 == 0 {
+                eprintln!(
+                    "[LAPIC-R] #{n} vp={} offset={:#x} value={:#x}",
+                    self._vp_index, offset, value
+                );
+            }
+        }
+
+        // Advance RIP past the faulting instruction.
+        gregs.rip += insn_len;
+        self.set_regs(&crate::StandardRegisters::Themis(gregs))
+            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("set_regs: {e}").into()))?;
+
+        Ok(())
+    }
+
+    /// Read a guest GPR value by iced-x86 Register enum.
+    fn read_iced_reg(gregs: &ThemisStandardRegisters, r: iced_x86::Register) -> u64 {
+        use iced_x86::Register::*;
+        match r {
+            RAX | EAX | AX | AL => gregs.rax,
+            RBX | EBX | BX | BL => gregs.rbx,
+            RCX | ECX | CX | CL => gregs.rcx,
+            RDX | EDX | DX | DL => gregs.rdx,
+            RSI | ESI | SI | SIL => gregs.rsi,
+            RDI | EDI | DI | DIL => gregs.rdi,
+            RSP | ESP | SP => gregs.rsp,
+            RBP | EBP | BP => gregs.rbp,
+            R8 | R8D | R8W | R8L => gregs.r8,
+            R9 | R9D | R9W | R9L => gregs.r9,
+            R10 | R10D | R10W | R10L => gregs.r10,
+            R11 | R11D | R11W | R11L => gregs.r11,
+            R12 | R12D | R12W | R12L => gregs.r12,
+            R13 | R13D | R13W | R13L => gregs.r13,
+            R14 | R14D | R14W | R14L => gregs.r14,
+            R15 | R15D | R15W | R15L => gregs.r15,
+            // High-byte registers: extract bits 15:8
+            AH => (gregs.rax >> 8) & 0xFF,
+            BH => (gregs.rbx >> 8) & 0xFF,
+            CH => (gregs.rcx >> 8) & 0xFF,
+            DH => (gregs.rdx >> 8) & 0xFF,
+            _ => {
+                eprintln!("[LAPIC] read_iced_reg: unhandled register {:?}", r);
+                0
+            }
+        }
+    }
+
+    /// Write a value into a guest GPR by iced-x86 Register enum.
+    fn write_iced_reg(gregs: &mut ThemisStandardRegisters, r: iced_x86::Register, val: u64) {
+        use iced_x86::Register::*;
+        match r {
+            RAX => gregs.rax = val,
+            EAX => gregs.rax = val & 0xFFFF_FFFF, // 32-bit writes zero-extend
+            AX => gregs.rax = (gregs.rax & !0xFFFF) | (val & 0xFFFF),
+            AL => gregs.rax = (gregs.rax & !0xFF) | (val & 0xFF),
+            AH => gregs.rax = (gregs.rax & !0xFF00) | ((val & 0xFF) << 8),
+            RBX => gregs.rbx = val,
+            EBX => gregs.rbx = val & 0xFFFF_FFFF,
+            BX => gregs.rbx = (gregs.rbx & !0xFFFF) | (val & 0xFFFF),
+            BL => gregs.rbx = (gregs.rbx & !0xFF) | (val & 0xFF),
+            BH => gregs.rbx = (gregs.rbx & !0xFF00) | ((val & 0xFF) << 8),
+            RCX => gregs.rcx = val,
+            ECX => gregs.rcx = val & 0xFFFF_FFFF,
+            CX => gregs.rcx = (gregs.rcx & !0xFFFF) | (val & 0xFFFF),
+            CL => gregs.rcx = (gregs.rcx & !0xFF) | (val & 0xFF),
+            CH => gregs.rcx = (gregs.rcx & !0xFF00) | ((val & 0xFF) << 8),
+            RDX => gregs.rdx = val,
+            EDX => gregs.rdx = val & 0xFFFF_FFFF,
+            DX => gregs.rdx = (gregs.rdx & !0xFFFF) | (val & 0xFFFF),
+            DL => gregs.rdx = (gregs.rdx & !0xFF) | (val & 0xFF),
+            DH => gregs.rdx = (gregs.rdx & !0xFF00) | ((val & 0xFF) << 8),
+            RSI => gregs.rsi = val,
+            ESI => gregs.rsi = val & 0xFFFF_FFFF,
+            SI => gregs.rsi = (gregs.rsi & !0xFFFF) | (val & 0xFFFF),
+            SIL => gregs.rsi = (gregs.rsi & !0xFF) | (val & 0xFF),
+            RDI => gregs.rdi = val,
+            EDI => gregs.rdi = val & 0xFFFF_FFFF,
+            DI => gregs.rdi = (gregs.rdi & !0xFFFF) | (val & 0xFFFF),
+            DIL => gregs.rdi = (gregs.rdi & !0xFF) | (val & 0xFF),
+            RSP => gregs.rsp = val,
+            ESP => gregs.rsp = val & 0xFFFF_FFFF,
+            SP => gregs.rsp = (gregs.rsp & !0xFFFF) | (val & 0xFFFF),
+            SPL => gregs.rsp = (gregs.rsp & !0xFF) | (val & 0xFF),
+            RBP => gregs.rbp = val,
+            EBP => gregs.rbp = val & 0xFFFF_FFFF,
+            BP => gregs.rbp = (gregs.rbp & !0xFFFF) | (val & 0xFFFF),
+            BPL => gregs.rbp = (gregs.rbp & !0xFF) | (val & 0xFF),
+            R8 => gregs.r8 = val,
+            R8D => gregs.r8 = val & 0xFFFF_FFFF,
+            R8W => gregs.r8 = (gregs.r8 & !0xFFFF) | (val & 0xFFFF),
+            R8L => gregs.r8 = (gregs.r8 & !0xFF) | (val & 0xFF),
+            R9 => gregs.r9 = val,
+            R9D => gregs.r9 = val & 0xFFFF_FFFF,
+            R9W => gregs.r9 = (gregs.r9 & !0xFFFF) | (val & 0xFFFF),
+            R9L => gregs.r9 = (gregs.r9 & !0xFF) | (val & 0xFF),
+            R10 => gregs.r10 = val,
+            R10D => gregs.r10 = val & 0xFFFF_FFFF,
+            R10W => gregs.r10 = (gregs.r10 & !0xFFFF) | (val & 0xFFFF),
+            R10L => gregs.r10 = (gregs.r10 & !0xFF) | (val & 0xFF),
+            R11 => gregs.r11 = val,
+            R11D => gregs.r11 = val & 0xFFFF_FFFF,
+            R11W => gregs.r11 = (gregs.r11 & !0xFFFF) | (val & 0xFFFF),
+            R11L => gregs.r11 = (gregs.r11 & !0xFF) | (val & 0xFF),
+            R12 => gregs.r12 = val,
+            R12D => gregs.r12 = val & 0xFFFF_FFFF,
+            R12W => gregs.r12 = (gregs.r12 & !0xFFFF) | (val & 0xFFFF),
+            R12L => gregs.r12 = (gregs.r12 & !0xFF) | (val & 0xFF),
+            R13 => gregs.r13 = val,
+            R13D => gregs.r13 = val & 0xFFFF_FFFF,
+            R13W => gregs.r13 = (gregs.r13 & !0xFFFF) | (val & 0xFFFF),
+            R13L => gregs.r13 = (gregs.r13 & !0xFF) | (val & 0xFF),
+            R14 => gregs.r14 = val,
+            R14D => gregs.r14 = val & 0xFFFF_FFFF,
+            R14W => gregs.r14 = (gregs.r14 & !0xFFFF) | (val & 0xFFFF),
+            R14L => gregs.r14 = (gregs.r14 & !0xFF) | (val & 0xFF),
+            R15 => gregs.r15 = val,
+            R15D => gregs.r15 = val & 0xFFFF_FFFF,
+            R15W => gregs.r15 = (gregs.r15 & !0xFFFF) | (val & 0xFFFF),
+            R15L => gregs.r15 = (gregs.r15 & !0xFF) | (val & 0xFF),
+            _ => {
+                eprintln!("[LAPIC] write_iced_reg: unhandled register {:?}", r);
+            }
+        }
+    }
+
+    /// Deliver an IPI based on the ICR low value.
+    /// Handles IPI delivery modes: Fixed (0), INIT (5), and SIPI (6).
+    fn deliver_ipi(&self, icr_low: u32) {
+        let delivery_mode = (icr_low >> 8) & 0x7;
+        let vector = icr_low & 0xFF;
+        let dest_shorthand = (icr_low >> 18) & 0x3;
+
+        // Read ICR_HIGH (destination APIC ID) from this vCPU's LAPIC state.
+        let dest_apic_id = {
+            let lapic = self.vm_state.lapic_regs.lock().unwrap();
+            let vp = self._vp_index as usize;
+            if vp < lapic.len() {
+                (lapic[vp][0x310 / 4] >> 24) & 0xFF
+            } else {
+                0
+            }
+        };
+
+        eprintln!(
+            "[LAPIC-IPI] vp={} icr_low={:#x} mode={} vector={:#x} shorthand={} dest_apic={}",
+            self._vp_index, icr_low, delivery_mode, vector, dest_shorthand, dest_apic_id
+        );
+
+        match delivery_mode {
+            0 | 1 => {
+                // Fixed (0) or Lowest Priority (1) — inject vector into target VP.
+                self.deliver_fixed_ipi(vector as u8, dest_shorthand, dest_apic_id);
+            }
+            5 => {
+                // INIT — AP is already in wait-for-SIPI (set at create_vcpu).
+                eprintln!("[LAPIC-IPI] INIT IPI — no-op (AP in wait-for-SIPI)");
+            }
+            6 => {
+                // Startup IPI (SIPI) — wake target AP with CS:IP from vector.
+                self.deliver_sipi(vector);
+            }
+            _ => {
+                eprintln!(
+                    "[LAPIC-IPI] unhandled delivery mode {} — ignored",
+                    delivery_mode
+                );
+            }
+        }
+    }
+
+    /// Deliver a Fixed-mode IPI: inject vector into target VP(s) via THHV_INJECT_INTERRUPT.
+    fn deliver_fixed_ipi(&self, vector: u8, dest_shorthand: u32, dest_apic_id: u32) {
+        let fds = self.vm_state.vp_fds.lock().unwrap();
+        let num_vps = fds.len();
+
+        // Determine target VP indices based on destination shorthand.
+        let targets: Vec<usize> = match dest_shorthand {
+            0 => {
+                // No shorthand — use dest_apic_id.
+                // APIC ID = vp_index (simple 1:1 mapping).
+                let target = dest_apic_id as usize;
+                if target < num_vps { vec![target] } else { vec![] }
+            }
+            1 => vec![self._vp_index as usize], // Self
+            2 => (0..num_vps).collect(),         // All including self
+            3 => {
+                // All excluding self
+                (0..num_vps).filter(|&i| i != self._vp_index as usize).collect()
+            }
+            _ => vec![],
+        };
+
+        let part_fd = self.vm_state.fd.as_raw_fd();
+        for target_vp in targets {
+            let mut ii = ThhvInjectInterrupt {
+                vp_index: target_vp as u32,
+                vector,
+                pad: [0; 3],
+            };
+            let ret = unsafe {
+                libc::ioctl(part_fd, THHV_INJECT_INTERRUPT as libc::c_ulong, &mut ii)
+            };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!(
+                    "[LAPIC-IPI] Fixed IPI inject failed: vp={} vector={:#x} err={:?}",
+                    target_vp, vector, err
+                );
+            } else {
+                eprintln!(
+                    "[LAPIC-IPI] Fixed IPI injected: vp={} vector={:#x}",
+                    target_vp, vector
+                );
+            }
+        }
+    }
+
+    /// Deliver SIPI to all non-self vCPUs: set full real-mode state and wake AP.
+    ///
+    /// After SIPI, the AP must be in real mode with CS:IP from the SIPI vector
+    /// and all other segments in their reset defaults.  We also clear GP regs
+    /// and set RFLAGS=0x2, CR0=0 (real mode; capavisor adjusts NE/ET), CR3/CR4/EFER=0.
+    fn deliver_sipi(&self, vector: u32) {
+        let fds = self.vm_state.vp_fds.lock().unwrap();
+        let my_id = self._vp_index as usize;
+
+        for (target_id, &target_fd) in fds.iter().enumerate() {
+            if target_id == my_id || target_fd < 0 {
+                continue;
+            }
+
+            let startup_addr = (vector as u64) << 12;
+            let cs_selector = (vector as u64) << 8;
+
+            // Real-mode segment access rights: present, R/W data for data segs,
+            // execute/read for CS.
+            let data_ar: u64 = 0x0093; // P=1, S=1, type=3 (R/W accessed)
+            let code_ar: u64 = 0x009B; // P=1, S=1, type=B (exec/read accessed)
+
+            let regs = [
+                // CS from SIPI vector
+                reg(THHV_VP_REG_CS_SEL, cs_selector),
+                reg(THHV_VP_REG_CS_BASE, startup_addr),
+                reg(THHV_VP_REG_CS_LIM, 0xFFFF),
+                reg(THHV_VP_REG_CS_AR, code_ar),
+                // DS/ES/FS/GS/SS = 0:0 with 64K limit (real-mode reset)
+                reg(THHV_VP_REG_DS_SEL, 0),
+                reg(THHV_VP_REG_DS_BASE, 0),
+                reg(THHV_VP_REG_DS_LIM, 0xFFFF),
+                reg(THHV_VP_REG_DS_AR, data_ar),
+                reg(THHV_VP_REG_ES_SEL, 0),
+                reg(THHV_VP_REG_ES_BASE, 0),
+                reg(THHV_VP_REG_ES_LIM, 0xFFFF),
+                reg(THHV_VP_REG_ES_AR, data_ar),
+                reg(THHV_VP_REG_FS_SEL, 0),
+                reg(THHV_VP_REG_FS_BASE, 0),
+                reg(THHV_VP_REG_FS_LIM, 0xFFFF),
+                reg(THHV_VP_REG_FS_AR, data_ar),
+                reg(THHV_VP_REG_GS_SEL, 0),
+                reg(THHV_VP_REG_GS_BASE, 0),
+                reg(THHV_VP_REG_GS_LIM, 0xFFFF),
+                reg(THHV_VP_REG_GS_AR, data_ar),
+                reg(THHV_VP_REG_SS_SEL, 0),
+                reg(THHV_VP_REG_SS_BASE, 0),
+                reg(THHV_VP_REG_SS_LIM, 0xFFFF),
+                reg(THHV_VP_REG_SS_AR, data_ar),
+                // GDT/IDT with zero base (Linux trampoline sets its own)
+                reg(THHV_VP_REG_GDTR_BASE, 0),
+                reg(THHV_VP_REG_GDTR_LIM, 0xFFFF),
+                reg(THHV_VP_REG_IDTR_BASE, 0),
+                reg(THHV_VP_REG_IDTR_LIM, 0xFFFF),
+                // RIP = 0 (offset within CS segment)
+                reg(THHV_VP_REG_RIP, 0),
+                // RFLAGS = 0x2 (reserved bit 1 always set)
+                reg(THHV_VP_REG_RFLAGS, 0x2),
+                // CR0: PE=0 for real mode. The capavisor's vmcs_adjust_cr0()
+                // will add NE/ET bits required by IA32_VMX_CR0_FIXED0.
+                // UNRESTRICTED_GUEST exempts PE and PG from FIXED0 requirements.
+                reg(THHV_VP_REG_CR0, 0x00),
+                reg(THHV_VP_REG_CR3, 0),
+                reg(THHV_VP_REG_CR4, 0),
+                reg(THHV_VP_REG_EFER, 0),
+                // Clear GP regs
+                reg(THHV_VP_REG_RAX, 0),
+                reg(THHV_VP_REG_RBX, 0),
+                reg(THHV_VP_REG_RCX, 0),
+                reg(THHV_VP_REG_RDX, 0),
+                reg(THHV_VP_REG_RSI, 0),
+                reg(THHV_VP_REG_RDI, 0),
+                reg(THHV_VP_REG_RBP, 0),
+                reg(THHV_VP_REG_RSP, 0),
+                // Wake the AP
+                reg(THHV_VP_REG_ACTIVITY_STATE, 0),
+            ];
+            let mut regs = regs.to_vec();
+            let mut header = ThhvVpRegisters {
+                count: regs.len() as u32,
+                rsvd: 0,
+                regs: regs.as_mut_ptr() as usize as u64,
+            };
+            let res = ioctl_with_mut_ref(target_fd, THHV_SET_VP_STATE, &mut header);
+            eprintln!(
+                "[LAPIC-IPI] SIPI vector={:#x} → vCPU {} CS:IP={:#x}:{:#x} result={:?}",
+                vector, target_id, cs_selector, 0, res
+            );
+        }
+    }
+
+    /// Handle APIC-access exit forwarded by capavisor (Mode A — APICv).
     ///
     /// Only ICR low writes (offset 0x300) are forwarded.  We parse the ICR
     /// value to detect INIT (delivery mode 5) and Startup IPI (delivery mode 6).
     /// For SIPI, we configure the target AP's CS:IP from the SIPI vector and
     /// transition it from wait-for-SIPI to runnable via THHV_SET_VP_STATE.
     fn handle_apic_access_exit(&self, msg: &ThemicInterceptMessage) {
+        // In Mode A, the capavisor reads RAX as the ICR value.
+        // Note: this assumes the compiler used RAX for the writel() —
+        // a latent bug; will be fixed when we test on real hardware.
         let icr_val = msg.rax as u32;
-        let delivery_mode = (icr_val >> 8) & 0x7;
-        let dest_shorthand = (icr_val >> 18) & 0x3;
-        let vector = icr_val & 0xFF;
-
-        eprintln!(
-            "[APIC-ICR] vp={} icr={:#x} delivery_mode={} vector={:#x} shorthand={}",
-            self._vp_index, icr_val, delivery_mode, vector, dest_shorthand
-        );
-
-        // Delivery mode 5 = INIT.  Just log; thhv's wait-for-SIPI state
-        // is already set during create_vcpu.
-        if delivery_mode == 5 {
-            eprintln!("[APIC-ICR] INIT IPI — ignored (AP already in wait-for-SIPI)");
-            return;
-        }
-
-        // Delivery mode 6 = Startup IPI (SIPI).
-        if delivery_mode == 6 {
-            // Determine target vCPU.  For shorthand=0 (no shorthand), the
-            // destination APIC ID is in bits 31:24 of ICR high (offset 0x310).
-            // Since we only get the ICR low write, we assume destination =
-            // APIC ID in the VAPIC page.  For 2-vCPU configurations, the
-            // target is always vCPU 1 (the only AP).
-            //
-            // TODO: Read ICR high from guest VAPIC page for full destination
-            // decoding.  For now, broadcast to all non-self vCPUs.
-            let fds = self.vm_state.vp_fds.lock().unwrap();
-            let my_id = self._vp_index as usize;
-
-            for (target_id, &target_fd) in fds.iter().enumerate() {
-                if target_id == my_id || target_fd < 0 {
-                    continue;
-                }
-
-                let startup_addr = (vector as u64) << 12;
-                let cs_selector = (vector as u64) << 8;
-
-                // Set CS:IP and ACTIVITY_STATE=0 on the target AP.
-                // thhv intercepts ACTIVITY_STATE=0 and wakes the blocked
-                // VP_RUN thread.
-                let regs = [
-                    reg(THHV_VP_REG_CS_SEL, cs_selector),
-                    reg(THHV_VP_REG_CS_BASE, startup_addr),
-                    reg(THHV_VP_REG_CS_LIM, 0xFFFF),
-                    reg(THHV_VP_REG_CS_AR, 0x009B),
-                    reg(THHV_VP_REG_RIP, 0),
-                    reg(THHV_VP_REG_ACTIVITY_STATE, 0),
-                ];
-                let mut regs = regs.to_vec();
-                let mut header = ThhvVpRegisters {
-                    count: regs.len() as u32,
-                    rsvd: 0,
-                    regs: regs.as_mut_ptr() as usize as u64,
-                };
-                let res = ioctl_with_mut_ref(target_fd, THHV_SET_VP_STATE, &mut header);
-                eprintln!(
-                    "[APIC-ICR] SIPI vector={:#x} → vCPU {} CS:IP={:#x}:{:#x} result={:?}",
-                    vector, target_id, cs_selector, 0, res
-                );
-            }
-        }
+        self.deliver_ipi(icr_val);
     }
 }
 
