@@ -61,6 +61,34 @@ const EPT_VIOLATION_DATA_READ: u64 = 1 << 0;
 const EPT_VIOLATION_DATA_WRITE: u64 = 1 << 1;
 const EPT_VIOLATION_EXECUTE: u64 = 1 << 2;
 
+// ── APIC register offsets (Intel SDM Vol 3A §10.4.1) ──────────────────────
+const APIC_REG_ICR_LOW: u32 = 0x300;
+const APIC_REG_ICR_HIGH: u32 = 0x310;
+const APIC_REG_EOI: u32 = 0x0B0;
+
+// ── ICR bit fields (Intel SDM Vol 3A §10.6.1) ────────────────────────────
+const ICR_VECTOR_MASK: u32 = 0xFF;
+const ICR_DELIVERY_MODE_SHIFT: u32 = 8;
+const ICR_DELIVERY_MODE_MASK: u32 = 0x7;
+const ICR_DEST_SHORTHAND_SHIFT: u32 = 18;
+const ICR_DEST_SHORTHAND_MASK: u32 = 0x3;
+const ICR_HIGH_DEST_SHIFT: u32 = 24;
+const ICR_HIGH_DEST_MASK: u32 = 0xFF;
+
+// ICR delivery modes
+const ICR_MODE_FIXED: u32 = 0;
+const ICR_MODE_LOWEST_PRIORITY: u32 = 1;
+const ICR_MODE_INIT: u32 = 5;
+const ICR_MODE_SIPI: u32 = 6;
+
+// MSI address field (Intel SDM Vol 3A §10.11.1)
+const MSI_ADDR_DEST_ID_SHIFT: u32 = 12;
+const MSI_ADDR_DEST_ID_MASK: u32 = 0xFF;
+
+// SIPI real-mode segment access rights (Intel SDM §8.4.4)
+const REALMODE_DATA_SEG_AR: u64 = 0x0093; // P=1, S=1, type=3 (R/W accessed)
+const REALMODE_CODE_SEG_AR: u64 = 0x009B; // P=1, S=1, type=B (exec/read accessed)
+
 const fn ioctl_code(dir: c_ulong, ty: u8, nr: u8, size: usize) -> c_ulong {
     (dir << 30) | ((size as c_ulong) << 16) | ((ty as c_ulong) << 8) | nr as c_ulong
 }
@@ -930,9 +958,9 @@ impl vm::Vm for ThemisVm {
         for entry in entries {
             if let IrqRoutingEntry::Themis(e) = entry {
                 if e.is_msi {
-                    let vector = (e.msi_data & 0xFF) as u8;
+                    let vector = (e.msi_data & ICR_VECTOR_MASK) as u8;
                     // MSI address bits [19:12] = destination APIC ID
-                    let dest_apic = ((e.msi_address_lo >> 12) & 0xFF) as u8;
+                    let dest_apic = ((e.msi_address_lo >> MSI_ADDR_DEST_ID_SHIFT) & MSI_ADDR_DEST_ID_MASK) as u8;
                     eprintln!("[THEMIS-DBG] gsi_routing: gsi={} → msi_vector={} dest_apic={}", e.gsi, vector, dest_apic);
                     map.insert(e.gsi, (vector, dest_apic));
                 }
@@ -1409,7 +1437,7 @@ impl ThemisVcpu {
         let en = EXIT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Always log AP exits (vp_index > 0) for the first 20 + every 5000th
         let is_ap = self._vp_index > 0;
-        if en < 30 || en % 500 == 0 || (is_ap && (en < 39550 || en % 5000 == 0)) {
+        if en < 5 {
             eprintln!(
                 "[THEMIS-EXIT] #{en} vp={} reason={} rip={:#x} msr_num={:#x}",
                 self._vp_index, msg.exit_reason, msg.guest_rip, msg.msr_number
@@ -1922,17 +1950,17 @@ impl ThemisVcpu {
 
             // Handle side effects for specific registers.
             match offset {
-                0x300 => {
+                APIC_REG_ICR_LOW => {
                     // ICR low write — detect INIT/SIPI.
                     // Read ICR_HIGH from internal LAPIC state.
                     let icr_high = {
                         let lapic = self.vm_state.lapic_regs.lock().unwrap();
                         let vp = self._vp_index as usize;
-                        if vp < lapic.len() { lapic[vp][0x310 / 4] } else { 0 }
+                        if vp < lapic.len() { lapic[vp][(APIC_REG_ICR_HIGH / 4) as usize] } else { 0 }
                     };
                     self.deliver_ipi(value, icr_high);
                 }
-                0x0B0 => {
+                APIC_REG_EOI => {
                     // EOI — no action needed; interrupt injection uses VMENTRY.
                 }
                 _ => {}
@@ -2097,13 +2125,13 @@ impl ThemisVcpu {
     /// Deliver an IPI based on the ICR low value.
     /// Handles IPI delivery modes: Fixed (0), INIT (5), and SIPI (6).
     fn deliver_ipi(&self, icr_low: u32, icr_high: u32) {
-        let delivery_mode = (icr_low >> 8) & 0x7;
-        let vector = icr_low & 0xFF;
-        let dest_shorthand = (icr_low >> 18) & 0x3;
+        let delivery_mode = (icr_low >> ICR_DELIVERY_MODE_SHIFT) & ICR_DELIVERY_MODE_MASK;
+        let vector = icr_low & ICR_VECTOR_MASK;
+        let dest_shorthand = (icr_low >> ICR_DEST_SHORTHAND_SHIFT) & ICR_DEST_SHORTHAND_MASK;
 
         // Destination APIC ID from ICR_HIGH bits [31:24], passed by capavisor
         // from VAPIC[0x310].
-        let dest_apic_id = (icr_high >> 24) & 0xFF;
+        let dest_apic_id = (icr_high >> ICR_HIGH_DEST_SHIFT) & ICR_HIGH_DEST_MASK;
 
         eprintln!(
             "[LAPIC-IPI] vp={} icr_low={:#x} mode={} vector={:#x} shorthand={} dest_apic={}",
@@ -2111,15 +2139,15 @@ impl ThemisVcpu {
         );
 
         match delivery_mode {
-            0 | 1 => {
+            ICR_MODE_FIXED | ICR_MODE_LOWEST_PRIORITY => {
                 // Fixed (0) or Lowest Priority (1) — inject vector into target VP.
                 self.deliver_fixed_ipi(vector as u8, dest_shorthand, dest_apic_id);
             }
-            5 => {
+            ICR_MODE_INIT => {
                 // INIT — AP is already in wait-for-SIPI (set at create_vcpu).
                 eprintln!("[LAPIC-IPI] INIT IPI — no-op (AP in wait-for-SIPI)");
             }
-            6 => {
+            ICR_MODE_SIPI => {
                 // Startup IPI (SIPI) — wake target AP with CS:IP from vector.
                 self.deliver_sipi(vector);
             }
@@ -2170,11 +2198,6 @@ impl ThemisVcpu {
                     "[LAPIC-IPI] Fixed IPI inject failed: vp={} vector={:#x} err={:?}",
                     target_vp, vector, err
                 );
-            } else {
-                eprintln!(
-                    "[LAPIC-IPI] Fixed IPI injected: vp={} vector={:#x}",
-                    target_vp, vector
-                );
             }
         }
     }
@@ -2193,41 +2216,38 @@ impl ThemisVcpu {
                 continue;
             }
 
+            // Intel SDM §8.4.4: SIPI vector × 4 KiB = real-mode entry address
             let startup_addr = (vector as u64) << 12;
+            // Intel SDM §8.4.4: CS selector = SIPI vector × 256
             let cs_selector = (vector as u64) << 8;
-
-            // Real-mode segment access rights: present, R/W data for data segs,
-            // execute/read for CS.
-            let data_ar: u64 = 0x0093; // P=1, S=1, type=3 (R/W accessed)
-            let code_ar: u64 = 0x009B; // P=1, S=1, type=B (exec/read accessed)
 
             let regs = [
                 // CS from SIPI vector
                 reg(THHV_VP_REG_CS_SEL, cs_selector),
                 reg(THHV_VP_REG_CS_BASE, startup_addr),
                 reg(THHV_VP_REG_CS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_CS_AR, code_ar),
+                reg(THHV_VP_REG_CS_AR, REALMODE_CODE_SEG_AR),
                 // DS/ES/FS/GS/SS = 0:0 with 64K limit (real-mode reset)
                 reg(THHV_VP_REG_DS_SEL, 0),
                 reg(THHV_VP_REG_DS_BASE, 0),
                 reg(THHV_VP_REG_DS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_DS_AR, data_ar),
+                reg(THHV_VP_REG_DS_AR, REALMODE_DATA_SEG_AR),
                 reg(THHV_VP_REG_ES_SEL, 0),
                 reg(THHV_VP_REG_ES_BASE, 0),
                 reg(THHV_VP_REG_ES_LIM, 0xFFFF),
-                reg(THHV_VP_REG_ES_AR, data_ar),
+                reg(THHV_VP_REG_ES_AR, REALMODE_DATA_SEG_AR),
                 reg(THHV_VP_REG_FS_SEL, 0),
                 reg(THHV_VP_REG_FS_BASE, 0),
                 reg(THHV_VP_REG_FS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_FS_AR, data_ar),
+                reg(THHV_VP_REG_FS_AR, REALMODE_DATA_SEG_AR),
                 reg(THHV_VP_REG_GS_SEL, 0),
                 reg(THHV_VP_REG_GS_BASE, 0),
                 reg(THHV_VP_REG_GS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_GS_AR, data_ar),
+                reg(THHV_VP_REG_GS_AR, REALMODE_DATA_SEG_AR),
                 reg(THHV_VP_REG_SS_SEL, 0),
                 reg(THHV_VP_REG_SS_BASE, 0),
                 reg(THHV_VP_REG_SS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_SS_AR, data_ar),
+                reg(THHV_VP_REG_SS_AR, REALMODE_DATA_SEG_AR),
                 // GDT/IDT with zero base (Linux trampoline sets its own)
                 reg(THHV_VP_REG_GDTR_BASE, 0),
                 reg(THHV_VP_REG_GDTR_LIM, 0xFFFF),
