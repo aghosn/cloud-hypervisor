@@ -443,10 +443,9 @@ struct ThemisVmState {
     /// EPT access.  Once SET_GUEST_MEMORY fires the capavisor removes those
     /// pages from dom0's EPT, so all writes must complete before then.
     pending_memory: Mutex<Vec<ThhvSetGuestMemory>>,
-    /// GSI → MSI vector mapping.  Updated by set_gsi_routing() when the guest
-    /// configures MSI Address/Data.  Used by register_irqfd() to pass the
-    /// correct injection vector to thhv (instead of the GSI number).
-    gsi_vectors: Mutex<std::collections::HashMap<u32, u8>>,
+    /// GSI → (MSI vector, destination APIC ID) mapping.  Updated by
+    /// set_gsi_routing() when the guest configures MSI Address/Data.
+    gsi_vectors: Mutex<std::collections::HashMap<u32, (u8, u8)>>,
     /// Per-vCPU file descriptors (raw), indexed by vCPU ID.  Used for
     /// cross-vCPU state updates (e.g., BSP sending SIPI to an AP).
     vp_fds: Mutex<Vec<RawFd>>,
@@ -674,15 +673,16 @@ impl vm::Vm for ThemisVm {
     }
 
     fn register_irqfd(&self, fd: &EventFd, gsi: u32) -> vm::Result<()> {
-        let vector = self.state.gsi_vectors.lock().unwrap()
-            .get(&gsi).copied().unwrap_or(0) as u32;
-        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} fd={}", fd.as_raw_fd());
+        let (vector, dest_apic) = self.state.gsi_vectors.lock().unwrap()
+            .get(&gsi).copied().unwrap_or((0, 0));
+        let vector = vector as u32;
+        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} vp={dest_apic} fd={}", fd.as_raw_fd());
         let mut irqfd = ThhvIrqfd {
             fd: fd.as_raw_fd(),
             gsi,
             flags: 0,
             vector,
-            vp_index: 0,
+            vp_index: dest_apic as u32,
             rsvd: 0,
         };
         let r = ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
@@ -931,8 +931,10 @@ impl vm::Vm for ThemisVm {
             if let IrqRoutingEntry::Themis(e) = entry {
                 if e.is_msi {
                     let vector = (e.msi_data & 0xFF) as u8;
-                    eprintln!("[THEMIS-DBG] gsi_routing: gsi={} → msi_vector={}", e.gsi, vector);
-                    map.insert(e.gsi, vector);
+                    // MSI address bits [19:12] = destination APIC ID
+                    let dest_apic = ((e.msi_address_lo >> 12) & 0xFF) as u8;
+                    eprintln!("[THEMIS-DBG] gsi_routing: gsi={} → msi_vector={} dest_apic={}", e.gsi, vector, dest_apic);
+                    map.insert(e.gsi, (vector, dest_apic));
                 }
             }
         }
