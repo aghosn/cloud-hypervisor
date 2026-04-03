@@ -1922,7 +1922,13 @@ impl ThemisVcpu {
             match offset {
                 0x300 => {
                     // ICR low write — detect INIT/SIPI.
-                    self.deliver_ipi(value);
+                    // Read ICR_HIGH from internal LAPIC state.
+                    let icr_high = {
+                        let lapic = self.vm_state.lapic_regs.lock().unwrap();
+                        let vp = self._vp_index as usize;
+                        if vp < lapic.len() { lapic[vp][0x310 / 4] } else { 0 }
+                    };
+                    self.deliver_ipi(value, icr_high);
                 }
                 0x0B0 => {
                     // EOI — no action needed; interrupt injection uses VMENTRY.
@@ -2088,21 +2094,14 @@ impl ThemisVcpu {
 
     /// Deliver an IPI based on the ICR low value.
     /// Handles IPI delivery modes: Fixed (0), INIT (5), and SIPI (6).
-    fn deliver_ipi(&self, icr_low: u32) {
+    fn deliver_ipi(&self, icr_low: u32, icr_high: u32) {
         let delivery_mode = (icr_low >> 8) & 0x7;
         let vector = icr_low & 0xFF;
         let dest_shorthand = (icr_low >> 18) & 0x3;
 
-        // Read ICR_HIGH (destination APIC ID) from this vCPU's LAPIC state.
-        let dest_apic_id = {
-            let lapic = self.vm_state.lapic_regs.lock().unwrap();
-            let vp = self._vp_index as usize;
-            if vp < lapic.len() {
-                (lapic[vp][0x310 / 4] >> 24) & 0xFF
-            } else {
-                0
-            }
-        };
+        // Destination APIC ID from ICR_HIGH bits [31:24], passed by capavisor
+        // from VAPIC[0x310].
+        let dest_apic_id = (icr_high >> 24) & 0xFF;
 
         eprintln!(
             "[LAPIC-IPI] vp={} icr_low={:#x} mode={} vector={:#x} shorthand={} dest_apic={}",
@@ -2276,11 +2275,11 @@ impl ThemisVcpu {
     /// For SIPI, we configure the target AP's CS:IP from the SIPI vector and
     /// transition it from wait-for-SIPI to runnable via THHV_SET_VP_STATE.
     fn handle_apic_access_exit(&self, msg: &ThemicInterceptMessage) {
-        // In Mode A, the capavisor reads RAX as the ICR value.
-        // Note: this assumes the compiler used RAX for the writel() —
-        // a latent bug; will be fixed when we test on real hardware.
+        // RAX = ICR_LOW value (decoded by capavisor from guest instruction).
+        // RCX (msr_number) = ICR_HIGH value (read from VAPIC[0x310] by capavisor).
         let icr_val = msg.rax as u32;
-        self.deliver_ipi(icr_val);
+        let icr_high = msg.msr_number;
+        self.deliver_ipi(icr_val, icr_high);
     }
 }
 
