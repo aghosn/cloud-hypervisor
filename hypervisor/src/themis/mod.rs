@@ -116,8 +116,23 @@ const THHV_SEND_SHARED_META: c_ulong = ioctl_iow::<ThhvInitializePartition>(THHV
 const THHV_RUN_VP: c_ulong = ioctl_iowr::<ThhvRunVp>(THHV_IOCTL_MAGIC, 0x20);
 const THHV_GET_VP_STATE: c_ulong = ioctl_iowr::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x21);
 const THHV_SET_VP_STATE: c_ulong = ioctl_iow::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x22);
-const THHV_SET_INTR_POLICY: c_ulong = ioctl_iow::<ThhvSetIntrPolicy>(THHV_IOCTL_MAGIC, 0x18);
 const THHV_INJECT_INTERRUPT: c_ulong = ioctl_iow::<ThhvInjectInterrupt>(THHV_IOCTL_MAGIC, 0x19);
+const THHV_SET_POLICY: c_ulong = ioctl_iow::<ThhvSetPolicy>(THHV_IOCTL_MAGIC, 0x1a);
+
+// Policy-kind discriminants for THHV_SET_POLICY (mirrors THEMIS_POLICY_* in thhv.h).
+#[allow(dead_code)]
+pub mod policy_kind {
+    pub const CORES: u64 = 0;
+    pub const API_MONITOR: u64 = 1;
+    pub const DEFAULT_INTR_VISIBILITY: u64 = 2;
+    pub const VECTOR_VISIBILITY: u64 = 3;
+    pub const VECTOR_REG_READ_SET: u64 = 4;
+    pub const VECTOR_REG_WRITE_SET: u64 = 5;
+    pub const DEFAULT_EXIT_TRAP: u64 = 6;
+    pub const EXIT_REASON_TRAP: u64 = 7;
+    pub const EXIT_REASON_REG_READ_SET: u64 = 8;
+    pub const EXIT_REASON_REG_WRITE_SET: u64 = 9;
+}
 
 const THHV_VP_REG_RAX: u64 = 0x00;
 const THHV_VP_REG_RBX: u64 = 0x01;
@@ -292,10 +307,11 @@ impl Default for ThhvRunVp {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct ThhvSetIntrPolicy {
-    vector: u8,
-    visibility: u8,
-    pad: [u8; 6],
+struct ThhvSetPolicy {
+    kind: u64,
+    key: u64,
+    sub_key: u64,
+    value: u64,
 }
 
 #[repr(C)]
@@ -513,6 +529,20 @@ impl ThemisVmState {
         // (trapped by the child MSR bitmap in capavisor) are handled
         // in handle_wrmsr_exit() which reprograms the timerfd.
 
+        Ok(())
+    }
+
+    /// Unified policy-setting ioctl — wraps THHV_SET_POLICY.
+    #[allow(dead_code)]
+    fn set_policy(&self, kind: u64, key: u64, sub_key: u64, value: u64) -> anyhow::Result<()> {
+        let mut sp = ThhvSetPolicy {
+            kind,
+            key,
+            sub_key,
+            value,
+        };
+        ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_POLICY, &mut sp)
+            .context("THHV_SET_POLICY failed")?;
         Ok(())
     }
 }

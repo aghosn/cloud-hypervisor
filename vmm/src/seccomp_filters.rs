@@ -130,7 +130,7 @@ mod themis {
     pub const THHV_IRQFD: u64 = 0x4010_b813;
     pub const THHV_IOEVENTFD: u64 = 0x4020_b814;
     pub const THHV_SEND_SHARED_META: u64 = 0x4010_b817;
-    pub const THHV_SET_INTR_POLICY: u64 = 0x4008_b818;
+    pub const THHV_SET_POLICY: u64 = 0x4020_b81a;
     pub const THHV_RUN_VP: u64 = 0xc100_b820;
     pub const THHV_GET_VP_STATE: u64 = 0xc010_b821;
     pub const THHV_SET_VP_STATE: u64 = 0x4010_b822;
@@ -275,7 +275,7 @@ fn create_vmm_ioctl_seccomp_rule_common_themis() -> Result<Vec<SeccompRule>, Bac
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_IRQFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_IOEVENTFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_SEND_SHARED_META)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, THHV_SET_INTR_POLICY)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_SET_POLICY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_RUN_VP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_GET_VP_STATE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_SET_VP_STATE)?],
