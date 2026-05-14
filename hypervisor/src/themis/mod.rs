@@ -510,18 +510,18 @@ impl ThemisVmState {
         // After this point dom0 loses EPT access to dom1's guest pages.
         let regions: Vec<ThhvSetGuestMemory> =
             self.pending_memory.lock().unwrap().drain(..).collect();
-        eprintln!("[THEMIS-DBG] ensure_initialized: flushing {} memory regions", regions.len());
+        eprintln!("\r[THEMIS-DBG] ensure_initialized: flushing {} memory regions", regions.len());
         for (i, mut region) in regions.into_iter().enumerate() {
-            eprintln!("[THEMIS-DBG] SET_GUEST_MEMORY[{i}] gfn=0x{:x} size=0x{:x}", region.guest_pfn, region.size);
+            eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] gfn=0x{:x} size=0x{:x}", region.guest_pfn, region.size);
             ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut region)
                 .context("deferred THHV_SET_GUEST_MEMORY failed")?;
-            eprintln!("[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
+            eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
         }
 
-        eprintln!("[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
+        eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
         ioctl_noarg(self.fd.as_raw_fd(), THHV_INITIALIZE_PARTITION)
             .context("failed to initialize Themis partition")?;
-        eprintln!("[THEMIS-DBG] INITIALIZE_PARTITION done");
+        eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION done");
         *initialized = true;
 
         // LAPIC timer emulation is set up per-vCPU in create_vcpu():
@@ -734,7 +734,7 @@ impl vm::Vm for ThemisVm {
         let (vector, dest_apic) = self.state.gsi_vectors.lock().unwrap()
             .get(&gsi).copied().unwrap_or((0, 0));
         let vector = vector as u32;
-        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} vp={dest_apic} fd={}", fd.as_raw_fd());
+        eprintln!("\r[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} vp={dest_apic} fd={}", fd.as_raw_fd());
         let mut irqfd = ThhvIrqfd {
             fd: fd.as_raw_fd(),
             gsi,
@@ -745,7 +745,7 @@ impl vm::Vm for ThemisVm {
         };
         let r = ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
             .map_err(|e| vm::HypervisorVmError::RegisterIrqFd(e.into()));
-        eprintln!("[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} result={r:?}");
+        eprintln!("\r[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} result={r:?}");
         r
     }
 
@@ -835,7 +835,7 @@ impl vm::Vm for ThemisVm {
             .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
 
         eprintln!(
-            "[THEMIS-DBG] vCPU {id}: LAPIC timer emulation ready (timerfd={}, irqfd vec=0x{LOCAL_TIMER_VECTOR:X})",
+            "\r[THEMIS-DBG] vCPU {id}: LAPIC timer emulation ready (timerfd={}, irqfd vec=0x{LOCAL_TIMER_VECTOR:X})",
             timer_fd.as_raw_fd()
         );
 
@@ -863,7 +863,7 @@ impl vm::Vm for ThemisVm {
             };
             ioctl_with_mut_ref(vcpu_fd.as_raw_fd(), THHV_SET_VP_STATE, &mut header)
                 .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-            eprintln!("[THEMIS-DBG] vCPU {id}: set ACTIVITY_STATE=3 (wait-for-SIPI)");
+            eprintln!("\r[THEMIS-DBG] vCPU {id}: set ACTIVITY_STATE=3 (wait-for-SIPI)");
         }
 
         // Initialize per-vCPU software LAPIC state.
@@ -991,7 +991,7 @@ impl vm::Vm for ThemisVm {
                     let vector = (e.msi_data & ICR_VECTOR_MASK) as u8;
                     // MSI address bits [19:12] = destination APIC ID
                     let dest_apic = ((e.msi_address_lo >> MSI_ADDR_DEST_ID_SHIFT) & MSI_ADDR_DEST_ID_MASK) as u8;
-                    eprintln!("[THEMIS-DBG] gsi_routing: gsi={} → msi_vector={} dest_apic={}", e.gsi, vector, dest_apic);
+                    eprintln!("\r[THEMIS-DBG] gsi_routing: gsi={} → msi_vector={} dest_apic={}", e.gsi, vector, dest_apic);
                     map.insert(e.gsi, (vector, dest_apic));
                 }
             }
@@ -1151,7 +1151,7 @@ impl Vcpu for ThemisVcpu {
         let result = self.set_reg_values(&regs)
             .map_err(|e| HypervisorCpuError::SetStandardRegs(anyhow!(e.to_string())));
         if let Err(ref e) = result {
-            eprintln!("[THEMIS-DBG] set_regs: THHV_SET_VP_STATE FAILED: {e}");
+            eprintln!("\r[THEMIS-DBG] set_regs: THHV_SET_VP_STATE FAILED: {e}");
         }
         result
     }
@@ -1469,7 +1469,7 @@ impl ThemisVcpu {
         let is_ap = self._vp_index > 0;
         if en < 5 {
             eprintln!(
-                "[THEMIS-EXIT] #{en} vp={} reason={} rip={:#x} msr_num={:#x}",
+                "\r[THEMIS-EXIT] #{en} vp={} reason={} rip={:#x} msr_num={:#x}",
                 self._vp_index, msg.exit_reason, msg.guest_rip, msg.msr_number
             );
         }
@@ -1503,7 +1503,7 @@ impl ThemisVcpu {
                 let cr4  = self.get_reg_values(&[THHV_VP_REG_CR4]).unwrap_or_default();
                 let efer = self.get_reg_values(&[THHV_VP_REG_EFER]).unwrap_or_default();
                 let rax  = self.get_reg_values(&[THHV_VP_REG_RAX]).unwrap_or_default();
-                eprintln!("[TRIPLE-FAULT] rip={:#x} cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} rax={:#x}",
+                eprintln!("\r[TRIPLE-FAULT] rip={:#x} cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} rax={:#x}",
                     msg.guest_rip,
                     cr0.first().copied().unwrap_or(0),
                     cr3.first().copied().unwrap_or(0),
@@ -1556,7 +1556,7 @@ impl ThemisVcpu {
         let n = WRMSR_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 20 || n % 100 == 0 {
             eprintln!(
-                "[THEMIS-MSR] #{n} WRMSR msr={:#x} val={:#x} rip={:#x}",
+                "\r[THEMIS-MSR] #{n} WRMSR msr={:#x} val={:#x} rip={:#x}",
                 msg.msr_number, msg.msr_value, msg.guest_rip
             );
         }
@@ -1591,7 +1591,7 @@ impl ThemisVcpu {
                 0
             };
             eprintln!(
-                "[THEMIS-TIMER] #{n} deadline={:#x} now={:#x} delta_tsc={} ({} us)",
+                "\r[THEMIS-TIMER] #{n} deadline={:#x} now={:#x} delta_tsc={} ({} us)",
                 deadline_tsc, now_tsc, diff, diff / (TSC_KHZ / 1_000_000)
             );
         }
@@ -1792,7 +1792,7 @@ impl ThemisVcpu {
         let n = IO_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 20 || (n < 200 && n % 50 == 0) {
             eprintln!(
-                "[THEMIS-IO] #{} port=0x{:x} size={} write={} rax=0x{:x}",
+                "\r[THEMIS-IO] #{} port=0x{:x} size={} write={} rax=0x{:x}",
                 n, msg.port_number, len, msg.is_write, msg.rax
             );
         }
@@ -1862,7 +1862,7 @@ impl ThemisVcpu {
             .emulate_first_insn(0, &msg.instruction_bytes)
             .map_err(|e| {
                 eprintln!(
-                    "[MMIO-EMU] emulation failed: gpa={:#x} rip={:#x} insn={:02x?}: {e}",
+                    "\r[MMIO-EMU] emulation failed: gpa={:#x} rip={:#x} insn={:02x?}: {e}",
                     msg.guest_physical_address, msg.guest_rip, &msg.instruction_bytes[..8],
                 );
                 HypervisorCpuError::RunVcpu(anyhow::anyhow!("MMIO emulation failed: {e}").into())
@@ -1878,7 +1878,7 @@ impl ThemisVcpu {
         };
         if mn < 20 || (mn < 500 && mn % 50 == 0) || mn % 1000 == 0 {
             eprintln!(
-                "[MMIO-DBG] #{mn} gpa={:#x} old_rip={:#x} new_rip={:#x} insn={:02x?}",
+                "\r[MMIO-DBG] #{mn} gpa={:#x} old_rip={:#x} new_rip={:#x} insn={:02x?}",
                 msg.guest_physical_address, old_rip, new_rip, &msg.instruction_bytes[..6],
             );
         }
@@ -1916,7 +1916,7 @@ impl ThemisVcpu {
 
         if insn_len == 0 {
             eprintln!(
-                "[LAPIC] failed to decode insn at RIP={:#x} bytes={:02x?}",
+                "\r[LAPIC] failed to decode insn at RIP={:#x} bytes={:02x?}",
                 msg.guest_rip,
                 &msg.instruction_bytes[..8]
             );
@@ -1953,7 +1953,7 @@ impl ThemisVcpu {
                     OpKind::Immediate16 => insn.immediate16() as u32,
                     _ => {
                         eprintln!(
-                            "[LAPIC] unhandled write operand kind {:?} at RIP={:#x}",
+                            "\r[LAPIC] unhandled write operand kind {:?} at RIP={:#x}",
                             insn.op1_kind(),
                             msg.guest_rip
                         );
@@ -1962,7 +1962,7 @@ impl ThemisVcpu {
                 }
             } else {
                 eprintln!(
-                    "[LAPIC] write with {} operands at RIP={:#x}",
+                    "\r[LAPIC] write with {} operands at RIP={:#x}",
                     insn.op_count(),
                     msg.guest_rip
                 );
@@ -2002,7 +2002,7 @@ impl ThemisVcpu {
             let n = LAPIC_W_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 30 || n % 500 == 0 {
                 eprintln!(
-                    "[LAPIC-W] #{n} vp={} offset={:#x} value={:#x}",
+                    "\r[LAPIC-W] #{n} vp={} offset={:#x} value={:#x}",
                     self._vp_index, offset, value
                 );
             }
@@ -2028,7 +2028,7 @@ impl ThemisVcpu {
             let n = LAPIC_R_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 30 || n % 500 == 0 {
                 eprintln!(
-                    "[LAPIC-R] #{n} vp={} offset={:#x} value={:#x}",
+                    "\r[LAPIC-R] #{n} vp={} offset={:#x} value={:#x}",
                     self._vp_index, offset, value
                 );
             }
@@ -2068,7 +2068,7 @@ impl ThemisVcpu {
             CH => (gregs.rcx >> 8) & 0xFF,
             DH => (gregs.rdx >> 8) & 0xFF,
             _ => {
-                eprintln!("[LAPIC] read_iced_reg: unhandled register {:?}", r);
+                eprintln!("\r[LAPIC] read_iced_reg: unhandled register {:?}", r);
                 0
             }
         }
@@ -2147,7 +2147,7 @@ impl ThemisVcpu {
             R15W => gregs.r15 = (gregs.r15 & !0xFFFF) | (val & 0xFFFF),
             R15L => gregs.r15 = (gregs.r15 & !0xFF) | (val & 0xFF),
             _ => {
-                eprintln!("[LAPIC] write_iced_reg: unhandled register {:?}", r);
+                eprintln!("\r[LAPIC] write_iced_reg: unhandled register {:?}", r);
             }
         }
     }
@@ -2164,7 +2164,7 @@ impl ThemisVcpu {
         let dest_apic_id = (icr_high >> ICR_HIGH_DEST_SHIFT) & ICR_HIGH_DEST_MASK;
 
         eprintln!(
-            "[LAPIC-IPI] vp={} icr_low={:#x} mode={} vector={:#x} shorthand={} dest_apic={}",
+            "\r[LAPIC-IPI] vp={} icr_low={:#x} mode={} vector={:#x} shorthand={} dest_apic={}",
             self._vp_index, icr_low, delivery_mode, vector, dest_shorthand, dest_apic_id
         );
 
@@ -2175,7 +2175,7 @@ impl ThemisVcpu {
             }
             ICR_MODE_INIT => {
                 // INIT — AP is already in wait-for-SIPI (set at create_vcpu).
-                eprintln!("[LAPIC-IPI] INIT IPI — no-op (AP in wait-for-SIPI)");
+                eprintln!("\r[LAPIC-IPI] INIT IPI — no-op (AP in wait-for-SIPI)");
             }
             ICR_MODE_SIPI => {
                 // Startup IPI (SIPI) — wake target AP with CS:IP from vector.
@@ -2183,7 +2183,7 @@ impl ThemisVcpu {
             }
             _ => {
                 eprintln!(
-                    "[LAPIC-IPI] unhandled delivery mode {} — ignored",
+                    "\r[LAPIC-IPI] unhandled delivery mode {} — ignored",
                     delivery_mode
                 );
             }
@@ -2225,7 +2225,7 @@ impl ThemisVcpu {
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 eprintln!(
-                    "[LAPIC-IPI] Fixed IPI inject failed: vp={} vector={:#x} err={:?}",
+                    "\r[LAPIC-IPI] Fixed IPI inject failed: vp={} vector={:#x} err={:?}",
                     target_vp, vector, err
                 );
             }
@@ -2314,7 +2314,7 @@ impl ThemisVcpu {
             };
             let res = ioctl_with_mut_ref(target_fd, THHV_SET_VP_STATE, &mut header);
             eprintln!(
-                "[LAPIC-IPI] SIPI vector={:#x} → vCPU {} CS:IP={:#x}:{:#x} result={:?}",
+                "\r[LAPIC-IPI] SIPI vector={:#x} → vCPU {} CS:IP={:#x}:{:#x} result={:?}",
                 vector, target_id, cs_selector, 0, res
             );
         }

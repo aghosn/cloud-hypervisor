@@ -96,7 +96,7 @@ pub fn setup_msrs(vcpu: &dyn hypervisor::Vcpu) -> Result<()> {
 /// * `entry_point` - Description of the boot entry to set up.
 pub fn setup_regs(vcpu: &dyn hypervisor::Vcpu, entry_point: EntryPoint) -> Result<()> {
     eprintln!(
-        "[ARCH-DBG] setup_regs: entry_addr=0x{:x} has_setup_header={}",
+        "\r[ARCH-DBG] setup_regs: entry_addr=0x{:x} has_setup_header={}",
         entry_point.entry_addr.raw_value(),
         entry_point.setup_header.is_some()
     );
