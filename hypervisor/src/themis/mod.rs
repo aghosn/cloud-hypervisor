@@ -548,6 +548,46 @@ impl ThemisVmState {
             }
         }
 
+        // Push Native ranges for Themis hypervisor CPUID leaves so the child
+        // can discover the capavisor.  The capavisor handles these natively
+        // (signature, features, domcomm, limits, etc.).
+        // We split around the CoCo detection leaf (0x40000100) which gets an
+        // Emulate override with the host-specific VTOM bit value.
+        // CPUID_RANGE encoding: key = (start_leaf << 32) | start_sub,
+        //                       sub_key = (end_leaf << 32) | end_sub,
+        //                       value = 1 (Native).
+        {
+            // Native: 0x40000000,0 – 0x400000FF,0xFFFFFFFF
+            let r1_start: u64 = 0x40000000_u64 << 32;
+            let r1_end: u64 = (0x400000FF_u64 << 32) | 0xFFFFFFFF;
+            // Native: 0x40000101,0 – 0x4FFFFFFF,0xFFFFFFFF
+            let r2_start: u64 = 0x40000101_u64 << 32;
+            let r2_end: u64 = (0x4FFFFFFF_u64 << 32) | 0xFFFFFFFF;
+            eprintln!("\r[THEMIS-DBG] pushing Native ranges for hypervisor CPUID leaves");
+            self.set_policy(policy_kind::CPUID_RANGE, r1_start, r1_end, 1)?;
+            self.set_policy(policy_kind::CPUID_RANGE, r2_start, r2_end, 1)?;
+        }
+
+        // Push Emulate override for CoCo detection leaf (0x40000100).
+        // EAX = VTOM bit = MAXPHYADDR - 1 (read from host CPU).
+        // EBX/ECX/EDX = "ThemisCoCo\0\0" signature.
+        {
+            let maxphyaddr = unsafe {
+                core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF
+            };
+            let vtom_bit = maxphyaddr - 1;
+            let coco_leaf: u64 = 0x40000100_u64 << 32; // subleaf 0
+            let eax = vtom_bit;
+            let ebx = u32::from_le_bytes(*b"Them");
+            let ecx = u32::from_le_bytes(*b"isCo");
+            let edx = u32::from_le_bytes(*b"Co\0\0");
+            let word0 = ((eax as u64) << 32) | (ebx as u64);
+            let word1 = ((ecx as u64) << 32) | (edx as u64);
+            eprintln!("\r[THEMIS-DBG] pushing CoCo CPUID leaf 0x40000100: vtom_bit={vtom_bit} (maxphyaddr={maxphyaddr})");
+            self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 0, word0)?;
+            self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 1, word1)?;
+        }
+
         eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
         ioctl_noarg(self.fd.as_raw_fd(), THHV_INITIALIZE_PARTITION)
             .context("failed to initialize Themis partition")?;
