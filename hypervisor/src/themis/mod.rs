@@ -527,16 +527,29 @@ impl ThemisVmState {
             eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
         }
 
-        // CPUID interposition push is disabled until the framework supports
-        // subleaf granularity. Without it, leaf 0x7 subleaf 1 would get the
-        // subleaf 0 emulated values, causing Linux boot hangs.
-        // The infrastructure (policy_kind constants, monitor loop lookup,
-        // ArchVpOps::emulate_cpuid) is wired and tested — only the bulk push
-        // from set_cpuid2 is deferred. Individual leaves (e.g., CoCo VTOM)
-        // can still be pushed explicitly.
-        //
-        // TODO: Add subleaf support to ProcFeature<Cpuid>::Input, then
-        // re-enable this bulk push.
+        // Push CPUID entries as Emulate overrides before sealing.
+        // Each entry becomes 4 set_policy calls (one per register word).
+        // Key encodes (leaf << 32 | subleaf), sub_key = word index.
+        let cpuid_entries: Vec<CpuIdEntry> =
+            self.cpuid_entries.lock().unwrap().clone();
+        if !cpuid_entries.is_empty() {
+            eprintln!(
+                "\r[THEMIS-DBG] pushing {} CPUID entries as Emulate policy",
+                cpuid_entries.len()
+            );
+            for entry in &cpuid_entries {
+                let key = ((entry.function as u64) << 32) | (entry.index as u64);
+                let words = [entry.eax, entry.ebx, entry.ecx, entry.edx];
+                for (wi, &val) in words.iter().enumerate() {
+                    self.set_policy(
+                        policy_kind::CPUID_EMULATE,
+                        key,
+                        wi as u64,
+                        val as u64,
+                    )?;
+                }
+            }
+        }
 
         eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
         ioctl_noarg(self.fd.as_raw_fd(), THHV_INITIALIZE_PARTITION)
