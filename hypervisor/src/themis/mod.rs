@@ -528,7 +528,9 @@ impl ThemisVmState {
         }
 
         // Push CPUID entries as Emulate overrides before sealing.
-        // Each entry becomes 4 set_policy calls (one per register word).
+        // Each entry becomes 2 set_policy calls (word 0 and word 1).
+        // Word 0: value = (eax << 32) | ebx — creates the entry.
+        // Word 1: value = (ecx << 32) | edx — updates remaining fields.
         // Key encodes (leaf << 32 | subleaf), sub_key = word index.
         let cpuid_entries: Vec<CpuIdEntry> =
             self.cpuid_entries.lock().unwrap().clone();
@@ -539,15 +541,10 @@ impl ThemisVmState {
             );
             for entry in &cpuid_entries {
                 let key = ((entry.function as u64) << 32) | (entry.index as u64);
-                let words = [entry.eax, entry.ebx, entry.ecx, entry.edx];
-                for (wi, &val) in words.iter().enumerate() {
-                    self.set_policy(
-                        policy_kind::CPUID_EMULATE,
-                        key,
-                        wi as u64,
-                        val as u64,
-                    )?;
-                }
+                let word0 = ((entry.eax as u64) << 32) | (entry.ebx as u64);
+                let word1 = ((entry.ecx as u64) << 32) | (entry.edx as u64);
+                self.set_policy(policy_kind::CPUID_EMULATE, key, 0, word0)?;
+                self.set_policy(policy_kind::CPUID_EMULATE, key, 1, word1)?;
             }
         }
 
