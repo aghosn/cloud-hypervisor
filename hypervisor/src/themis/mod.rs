@@ -132,6 +132,12 @@ pub mod policy_kind {
     pub const EXIT_REASON_TRAP: u64 = 7;
     pub const EXIT_REASON_REG_READ_SET: u64 = 8;
     pub const EXIT_REASON_REG_WRITE_SET: u64 = 9;
+    pub const CPUID_DEFAULT: u64 = 10;
+    pub const CPUID_RANGE: u64 = 11;
+    pub const CPUID_EMULATE: u64 = 12;
+    pub const MSR_DEFAULT: u64 = 13;
+    pub const MSR_RANGE: u64 = 14;
+    pub const MSR_EMULATE: u64 = 15;
 }
 
 const THHV_VP_REG_RAX: u64 = 0x00;
@@ -497,6 +503,9 @@ struct ThemisVmState {
     /// Used when VIRTUALIZE_APIC_ACCESSES is not available: LAPIC MMIO
     /// accesses cause EPT violations that are emulated here in software.
     lapic_regs: Mutex<Vec<[u32; 1024]>>,
+    /// CPUID entries to push as interposition Emulate policy before sealing.
+    /// Populated by the first vCPU's set_cpuid2() call.
+    cpuid_entries: Mutex<Vec<CpuIdEntry>>,
 }
 
 impl ThemisVmState {
@@ -518,6 +527,56 @@ impl ThemisVmState {
             eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
         }
 
+        // Push CPUID interposition policy before sealing.
+        // For leaves with index=0 (non-indexed), push an Emulate override
+        // so the capavisor returns the value directly without trapping to CHV.
+        // Indexed leaves (0x4, 0x7 subleaves, 0xB, 0x1F, etc.) and
+        // duplicates are skipped — they fall back to trap-and-emulate.
+        {
+            let entries = self.cpuid_entries.lock().unwrap();
+            if !entries.is_empty() {
+                let mut pushed = 0u32;
+                let mut seen = std::collections::HashSet::new();
+                for entry in entries.iter() {
+                    // Only push index-0 entries, skip subleaved duplicates.
+                    if entry.index != 0 || !seen.insert(entry.function) {
+                        continue;
+                    }
+                    let leaf = entry.function;
+                    let w0 = ((entry.eax as u64) << 32) | (entry.ebx as u64);
+                    let w1 = ((entry.ecx as u64) << 32) | (entry.edx as u64);
+                    if let Err(e) = self.set_policy(
+                        policy_kind::CPUID_EMULATE,
+                        leaf as u64,
+                        0,
+                        w0,
+                    ) {
+                        eprintln!(
+                            "\r[THEMIS-DBG] CPUID_EMULATE leaf=0x{:x} failed: {}",
+                            leaf, e
+                        );
+                        break; // likely MAX_OVERRIDES reached
+                    }
+                    if let Err(e) = self.set_policy(
+                        policy_kind::CPUID_EMULATE,
+                        leaf as u64,
+                        1,
+                        w1,
+                    ) {
+                        eprintln!(
+                            "\r[THEMIS-DBG] CPUID_EMULATE leaf=0x{:x} word1 failed: {}",
+                            leaf, e
+                        );
+                    }
+                    pushed += 1;
+                }
+                eprintln!(
+                    "\r[THEMIS-DBG] pushed {pushed} CPUID emulate entries ({} total in policy)",
+                    entries.len()
+                );
+            }
+        }
+
         eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
         ioctl_noarg(self.fd.as_raw_fd(), THHV_INITIALIZE_PARTITION)
             .context("failed to initialize Themis partition")?;
@@ -533,7 +592,6 @@ impl ThemisVmState {
     }
 
     /// Unified policy-setting ioctl — wraps THHV_SET_POLICY.
-    #[allow(dead_code)]
     fn set_policy(&self, kind: u64, key: u64, sub_key: u64, value: u64) -> anyhow::Result<()> {
         let mut sp = ThhvSetPolicy {
             kind,
@@ -662,6 +720,7 @@ impl Hypervisor for ThemisHypervisor {
                 gsi_vectors: Mutex::new(std::collections::HashMap::new()),
                 vp_fds: Mutex::new(Vec::new()),
                 lapic_regs: Mutex::new(Vec::new()),
+                cpuid_entries: Mutex::new(Vec::new()),
             }),
         }))
     }
@@ -1316,8 +1375,14 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn set_cpuid2(&self, cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
+        // Store per-vCPU for trap-and-emulate fallback.
         let mut guard = self.cpuid.lock().unwrap();
         *guard = cpuid.to_vec();
+        // Also store in VM state for interposition policy push (first wins).
+        let mut vm_entries = self.vm_state.cpuid_entries.lock().unwrap();
+        if vm_entries.is_empty() {
+            *vm_entries = cpuid.to_vec();
+        }
         Ok(())
     }
 
