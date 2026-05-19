@@ -506,6 +506,9 @@ struct ThemisVmState {
     /// CPUID entries to push as interposition Emulate policy before sealing.
     /// Populated by the first vCPU's set_cpuid2() call.
     cpuid_entries: Mutex<Vec<CpuIdEntry>>,
+    /// VTOM bit position (MAXPHYADDR - 1). Used to strip the VTOM bit from
+    /// MMIO GPAs when the CoCo kernel marks device accesses as shared.
+    vtom_bit: u32,
 }
 
 impl ThemisVmState {
@@ -520,11 +523,45 @@ impl ThemisVmState {
         let regions: Vec<ThhvSetGuestMemory> =
             self.pending_memory.lock().unwrap().drain(..).collect();
         eprintln!("\r[THEMIS-DBG] ensure_initialized: flushing {} memory regions", regions.len());
-        for (i, mut region) in regions.into_iter().enumerate() {
+        for (i, mut region) in regions.iter().cloned().enumerate() {
             eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] gfn=0x{:x} size=0x{:x}", region.guest_pfn, region.size);
             ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut region)
                 .context("deferred THHV_SET_GUEST_MEMORY failed")?;
             eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
+        }
+
+        // Double-map the ACPI/firmware region (EBDA: 0xA0000–0xFFFFF) at the
+        // VTOM-offset GPA.  The CoCo kernel accesses ACPI tables with the VTOM
+        // bit set (shared marking).  Without this alias, those accesses cause
+        // EPT violations that cannot be emulated (it's RAM, not MMIO).
+        // The EBDA is in the e820 gap — Linux marks it nosave, never recycles it.
+        const EBDA_START: u64 = 0xA0000;
+        const EBDA_END: u64 = 0x100000; // exclusive
+        const EBDA_SIZE: u64 = EBDA_END - EBDA_START;
+
+        for region in &regions {
+            let region_start = region.guest_pfn << 12;
+            let region_end = region_start + region.size;
+            if region_start <= EBDA_START && region_end >= EBDA_END {
+                // Found the region containing EBDA. Compute userspace_addr offset.
+                let offset_in_region = EBDA_START - region_start;
+                let vtom_gpa = EBDA_START | (1u64 << self.vtom_bit);
+                let mut vtom_region = ThhvSetGuestMemory {
+                    guest_pfn: vtom_gpa >> 12,
+                    userspace_addr: region.userspace_addr + offset_in_region,
+                    size: EBDA_SIZE,
+                    flags: THHV_MEM_F_ALIAS,
+                    rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
+                    attrs: 0,
+                };
+                eprintln!(
+                    "\r[THEMIS-DBG] VTOM double-map EBDA: GPA {:#x} → userspace {:#x} (size {:#x})",
+                    vtom_gpa, vtom_region.userspace_addr, EBDA_SIZE
+                );
+                ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut vtom_region)
+                    .context("VTOM EBDA double-map THHV_SET_GUEST_MEMORY failed")?;
+                break;
+            }
         }
 
         // Push CPUID entries as Emulate overrides before sealing.
@@ -732,6 +769,7 @@ impl Hypervisor for ThemisHypervisor {
                 vp_fds: Mutex::new(Vec::new()),
                 lapic_regs: Mutex::new(Vec::new()),
                 cpuid_entries: Mutex::new(Vec::new()),
+                vtom_bit: unsafe { core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF } - 1,
             }),
         }))
     }
@@ -1899,10 +1937,15 @@ impl ThemisVcpu {
     }
 
     fn handle_mmio_exit(&mut self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
+        // Strip the VTOM bit from the GPA. CoCo guests set this bit on MMIO
+        // addresses to mark them as shared.  The device model only knows the
+        // canonical (non-VTOM'd) addresses.
+        let vtom_mask = 1u64 << self.vm_state.vtom_bit;
+        let gpa = msg.guest_physical_address & !vtom_mask;
+
         // LAPIC MMIO fast-path: when VIRTUALIZE_APIC_ACCESSES is not
         // supported, LAPIC accesses cause EPT violations.  Handle them
         // here with per-vCPU software LAPIC state + instruction decode.
-        let gpa = msg.guest_physical_address;
         if gpa >= 0xFEE0_0000 && gpa < 0xFEE0_1000 {
             return self.handle_lapic_mmio(msg);
         }
@@ -1927,8 +1970,9 @@ impl ThemisVcpu {
         // the old hand-rolled decoder in the capavisor.
         let mut ctx = emulator::ThemisEmulatorContext {
             vcpu: self,
-            mmio_gpa: msg.guest_physical_address,
+            mmio_gpa: gpa,
             insn_bytes: msg.instruction_bytes,
+            vtom_mask,
         };
 
         let old_rip = msg.guest_rip;
@@ -1939,7 +1983,7 @@ impl ThemisVcpu {
             .map_err(|e| {
                 eprintln!(
                     "\r[MMIO-EMU] emulation failed: gpa={:#x} rip={:#x} insn={:02x?}: {e}",
-                    msg.guest_physical_address, msg.guest_rip, &msg.instruction_bytes[..8],
+                    gpa, msg.guest_rip, &msg.instruction_bytes[..8],
                 );
                 HypervisorCpuError::RunVcpu(anyhow::anyhow!("MMIO emulation failed: {e}").into())
             })?;
@@ -1955,7 +1999,7 @@ impl ThemisVcpu {
         if mn < 20 || (mn < 500 && mn % 50 == 0) || mn % 1000 == 0 {
             eprintln!(
                 "\r[MMIO-DBG] #{mn} gpa={:#x} old_rip={:#x} new_rip={:#x} insn={:02x?}",
-                msg.guest_physical_address, old_rip, new_rip, &msg.instruction_bytes[..6],
+                gpa, old_rip, new_rip, &msg.instruction_bytes[..6],
             );
         }
 

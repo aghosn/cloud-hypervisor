@@ -28,6 +28,11 @@ pub struct ThemisEmulatorContext<'a> {
     pub vcpu: &'a ThemisVcpu,
     pub mmio_gpa: u64,
     pub insn_bytes: [u8; 16],
+    /// Mask with the VTOM bit set (e.g. `1 << 38`).  CoCo guests set this bit
+    /// in page-table entries for shared (MMIO / DMA) pages.  We strip it from
+    /// GPAs before passing them to the device model so that addresses match the
+    /// canonical device-model layout.
+    pub vtom_mask: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +84,7 @@ impl ThemisEmulatorContext<'_> {
         }
         if pdpte & PAGE_SIZE_BIT != 0 {
             // 1 GB page
-            return Ok((pdpte & 0x000F_FFFF_C000_0000) | (gva & 0x3FFF_FFFF));
+            return Ok(((pdpte & 0x000F_FFFF_C000_0000) | (gva & 0x3FFF_FFFF)) & !self.vtom_mask);
         }
 
         // PD
@@ -91,7 +96,7 @@ impl ThemisEmulatorContext<'_> {
         }
         if pde & PAGE_SIZE_BIT != 0 {
             // 2 MB page
-            return Ok((pde & 0x000F_FFFF_FFE0_0000) | (gva & 0x1F_FFFF));
+            return Ok(((pde & 0x000F_FFFF_FFE0_0000) | (gva & 0x1F_FFFF)) & !self.vtom_mask);
         }
 
         // PT
@@ -102,7 +107,7 @@ impl ThemisEmulatorContext<'_> {
             )));
         }
 
-        Ok((pte & PHYS_ADDR_MASK) | (gva & 0xFFF))
+        Ok(((pte & PHYS_ADDR_MASK) | (gva & 0xFFF)) & !self.vtom_mask)
     }
 
     /// Read from guest memory at a guest virtual address.
