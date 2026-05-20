@@ -509,6 +509,9 @@ struct ThemisVmState {
     /// VTOM bit position (MAXPHYADDR - 1). Used to strip the VTOM bit from
     /// MMIO GPAs when the CoCo kernel marks device accesses as shared.
     vtom_bit: u32,
+    /// Confidential mode: guest RAM is CARVEd (dom0 loses access) instead of
+    /// ALIASed. MMIO regions remain ALIAS (shared by design).
+    confidential: bool,
 }
 
 impl ThemisVmState {
@@ -726,6 +729,7 @@ impl Hypervisor for ThemisHypervisor {
     }
 
     fn create_vm(&self, _config: HypervisorVmConfig) -> hypervisor::Result<Arc<dyn vm::Vm>> {
+        let confidential = _config.confidential;
         let mut create = ThhvCreatePartition {
             cores_mask: !0,
             api_flags: !0,
@@ -770,6 +774,7 @@ impl Hypervisor for ThemisHypervisor {
                 lapic_regs: Mutex::new(Vec::new()),
                 cpuid_entries: Mutex::new(Vec::new()),
                 vtom_bit: unsafe { core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF } - 1,
+                confidential,
             }),
         }))
     }
@@ -1116,11 +1121,19 @@ impl vm::Vm for ThemisVm {
         _readonly: bool,
         _log_dirty_pages: bool,
     ) -> vm::Result<()> {
+        // In confidential mode, guest RAM uses CARVE (exclusive — dom0 loses
+        // access) while MMIO regions (PCI hole 0xC0000000–0xFFFFFFFF) stay ALIAS.
+        let is_mmio = guest_phys_addr >= 0xC000_0000 && guest_phys_addr < 0x1_0000_0000;
+        let flags = if self.state.confidential && !is_mmio {
+            0 // CARVE (no ALIAS flag)
+        } else {
+            THHV_MEM_F_ALIAS
+        };
         let region = ThhvSetGuestMemory {
             guest_pfn: guest_phys_addr >> 12,
             userspace_addr: userspace_addr as usize as u64,
             size: memory_size as u64,
-            flags: THHV_MEM_F_ALIAS,
+            flags,
             rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
             attrs: 0,
         };

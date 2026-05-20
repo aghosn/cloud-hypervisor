@@ -188,6 +188,7 @@ pub struct HypervisorVmConfig {
     pub mem_size: u64,
     pub nested: bool,
     pub smt_enabled: bool,
+    pub confidential: bool,
 }
 
 #[derive(Copy, Clone)]

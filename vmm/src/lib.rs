@@ -231,6 +231,10 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
                 .topology
                 .as_ref()
                 .is_some_and(|t| t.threads_per_core > 1),
+            confidential: _value
+                .platform
+                .as_ref()
+                .is_some_and(|p| p.confidential),
         }
     }
 }

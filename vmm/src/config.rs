@@ -811,6 +811,7 @@ impl PlatformConfig {
         parser.add("tdx");
         #[cfg(feature = "sev_snp")]
         parser.add("sev_snp");
+        parser.add("confidential");
         parser.parse(platform).map_err(Error::ParsePlatform)?;
 
         let num_pci_segments: u16 = parser
@@ -845,6 +846,11 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(false))
             .0;
+        let confidential = parser
+            .convert::<Toggle>("confidential")
+            .map_err(Error::ParsePlatform)?
+            .unwrap_or(Toggle(false))
+            .0;
         Ok(PlatformConfig {
             num_pci_segments,
             iommu_segments,
@@ -856,6 +862,7 @@ impl PlatformConfig {
             tdx,
             #[cfg(feature = "sev_snp")]
             sev_snp,
+            confidential,
         })
     }
 
@@ -4774,6 +4781,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             tdx: false,
             #[cfg(feature = "sev_snp")]
             sev_snp: false,
+            confidential: false,
         }
     }
 
