@@ -458,7 +458,7 @@ pub struct VmParams<'a> {
     #[cfg(feature = "fw_cfg")]
     pub fw_cfg_config: Option<&'a str>,
     #[cfg(feature = "ivshmem")]
-    pub ivshmem: Option<&'a str>,
+    pub ivshmem: Option<Vec<&'a str>>,
 }
 
 impl<'a> VmParams<'a> {
@@ -533,7 +533,9 @@ impl<'a> VmParams<'a> {
         let fw_cfg_config: Option<&str> =
             args.get_one::<String>("fw-cfg-config").map(|x| x as &str);
         #[cfg(feature = "ivshmem")]
-        let ivshmem: Option<&str> = args.get_one::<String>("ivshmem").map(|x| x as &str);
+        let ivshmem: Option<Vec<&str>> = args
+            .get_many::<String>("ivshmem")
+            .map(|x| x.map(|y| y as &str).collect());
         VmParams {
             cpus,
             memory,
@@ -2773,12 +2775,15 @@ impl LandlockConfig {
 #[cfg(feature = "ivshmem")]
 impl IvshmemConfig {
     pub const SYNTAX: &'static str = "Ivshmem device. Specify the backend file path and size \
-    for the shared memory: \"path=</path/to/a/file>, size=<file_size>\" \
+    for the shared memory: \"path=</path/to/a/file>, size=<file_size>[,mode=alias|carve|plug][,count=<N>]\" \
     \nThe <file_size> must be a power of 2 (e.g., 2M, 4M, etc.), as it represents the size \
-    of the memory region mapped to the guest. Default size is 128M.";
+    of the memory region mapped to the guest. Default size is 128M. \
+    \nOptional mode: alias (creator keeps access), carve (creator loses access), \
+    plug (join existing region). count = number of additional domains that may plug in. \
+    \nMultiple --ivshmem flags create multiple ivshmem PCI devices.";
     pub fn parse(ivshmem: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
-        parser.add("path").add("size");
+        parser.add("path").add("size").add("mode").add("count");
         parser.parse(ivshmem).map_err(Error::ParseIvshmem)?;
         let path = parser
             .get("path")
@@ -2789,9 +2794,15 @@ impl IvshmemConfig {
             .map_err(Error::ParseIvshmem)?
             .unwrap_or(ByteSized((DEFAULT_IVSHMEM_SIZE << 20) as u64))
             .0;
+        let mode = parser.get("mode");
+        let count = parser
+            .convert::<u32>("count")
+            .map_err(Error::ParseIvshmem)?;
         Ok(IvshmemConfig {
             path,
             size: size as usize,
+            mode,
+            count,
         })
     }
 
@@ -2802,10 +2813,24 @@ impl IvshmemConfig {
         if !size.is_power_of_two() {
             return Err(ValidationError::InvalidIvshmemInputSize(size));
         }
-        let metadata = fs::metadata(path.to_str().unwrap())
-            .map_err(|_| ValidationError::InvalidIvshmemPath)?;
-        if metadata.len() < size {
-            return Err(ValidationError::InvalidIvshmemSize(metadata.len()));
+        // Validate mode if present
+        if let Some(ref mode) = self.mode {
+            match mode.as_str() {
+                "alias" | "carve" | "plug" => {}
+                _ => return Err(ValidationError::InvalidIvshmemPath),
+            }
+            // plug mode doesn't need count; alias/carve should have count
+            if mode == "plug" && self.count.is_some() {
+                return Err(ValidationError::InvalidIvshmemPath);
+            }
+        }
+        // Vanilla and creator modes need the backing file to exist
+        if self.mode.as_deref() != Some("plug") {
+            let metadata = fs::metadata(path.to_str().unwrap())
+                .map_err(|_| ValidationError::InvalidIvshmemPath)?;
+            if metadata.len() < size {
+                return Err(ValidationError::InvalidIvshmemSize(metadata.len()));
+            }
         }
         Ok(())
     }
@@ -3190,8 +3215,10 @@ impl VmConfig {
             }
         }
         #[cfg(feature = "ivshmem")]
-        if let Some(ivshmem_config) = &self.ivshmem {
-            ivshmem_config.validate()?;
+        if let Some(ivshmem_list) = &self.ivshmem {
+            for ivshmem_config in ivshmem_list {
+                ivshmem_config.validate()?;
+            }
         }
 
         Ok(id_list)
@@ -3385,11 +3412,15 @@ impl VmConfig {
         }
 
         #[cfg(feature = "ivshmem")]
-        let mut ivshmem: Option<IvshmemConfig> = None;
+        let mut ivshmem: Option<Vec<IvshmemConfig>> = None;
         #[cfg(feature = "ivshmem")]
-        if let Some(iv) = vm_params.ivshmem {
-            let ivshmem_conf = IvshmemConfig::parse(iv)?;
-            ivshmem = Some(ivshmem_conf);
+        if let Some(ivshmem_list) = &vm_params.ivshmem {
+            let mut ivshmem_config_list = Vec::new();
+            for item in ivshmem_list.iter() {
+                let ivshmem_conf = IvshmemConfig::parse(item)?;
+                ivshmem_config_list.push(ivshmem_conf);
+            }
+            ivshmem = Some(ivshmem_config_list);
         }
 
         let mut config = VmConfig {

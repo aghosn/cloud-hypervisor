@@ -465,6 +465,18 @@ pub trait Vm: Send + Sync + Any {
     fn enable_x2apic_api(&self) -> Result<()> {
         unimplemented!("x2Apic is only supported on KVM/Linux hosts")
     }
+
+    /// Annotate a pending memory region as capability-backed shared memory.
+    /// Default no-op — only implemented by the Themis backend.
+    fn annotate_shmem(
+        &self,
+        _guest_gpa: u64,
+        _mode: u32,
+        _count: u32,
+        _path: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait VmOps: Send + Sync {

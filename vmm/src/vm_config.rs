@@ -697,6 +697,13 @@ pub const DEFAULT_IVSHMEM_SIZE: usize = 128;
 pub struct IvshmemConfig {
     pub path: PathBuf,
     pub size: usize,
+    /// Capability-backed mode: "alias", "carve", or "plug".
+    /// None = vanilla file-backed ivshmem (existing behavior).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Number of additional domains that may plug in (creator only).
+    #[serde(default)]
+    pub count: Option<u32>,
 }
 
 #[cfg(feature = "ivshmem")]
@@ -705,6 +712,8 @@ impl Default for IvshmemConfig {
         Self {
             path: PathBuf::new(),
             size: DEFAULT_IVSHMEM_SIZE << 20,
+            mode: None,
+            count: None,
         }
     }
 }
@@ -1002,7 +1011,7 @@ pub struct VmConfig {
     pub landlock_enable: bool,
     pub landlock_rules: Option<Vec<LandlockConfig>>,
     #[cfg(feature = "ivshmem")]
-    pub ivshmem: Option<IvshmemConfig>,
+    pub ivshmem: Option<Vec<IvshmemConfig>>,
 }
 
 impl VmConfig {

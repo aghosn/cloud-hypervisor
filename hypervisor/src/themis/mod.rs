@@ -261,6 +261,9 @@ struct ThhvSetGuestMemory {
     flags: u32,
     rights: u32,
     attrs: u64,
+    shmem_mode: u32,
+    shmem_count: u32,
+    shmem_path: [u8; THHV_SHMEM_PATH_MAX],
 }
 
 #[repr(C)]
@@ -326,6 +329,16 @@ struct ThhvInjectInterrupt {
     vp_index: u32,
     vector: u8,
     pad: [u8; 3],
+}
+
+const THHV_SHMEM_PATH_MAX: usize = 256;
+
+#[allow(dead_code)]
+pub mod shmem_mode {
+    pub const NONE: u32 = 0;
+    pub const ALIAS: u32 = 1;
+    pub const CARVE: u32 = 2;
+    pub const PLUG: u32 = 3;
 }
 
 #[repr(C)]
@@ -515,6 +528,120 @@ struct ThemisVmState {
 }
 
 impl ThemisVmState {
+    /// Known shared regions in a confidential guest.  These need ALIAS slots
+    /// (parent retains access) instead of CARVE, plus a vTOM mirror ALIAS.
+    const SHARED_REGIONS: &'static [(u64, u64)] = &[
+        (0xA0000, 0x100000), // EBDA / legacy ACPI firmware area
+    ];
+
+    /// Split pending memory regions for confidential mode.
+    ///
+    /// Any region that overlaps a known shared area is split into up to 3 parts:
+    ///   [region_start .. shared_start]  CARVE  (if non-empty)
+    ///   [shared_start .. shared_end]    ALIAS  (shared)
+    ///   [shared_end   .. region_end]    CARVE  (if non-empty)
+    /// Plus a vTOM mirror ALIAS at (vtom_bit | shared_start).
+    ///
+    /// Non-overlapping regions pass through unchanged.
+    fn split_confidential_regions(
+        regions: &[ThhvSetGuestMemory],
+        vtom_bit: u32,
+    ) -> Vec<ThhvSetGuestMemory> {
+        let all_rights = THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC;
+        let mut out = Vec::new();
+
+        for region in regions {
+            let r_start = region.guest_pfn << 12;
+            let r_end = r_start + region.size;
+
+            // MMIO regions are always ALIAS, no splitting needed.
+            if region.flags & THHV_MEM_F_ALIAS != 0 {
+                out.push(*region);
+                continue;
+            }
+
+            // Collect shared sub-ranges that overlap this region.
+            let mut cuts: Vec<(u64, u64)> = Vec::new();
+            for &(s_start, s_end) in Self::SHARED_REGIONS {
+                let lo = s_start.max(r_start);
+                let hi = s_end.min(r_end);
+                if lo < hi {
+                    cuts.push((lo, hi));
+                }
+            }
+
+            if cuts.is_empty() {
+                // No shared overlap — pass through as CARVE.
+                out.push(*region);
+                continue;
+            }
+
+            // Sort cuts by start address (already sorted for a single entry,
+            // but future-proof for multiple shared regions).
+            cuts.sort_by_key(|&(lo, _)| lo);
+
+            // Walk through the region, emitting CARVE gaps and ALIAS shared parts.
+            let mut cursor = r_start;
+            for (s_lo, s_hi) in &cuts {
+                // CARVE gap before this shared region.
+                if cursor < *s_lo {
+                    let gap_size = s_lo - cursor;
+                    out.push(ThhvSetGuestMemory {
+                        guest_pfn: cursor >> 12,
+                        userspace_addr: region.userspace_addr + (cursor - r_start),
+                        size: gap_size,
+                        flags: 0,
+                        rights: all_rights,
+                        attrs: 0,
+                        ..ThhvSetGuestMemory::default()
+                    });
+                }
+
+                // ALIAS for the shared region.
+                let shared_size = s_hi - s_lo;
+                out.push(ThhvSetGuestMemory {
+                    guest_pfn: s_lo >> 12,
+                    userspace_addr: region.userspace_addr + (s_lo - r_start),
+                    size: shared_size,
+                    flags: THHV_MEM_F_ALIAS,
+                    rights: all_rights,
+                    attrs: 0,
+                    ..ThhvSetGuestMemory::default()
+                });
+
+                // vTOM mirror ALIAS.
+                let vtom_gpa = s_lo | (1u64 << vtom_bit);
+                out.push(ThhvSetGuestMemory {
+                    guest_pfn: vtom_gpa >> 12,
+                    userspace_addr: region.userspace_addr + (s_lo - r_start),
+                    size: shared_size,
+                    flags: THHV_MEM_F_ALIAS,
+                    rights: all_rights,
+                    attrs: 0,
+                    ..ThhvSetGuestMemory::default()
+                });
+
+                cursor = *s_hi;
+            }
+
+            // CARVE tail after last shared region.
+            if cursor < r_end {
+                let tail_size = r_end - cursor;
+                out.push(ThhvSetGuestMemory {
+                    guest_pfn: cursor >> 12,
+                    userspace_addr: region.userspace_addr + (cursor - r_start),
+                    size: tail_size,
+                    flags: 0,
+                    rights: all_rights,
+                    attrs: 0,
+                    ..ThhvSetGuestMemory::default()
+                });
+            }
+        }
+
+        out
+    }
+
     fn ensure_initialized(&self) -> anyhow::Result<()> {
         let mut initialized = self.initialized.lock().unwrap();
         if *initialized {
@@ -523,48 +650,34 @@ impl ThemisVmState {
 
         // Flush all deferred SET_GUEST_MEMORY calls before sealing.
         // After this point dom0 loses EPT access to dom1's guest pages.
-        let regions: Vec<ThhvSetGuestMemory> =
+        let raw_regions: Vec<ThhvSetGuestMemory> =
             self.pending_memory.lock().unwrap().drain(..).collect();
+
+        // In confidential mode, split regions around known shared areas (EBDA/ACPI).
+        // Shared regions become ALIAS slots (+ vTOM mirror), the rest stays CARVE.
+        let regions = if self.confidential {
+            Self::split_confidential_regions(&raw_regions, self.vtom_bit)
+        } else {
+            raw_regions
+        };
+
         eprintln!("\r[THEMIS-DBG] ensure_initialized: flushing {} memory regions", regions.len());
         for (i, mut region) in regions.iter().cloned().enumerate() {
-            eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] gfn=0x{:x} size=0x{:x}", region.guest_pfn, region.size);
+            let kind = if region.flags & THHV_MEM_F_ALIAS != 0 { "ALIAS" } else { "CARVE" };
+            let shmem_info = if region.shmem_mode != 0 {
+                let path = std::str::from_utf8(&region.shmem_path)
+                    .unwrap_or("<invalid>")
+                    .trim_end_matches('\0');
+                format!(" shmem_mode={} count={} path=\"{}\"",
+                    region.shmem_mode, region.shmem_count, path)
+            } else {
+                String::new()
+            };
+            eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] gfn=0x{:x} size=0x{:x} {kind}{shmem_info}",
+                region.guest_pfn, region.size);
             ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut region)
                 .context("deferred THHV_SET_GUEST_MEMORY failed")?;
             eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
-        }
-
-        // Double-map the ACPI/firmware region (EBDA: 0xA0000–0xFFFFF) at the
-        // VTOM-offset GPA.  The CoCo kernel accesses ACPI tables with the VTOM
-        // bit set (shared marking).  Without this alias, those accesses cause
-        // EPT violations that cannot be emulated (it's RAM, not MMIO).
-        // The EBDA is in the e820 gap — Linux marks it nosave, never recycles it.
-        const EBDA_START: u64 = 0xA0000;
-        const EBDA_END: u64 = 0x100000; // exclusive
-        const EBDA_SIZE: u64 = EBDA_END - EBDA_START;
-
-        for region in &regions {
-            let region_start = region.guest_pfn << 12;
-            let region_end = region_start + region.size;
-            if region_start <= EBDA_START && region_end >= EBDA_END {
-                // Found the region containing EBDA. Compute userspace_addr offset.
-                let offset_in_region = EBDA_START - region_start;
-                let vtom_gpa = EBDA_START | (1u64 << self.vtom_bit);
-                let mut vtom_region = ThhvSetGuestMemory {
-                    guest_pfn: vtom_gpa >> 12,
-                    userspace_addr: region.userspace_addr + offset_in_region,
-                    size: EBDA_SIZE,
-                    flags: THHV_MEM_F_ALIAS,
-                    rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
-                    attrs: 0,
-                };
-                eprintln!(
-                    "\r[THEMIS-DBG] VTOM double-map EBDA: GPA {:#x} → userspace {:#x} (size {:#x})",
-                    vtom_gpa, vtom_region.userspace_addr, EBDA_SIZE
-                );
-                ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut vtom_region)
-                    .context("VTOM EBDA double-map THHV_SET_GUEST_MEMORY failed")?;
-                break;
-            }
         }
 
         // Push CPUID entries as Emulate overrides before sealing.
@@ -591,41 +704,38 @@ impl ThemisVmState {
         // Push Native ranges for Themis hypervisor CPUID leaves so the child
         // can discover the capavisor.  The capavisor handles these natively
         // (signature, features, domcomm, limits, etc.).
-        // We split around the CoCo detection leaf (0x40000100) which gets an
-        // Emulate override with the host-specific VTOM bit value.
         // CPUID_RANGE encoding: key = (start_leaf << 32) | start_sub,
         //                       sub_key = (end_leaf << 32) | end_sub,
         //                       value = 1 (Native).
-        {
-            // Native: 0x40000000,0 – 0x400000FF,0xFFFFFFFF
+        if self.confidential {
+            // Confidential: split around CoCo detection leaf (0x40000100)
+            // which gets an Emulate override with VTOM bit.
             let r1_start: u64 = 0x40000000_u64 << 32;
             let r1_end: u64 = (0x400000FF_u64 << 32) | 0xFFFFFFFF;
-            // Native: 0x40000101,0 – 0x4FFFFFFF,0xFFFFFFFF
             let r2_start: u64 = 0x40000101_u64 << 32;
             let r2_end: u64 = (0x4FFFFFFF_u64 << 32) | 0xFFFFFFFF;
-            eprintln!("\r[THEMIS-DBG] pushing Native ranges for hypervisor CPUID leaves");
+            eprintln!("\r[THEMIS-DBG] pushing Native ranges for hypervisor CPUID leaves (CoCo split)");
             self.set_policy(policy_kind::CPUID_RANGE, r1_start, r1_end, 1)?;
             self.set_policy(policy_kind::CPUID_RANGE, r2_start, r2_end, 1)?;
-        }
 
-        // Push Emulate override for CoCo detection leaf (0x40000100).
-        // EAX = VTOM bit = MAXPHYADDR - 1 (read from host CPU).
-        // EBX/ECX/EDX = "ThemisCoCo\0\0" signature.
-        {
-            let maxphyaddr = unsafe {
-                core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF
-            };
-            let vtom_bit = maxphyaddr - 1;
-            let coco_leaf: u64 = 0x40000100_u64 << 32; // subleaf 0
-            let eax = vtom_bit;
+            // Push Emulate override for CoCo detection leaf (0x40000100).
+            // EAX = VTOM bit, EBX/ECX/EDX = "ThemisCoCo\0\0" signature.
+            let coco_leaf: u64 = 0x40000100_u64 << 32;
+            let eax = self.vtom_bit;
             let ebx = u32::from_le_bytes(*b"Them");
             let ecx = u32::from_le_bytes(*b"isCo");
             let edx = u32::from_le_bytes(*b"Co\0\0");
             let word0 = ((eax as u64) << 32) | (ebx as u64);
             let word1 = ((ecx as u64) << 32) | (edx as u64);
-            eprintln!("\r[THEMIS-DBG] pushing CoCo CPUID leaf 0x40000100: vtom_bit={vtom_bit} (maxphyaddr={maxphyaddr})");
+            eprintln!("\r[THEMIS-DBG] pushing CoCo CPUID leaf 0x40000100: vtom_bit={}", self.vtom_bit);
             self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 0, word0)?;
             self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 1, word1)?;
+        } else {
+            // Non-confidential: full Native range, no CoCo leaf.
+            let r_start: u64 = 0x40000000_u64 << 32;
+            let r_end: u64 = (0x4FFFFFFF_u64 << 32) | 0xFFFFFFFF;
+            eprintln!("\r[THEMIS-DBG] pushing Native range for hypervisor CPUID leaves (no CoCo)");
+            self.set_policy(policy_kind::CPUID_RANGE, r_start, r_end, 1)?;
         }
 
         eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
@@ -773,7 +883,11 @@ impl Hypervisor for ThemisHypervisor {
                 vp_fds: Mutex::new(Vec::new()),
                 lapic_regs: Mutex::new(Vec::new()),
                 cpuid_entries: Mutex::new(Vec::new()),
-                vtom_bit: unsafe { core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF } - 1,
+                vtom_bit: if confidential {
+                    (unsafe { core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF }) - 1
+                } else {
+                    0
+                },
                 confidential,
             }),
         }))
@@ -1136,6 +1250,7 @@ impl vm::Vm for ThemisVm {
             flags,
             rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
             attrs: 0,
+            ..ThhvSetGuestMemory::default()
         };
         // Defer THHV_SET_GUEST_MEMORY until ensure_initialized() (just before
         // first run()).  Cloud-hypervisor must finish all writes into dom1's
@@ -1161,6 +1276,7 @@ impl vm::Vm for ThemisVm {
             flags: THHV_MEM_F_UNMAP,
             rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
             attrs: 0,
+            ..ThhvSetGuestMemory::default()
         };
         ioctl_with_mut_ref(
             self.state.fd.as_raw_fd(),
@@ -1206,6 +1322,39 @@ impl vm::Vm for ThemisVm {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn annotate_shmem(
+        &self,
+        guest_gpa: u64,
+        mode: u32,
+        count: u32,
+        path: &str,
+    ) -> vm::Result<()> {
+        let guest_pfn = guest_gpa >> 12;
+        let mut pending = self.state.pending_memory.lock().unwrap();
+        let entry = pending.iter_mut().find(|e| e.guest_pfn == guest_pfn);
+        match entry {
+            Some(e) => {
+                e.shmem_mode = mode;
+                e.shmem_count = count;
+                let path_bytes = path.as_bytes();
+                let copy_len = path_bytes.len().min(THHV_SHMEM_PATH_MAX - 1);
+                e.shmem_path[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
+                eprintln!(
+                    "\r[THEMIS-DBG] annotated shmem gfn=0x{guest_pfn:x} path=\"{path}\" mode={mode} count={count}"
+                );
+                Ok(())
+            }
+            None => {
+                eprintln!(
+                    "\r[THEMIS-DBG] annotate_shmem: no pending entry for gfn=0x{guest_pfn:x}"
+                );
+                Err(vm::HypervisorVmError::SetUserMemoryRegion(
+                    anyhow::anyhow!("no pending entry for shmem annotation"),
+                ))
+            }
+        }
     }
 }
 
@@ -1952,9 +2101,13 @@ impl ThemisVcpu {
     fn handle_mmio_exit(&mut self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
         // Strip the VTOM bit from the GPA. CoCo guests set this bit on MMIO
         // addresses to mark them as shared.  The device model only knows the
-        // canonical (non-VTOM'd) addresses.
-        let vtom_mask = 1u64 << self.vm_state.vtom_bit;
-        let gpa = msg.guest_physical_address & !vtom_mask;
+        // canonical (non-VTOM'd) addresses.  Skip when not confidential.
+        let gpa = if self.vm_state.confidential {
+            let vtom_mask = 1u64 << self.vm_state.vtom_bit;
+            msg.guest_physical_address & !vtom_mask
+        } else {
+            msg.guest_physical_address
+        };
 
         // LAPIC MMIO fast-path: when VIRTUALIZE_APIC_ACCESSES is not
         // supported, LAPIC accesses cause EPT violations.  Handle them
@@ -1985,7 +2138,11 @@ impl ThemisVcpu {
             vcpu: self,
             mmio_gpa: gpa,
             insn_bytes: msg.instruction_bytes,
-            vtom_mask,
+            vtom_mask: if self.vm_state.confidential {
+                1u64 << self.vm_state.vtom_bit
+            } else {
+                0
+            },
         };
 
         let old_rip = msg.guest_rip;

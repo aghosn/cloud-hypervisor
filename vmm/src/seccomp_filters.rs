@@ -126,7 +126,7 @@ mod themis {
     pub const THHV_QUERY: u64 = 0xc010_b803;
     pub const THHV_INITIALIZE_PARTITION: u64 = 0x0000_b810;
     pub const THHV_CREATE_VP: u64 = 0xc020_b811;
-    pub const THHV_SET_GUEST_MEMORY: u64 = 0x4028_b812;
+    pub const THHV_SET_GUEST_MEMORY: u64 = 0x4130_b812;
     pub const THHV_IRQFD: u64 = 0x4010_b813;
     pub const THHV_IOEVENTFD: u64 = 0x4020_b814;
     pub const THHV_SEND_SHARED_META: u64 = 0x4010_b817;

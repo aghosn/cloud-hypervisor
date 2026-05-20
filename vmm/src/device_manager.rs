@@ -1123,8 +1123,8 @@ pub struct DeviceManager {
     fw_cfg: Option<Arc<Mutex<FwCfg>>>,
 
     #[cfg(feature = "ivshmem")]
-    // ivshmem device
-    ivshmem_device: Option<Arc<Mutex<devices::IvshmemDevice>>>,
+    // ivshmem devices (one per --ivshmem flag)
+    ivshmem_devices: Vec<Arc<Mutex<devices::IvshmemDevice>>>,
 }
 
 fn create_mmio_allocators(
@@ -1391,7 +1391,7 @@ impl DeviceManager {
             #[cfg(feature = "fw_cfg")]
             fw_cfg: None,
             #[cfg(feature = "ivshmem")]
-            ivshmem_device: None,
+            ivshmem_devices: Vec::new(),
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -1511,8 +1511,12 @@ impl DeviceManager {
         }
 
         #[cfg(feature = "ivshmem")]
-        if let Some(ivshmem) = self.config.clone().lock().unwrap().ivshmem.as_ref() {
-            self.ivshmem_device = self.add_ivshmem_device(ivshmem)?;
+        if let Some(ivshmem_list) = self.config.clone().lock().unwrap().ivshmem.as_ref() {
+            for (idx, ivshmem_cfg) in ivshmem_list.iter().enumerate() {
+                if let Some(dev) = self.add_ivshmem_device(ivshmem_cfg, idx)? {
+                    self.ivshmem_devices.push(dev);
+                }
+            }
         }
 
         Ok(())
@@ -4361,8 +4365,9 @@ impl DeviceManager {
     fn add_ivshmem_device(
         &mut self,
         ivshmem_cfg: &IvshmemConfig,
+        index: usize,
     ) -> DeviceManagerResult<Option<Arc<Mutex<devices::IvshmemDevice>>>> {
-        let id = String::from(IVSHMEM_DEVICE_NAME);
+        let id = format!("{IVSHMEM_DEVICE_NAME}_{index}");
         let pci_segment_id = 0x0_u16;
         info!("Creating ivshmem device {id}");
 
@@ -4397,6 +4402,31 @@ impl DeviceManager {
             .unwrap()
             .map_ram_region(start_addr, ivshmem_cfg.size, Some(ivshmem_cfg.path.clone()))
             .map_err(DeviceManagerError::IvshmemCreate)?;
+
+        // For capability-backed mode, annotate the pending memory slot with
+        // shmem info so thhv handles rendezvous registration during
+        // SET_GUEST_MEMORY.  The primary map is part of the same ioctl.
+        if let Some(ref mode) = ivshmem_cfg.mode {
+            let mode_val = match mode.as_str() {
+                "alias" => 1u32,
+                "carve" => 2u32,
+                "plug" => 3u32,
+                _ => 0u32,
+            };
+            let path_str = ivshmem_cfg.path.to_str().unwrap_or("");
+            self.address_manager
+                .vm
+                .annotate_shmem(
+                    start_addr,
+                    mode_val,
+                    ivshmem_cfg.count.unwrap_or(0),
+                    path_str,
+                )
+                .map_err(|e| DeviceManagerError::IvshmemCreate(
+                    devices::ivshmem::IvshmemError::CreateUserMemoryRegion,
+                ))?;
+        }
+
         ivshmem_device.lock().unwrap().set_region(region, mapping);
 
         let mut node = device_node!(id, ivshmem_device);

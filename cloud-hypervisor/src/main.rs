@@ -309,7 +309,8 @@ fn get_cli_options_sorted(
         Arg::new("ivshmem")
             .long("ivshmem")
             .help(IvshmemConfig::SYNTAX)
-            .num_args(1)
+            .num_args(1..)
+            .action(ArgAction::Append)
             .group("vm-config"),
         Arg::new("kernel")
             .long("kernel")
