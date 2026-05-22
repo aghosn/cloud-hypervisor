@@ -253,7 +253,7 @@ struct ThhvInitializePartition {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct ThhvSetGuestMemory {
     guest_pfn: u64,
     userspace_addr: u64,
@@ -264,6 +264,22 @@ struct ThhvSetGuestMemory {
     shmem_mode: u32,
     shmem_count: u32,
     shmem_path: [u8; THHV_SHMEM_PATH_MAX],
+}
+
+impl Default for ThhvSetGuestMemory {
+    fn default() -> Self {
+        Self {
+            guest_pfn: 0,
+            userspace_addr: 0,
+            size: 0,
+            flags: 0,
+            rights: 0,
+            attrs: 0,
+            shmem_mode: 0,
+            shmem_count: 0,
+            shmem_path: [0u8; THHV_SHMEM_PATH_MAX],
+        }
+    }
 }
 
 #[repr(C)]
@@ -519,6 +535,13 @@ struct ThemisVmState {
     /// CPUID entries to push as interposition Emulate policy before sealing.
     /// Populated by the first vCPU's set_cpuid2() call.
     cpuid_entries: Mutex<Vec<CpuIdEntry>>,
+    /// ivshmem BAR addresses for CPUID leaf 0x40000004 (Emulate override).
+    /// Each entry: (index, bar0_gpa, bar2_gpa).
+    ivshmem_bars: Mutex<Vec<(u32, u64, u64)>>,
+    /// IOEVENTFDs deferred until ensure_initialized().  The THHV_IOEVENTFD
+    /// ioctl calls REGISTER_DOORBELL which needs the child domain to exist
+    /// (after creation) but must happen before seal.
+    pending_ioeventfds: Mutex<Vec<(ThhvIoeventfd, EventFd)>>,
     /// VTOM bit position (MAXPHYADDR - 1). Used to strip the VTOM bit from
     /// MMIO GPAs when the CoCo kernel marks device accesses as shared.
     vtom_bit: u32,
@@ -701,25 +724,89 @@ impl ThemisVmState {
             }
         }
 
+        // Push ivshmem BAR addresses as Emulate CPUID leaf 0x40000004.
+        // Each ivshmem device gets its own subleaf (index).
+        // EAX = BAR0 GPA (32-bit), EBX = device count,
+        // ECX = BAR2 GPA (low 32), EDX = BAR2 GPA (high 32).
+        let ivshmem_bars = self.ivshmem_bars.lock().unwrap().clone();
+        if !ivshmem_bars.is_empty() {
+            let count = ivshmem_bars.len() as u32;
+            eprintln!(
+                "\r[THEMIS-DBG] pushing {} ivshmem CPUID entries (leaf 0x40000004)",
+                count
+            );
+            for &(index, bar0_gpa, bar2_gpa) in &ivshmem_bars {
+                let leaf: u64 = (0x40000004_u64 << 32) | (index as u64);
+                let eax = bar0_gpa as u32;
+                let ebx = count;
+                let ecx = bar2_gpa as u32;
+                let edx = (bar2_gpa >> 32) as u32;
+                let word0 = ((eax as u64) << 32) | (ebx as u64);
+                let word1 = ((ecx as u64) << 32) | (edx as u64);
+                self.set_policy(policy_kind::CPUID_EMULATE, leaf, 0, word0)?;
+                self.set_policy(policy_kind::CPUID_EMULATE, leaf, 1, word1)?;
+                eprintln!(
+                    "\r[THEMIS-DBG]   ivshmem[{index}]: bar0=0x{bar0_gpa:x} bar2=0x{bar2_gpa:x}"
+                );
+            }
+        }
+
         // Push Native ranges for Themis hypervisor CPUID leaves so the child
         // can discover the capavisor.  The capavisor handles these natively
         // (signature, features, domcomm, limits, etc.).
+        //
+        // We must split the Native range around any Emulate leaves (ivshmem,
+        // CoCo detection) because the engine rejects overlapping entries.
+        // Collect Emulate leaf numbers, sort them, then emit Native segments
+        // that skip those leaves.
+        //
         // CPUID_RANGE encoding: key = (start_leaf << 32) | start_sub,
         //                       sub_key = (end_leaf << 32) | end_sub,
         //                       value = 1 (Native).
-        if self.confidential {
-            // Confidential: split around CoCo detection leaf (0x40000100)
-            // which gets an Emulate override with VTOM bit.
-            let r1_start: u64 = 0x40000000_u64 << 32;
-            let r1_end: u64 = (0x400000FF_u64 << 32) | 0xFFFFFFFF;
-            let r2_start: u64 = 0x40000101_u64 << 32;
-            let r2_end: u64 = (0x4FFFFFFF_u64 << 32) | 0xFFFFFFFF;
-            eprintln!("\r[THEMIS-DBG] pushing Native ranges for hypervisor CPUID leaves (CoCo split)");
-            self.set_policy(policy_kind::CPUID_RANGE, r1_start, r1_end, 1)?;
-            self.set_policy(policy_kind::CPUID_RANGE, r2_start, r2_end, 1)?;
+        {
+            let range_start: u32 = 0x40000000;
+            let range_end: u32 = 0x4FFFFFFF;
 
-            // Push Emulate override for CoCo detection leaf (0x40000100).
-            // EAX = VTOM bit, EBX/ECX/EDX = "ThemisCoCo\0\0" signature.
+            // Gather all Emulate leaf numbers that fall in the Native range.
+            let mut emulate_leaves: Vec<u32> = Vec::new();
+
+            // ivshmem leaves (one per device, all at leaf 0x40000004).
+            if !ivshmem_bars.is_empty() {
+                emulate_leaves.push(0x40000004);
+            }
+
+            // CoCo detection leaf.
+            if self.confidential {
+                emulate_leaves.push(0x40000100);
+            }
+
+            emulate_leaves.sort();
+            emulate_leaves.dedup();
+
+            // Emit Native segments between emulate gaps.
+            let mut cursor = range_start;
+            for &leaf in &emulate_leaves {
+                if cursor < leaf {
+                    let s: u64 = (cursor as u64) << 32;
+                    let e: u64 = ((leaf - 1) as u64) << 32 | 0xFFFFFFFF;
+                    self.set_policy(policy_kind::CPUID_RANGE, s, e, 1)?;
+                }
+                cursor = leaf + 1;
+            }
+            if cursor <= range_end {
+                let s: u64 = (cursor as u64) << 32;
+                let e: u64 = (range_end as u64) << 32 | 0xFFFFFFFF;
+                self.set_policy(policy_kind::CPUID_RANGE, s, e, 1)?;
+            }
+
+            eprintln!(
+                "\r[THEMIS-DBG] pushed Native CPUID ranges (split around {} emulate leaves)",
+                emulate_leaves.len()
+            );
+        }
+
+        // Push CoCo detection Emulate leaf (0x40000100) if confidential.
+        if self.confidential {
             let coco_leaf: u64 = 0x40000100_u64 << 32;
             let eax = self.vtom_bit;
             let ebx = u32::from_le_bytes(*b"Them");
@@ -730,12 +817,20 @@ impl ThemisVmState {
             eprintln!("\r[THEMIS-DBG] pushing CoCo CPUID leaf 0x40000100: vtom_bit={}", self.vtom_bit);
             self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 0, word0)?;
             self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 1, word1)?;
-        } else {
-            // Non-confidential: full Native range, no CoCo leaf.
-            let r_start: u64 = 0x40000000_u64 << 32;
-            let r_end: u64 = (0x4FFFFFFF_u64 << 32) | 0xFFFFFFFF;
-            eprintln!("\r[THEMIS-DBG] pushing Native range for hypervisor CPUID leaves (no CoCo)");
-            self.set_policy(policy_kind::CPUID_RANGE, r_start, r_end, 1)?;
+        }
+
+        // Flush deferred IOEVENTFDs — registers doorbells with capavisor.
+        // Must happen after domain creation but before seal.
+        {
+            let pending = self.pending_ioeventfds.lock().unwrap().drain(..).collect::<Vec<_>>();
+            for (mut ioevent, _owner) in pending {
+                eprintln!(
+                    "\r[THEMIS-DBG] deferred IOEVENTFD addr=0x{:x} fd={}",
+                    ioevent.addr, ioevent.fd
+                );
+                ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_IOEVENTFD, &mut ioevent)
+                    .context("deferred THHV_IOEVENTFD failed")?;
+            }
         }
 
         eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
@@ -883,6 +978,8 @@ impl Hypervisor for ThemisHypervisor {
                 vp_fds: Mutex::new(Vec::new()),
                 lapic_regs: Mutex::new(Vec::new()),
                 cpuid_entries: Mutex::new(Vec::new()),
+                ivshmem_bars: Mutex::new(Vec::new()),
+                pending_ioeventfds: Mutex::new(Vec::new()),
                 vtom_bit: if confidential {
                     (unsafe { core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF }) - 1
                 } else {
@@ -1154,13 +1251,26 @@ impl vm::Vm for ThemisVm {
             }
             None => 0,
         };
-        let mut ioevent = ThhvIoeventfd {
+        let ioevent = ThhvIoeventfd {
             fd: fd.as_raw_fd(),
             flags,
             addr,
             len,
             datamatch,
         };
+        // If the domain is not yet sealed, defer the ioctl.  THHV_IOEVENTFD
+        // calls REGISTER_DOORBELL which needs the child domain to exist.
+        if !*self.state.initialized.lock().unwrap() {
+            let fd_clone = fd.try_clone().map_err(|e|
+                vm::HypervisorVmError::RegisterIoEvent(e.into()))?;
+            eprintln!(
+                "\r[THEMIS-DBG] deferring IOEVENTFD addr=0x{:x} flags=0x{:x}",
+                ioevent.addr, ioevent.flags
+            );
+            self.state.pending_ioeventfds.lock().unwrap().push((ioevent, fd_clone));
+            return Ok(());
+        }
+        let mut ioevent = ioevent;
         ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IOEVENTFD, &mut ioevent)
             .map_err(|e| vm::HypervisorVmError::RegisterIoEvent(e.into()))
     }
@@ -1338,6 +1448,10 @@ impl vm::Vm for ThemisVm {
             Some(e) => {
                 e.shmem_mode = mode;
                 e.shmem_count = count;
+                // shmem_mode=ALIAS means dom0 keeps access → primary op is ALIAS.
+                if mode == shmem_mode::ALIAS {
+                    e.flags |= THHV_MEM_F_ALIAS;
+                }
                 let path_bytes = path.as_bytes();
                 let copy_len = path_bytes.len().min(THHV_SHMEM_PATH_MAX - 1);
                 e.shmem_path[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
@@ -1350,11 +1464,27 @@ impl vm::Vm for ThemisVm {
                 eprintln!(
                     "\r[THEMIS-DBG] annotate_shmem: no pending entry for gfn=0x{guest_pfn:x}"
                 );
-                Err(vm::HypervisorVmError::SetUserMemoryRegion(
+                Err(vm::HypervisorVmError::CreateUserMemory(
                     anyhow::anyhow!("no pending entry for shmem annotation"),
                 ))
             }
         }
+    }
+
+    fn register_ivshmem_bars(
+        &self,
+        index: u32,
+        bar0_gpa: u64,
+        bar2_gpa: u64,
+        _count: u32,
+    ) -> vm::Result<()> {
+        let mut bars = self.state.ivshmem_bars.lock().unwrap();
+        bars.push((index, bar0_gpa, bar2_gpa));
+        eprintln!(
+            "\r[THEMIS-DBG] registered ivshmem[{index}] bar0=0x{bar0_gpa:x} bar2=0x{bar2_gpa:x} (total={})",
+            bars.len()
+        );
+        Ok(())
     }
 }
 

@@ -477,6 +477,18 @@ pub trait Vm: Send + Sync + Any {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Register ivshmem BAR addresses for CPUID discovery (leaf 0x40000004).
+    /// Called by device_manager after PCI allocation assigns BAR GPAs.
+    fn register_ivshmem_bars(
+        &self,
+        _index: u32,
+        _bar0_gpa: u64,
+        _bar2_gpa: u64,
+        _count: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait VmOps: Send + Sync {

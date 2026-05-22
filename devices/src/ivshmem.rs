@@ -29,6 +29,9 @@ const IVSHMEM_BAR0_IDX: usize = 0;
 const IVSHMEM_BAR1_IDX: usize = 1;
 const IVSHMEM_BAR2_IDX: usize = 2;
 
+/// BAR0 register offsets (ivshmem spec).
+pub const IVSHMEM_REG_DOORBELL: u64 = 0x0C;
+
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
 const IVSHMEM_DEVICE_ID: u16 = 0x1110;
 
@@ -348,7 +351,11 @@ impl PciDevice for IvshmemDevice {
 
     fn write_bar(&mut self, base: u64, offset: u64, _data: &[u8]) -> Option<Arc<Barrier>> {
         debug!("write base {base:x} offset {offset}");
-        warn!("Unexpected write ivshmem memory idx: {offset}");
+        // Offset 0xC is the doorbell register — handled via IOEVENTFD,
+        // so writes here are expected and silently ignored by BusDevice.
+        if offset != IVSHMEM_REG_DOORBELL {
+            warn!("Unexpected write ivshmem memory idx: {offset}");
+        }
         None
     }
 

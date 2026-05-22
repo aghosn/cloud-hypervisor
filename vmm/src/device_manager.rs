@@ -4407,11 +4407,12 @@ impl DeviceManager {
         // shmem info so thhv handles rendezvous registration during
         // SET_GUEST_MEMORY.  The primary map is part of the same ioctl.
         if let Some(ref mode) = ivshmem_cfg.mode {
+            use hypervisor::themis::shmem_mode;
             let mode_val = match mode.as_str() {
-                "alias" => 1u32,
-                "carve" => 2u32,
-                "plug" => 3u32,
-                _ => 0u32,
+                "alias" => shmem_mode::ALIAS,
+                "carve" => shmem_mode::CARVE,
+                "plug" => shmem_mode::PLUG,
+                _ => shmem_mode::NONE,
             };
             let path_str = ivshmem_cfg.path.to_str().unwrap_or("");
             self.address_manager
@@ -4428,6 +4429,65 @@ impl DeviceManager {
         }
 
         ivshmem_device.lock().unwrap().set_region(region, mapping);
+
+        // Register ivshmem BAR addresses for CPUID discovery (leaf 0x40000004).
+        let bar0_gpa = ivshmem_device.lock().unwrap().config_bar_addr();
+        self.address_manager
+            .vm
+            .register_ivshmem_bars(index as u32, bar0_gpa, start_addr, 0)
+            .map_err(|e| {
+                DeviceManagerError::IvshmemCreate(
+                    devices::ivshmem::IvshmemError::CreateUserMemoryRegion,
+                )
+            })?;
+
+        // Register IOEVENTFD for ivshmem BAR0 doorbell register (offset 0xC).
+        // This wires the existing EPT violation → DomainComm → eventfd pipeline.
+        let doorbell_fd = EventFd::new(vmm_sys_util::eventfd::EFD_NONBLOCK)
+            .map_err(|_| {
+                DeviceManagerError::IvshmemCreate(
+                    devices::ivshmem::IvshmemError::CreateUserMemoryRegion,
+                )
+            })?;
+        let doorbell_gpa = bar0_gpa + devices::ivshmem::IVSHMEM_REG_DOORBELL;
+        let io_addr = IoEventAddress::Mmio(doorbell_gpa);
+        self.address_manager
+            .vm
+            .register_ioevent(&doorbell_fd, &io_addr, None)
+            .map_err(|e| DeviceManagerError::RegisterIoevent(e.into()))?;
+        info!("ivshmem[{index}] doorbell IOEVENTFD at GPA 0x{doorbell_gpa:x}");
+
+        // Spawn a listener thread that logs doorbell rings.
+        // The eventfd is non-blocking, so we poll with a small sleep.
+        // TODO: integrate into the VM event loop for production use.
+        let doorbell_clone = doorbell_fd
+            .try_clone()
+            .map_err(|_| {
+                DeviceManagerError::IvshmemCreate(
+                    devices::ivshmem::IvshmemError::CreateUserMemoryRegion,
+                )
+            })?;
+        let dev_idx = index;
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("ivshmem-doorbell-{index}"))
+            .spawn(move || {
+                loop {
+                    match doorbell_clone.read() {
+                        Ok(count) => {
+                            eprintln!(
+                                "\r[IVSHMEM] doorbell[{dev_idx}] rang! (count={count})"
+                            );
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        {
+            error!("Failed to spawn doorbell listener for ivshmem[{index}]: {e}");
+        }
 
         let mut node = device_node!(id, ivshmem_device);
         node.resources = new_resources;
