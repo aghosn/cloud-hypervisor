@@ -54,6 +54,9 @@ const EXIT_REASON_WRMSR: u32 = 32;
 const EXIT_REASON_EPT_VIOLATION: u32 = 48;
 const EXIT_REASON_APIC_ACCESS: u32 = 44;  // Intel SDM: APIC-access MMIO trap
 
+// Synthetic exit reasons (high bit set, not hardware VMX reasons)
+const THEMIS_EXIT_DOORBELL: u32 = 0x8000_0001;
+
 const THEMIC_MSG_SHUTDOWN: u32 = 0x0004;
 
 #[allow(dead_code)]
@@ -1260,9 +1263,22 @@ impl vm::Vm for ThemisVm {
         };
         // If the domain is not yet sealed, defer the ioctl.  THHV_IOEVENTFD
         // calls REGISTER_DOORBELL which needs the child domain to exist.
+        //
+        // IMPORTANT: when deferring, we MUST store the cloned fd's number,
+        // not the original.  The original `EventFd` belongs to the caller and
+        // is typically dropped right after `register_ioevent` returns, which
+        // closes its raw fd in the process.  By the time the deferred ioctl
+        // runs (inside ensure_initialized()), the original fd number may have
+        // been reassigned to a completely unrelated eventfd — and thhv would
+        // then register the doorbell against the wrong eventfd_ctx (in
+        // practice, this aliased onto `exit_evt`, so doorbell rings would
+        // tear the VM down).  The cloned fd is held alive in
+        // `pending_ioeventfds` so its number stays valid until flush.
         if !*self.state.initialized.lock().unwrap() {
             let fd_clone = fd.try_clone().map_err(|e|
                 vm::HypervisorVmError::RegisterIoEvent(e.into()))?;
+            let mut ioevent = ioevent;
+            ioevent.fd = fd_clone.as_raw_fd();
             eprintln!(
                 "\r[THEMIS-DBG] deferring IOEVENTFD addr=0x{:x} flags=0x{:x}",
                 ioevent.addr, ioevent.flags
@@ -1943,6 +1959,7 @@ impl ThemisVcpu {
                 self.handle_apic_access_exit(&msg);
                 Ok(VmExit::Ignore)
             }
+            THEMIS_EXIT_DOORBELL => Ok(VmExit::Ignore),
             _ => Ok(VmExit::Ignore),
         }
     }
