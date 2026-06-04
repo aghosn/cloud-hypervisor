@@ -13,7 +13,7 @@ use crate::arch::x86::MsrEntry;
 
 // ── Re-exports from the shared `themis-abi` crate ────────────────────────── //
 // VpRegister enum (used as u64 register-id over the THHV ioctl wire).
-pub(super) use themis_abi::regs::{ALL_VP_REGISTERS, VpRegister};
+pub(super) use themis_abi::regs::VpRegister;
 // Synthetic exit reason injected by capavisor (high bit set, not an SDM value).
 pub(super) use themis_abi::synthetic_exits::THEMIS_EXIT_DOORBELL;
 // Domain-comm message types.
@@ -122,9 +122,5 @@ pub(super) const STANDARD_REGS: [VpRegister; 18] = [
     VpRegister::Rip,
     VpRegister::Rflags,
 ];
-
-// Silence dead-code warnings for the full-set re-export until consumers land.
-#[allow(dead_code)]
-const _: &[VpRegister] = ALL_VP_REGISTERS;
 
 pub(super) const EMPTY_BOOT_MSRS: [MsrEntry; 0] = [];
