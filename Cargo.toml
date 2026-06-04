@@ -78,6 +78,9 @@ igvm_defs = "0.4.0"
 # serde crates
 serde = "1.0.228"
 serde_json = "1.0.149"
+
+# Themis (gated behind themis feature)
+themis-abi = { path = "../themis/crates/themis-abi", default-features = false }
 serde_with = { version = "3.18.0", default-features = false }
 
 # other crates

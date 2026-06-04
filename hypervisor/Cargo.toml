@@ -12,7 +12,7 @@ mshv = ["mshv-bindings", "mshv-ioctls", "mshv_emulator", "vfio-ioctls/mshv"]
 mshv_emulator = ["iced-x86", "mshv-bindings"]
 sev_snp = ["igvm", "igvm_defs"]
 tdx = []
-themis = ["mshv_emulator"]  # MSHV-style MMIO instruction emulation via iced-x86 (see P16.6i in todo.md)
+themis = ["mshv_emulator", "themis-abi"]  # MSHV-style MMIO instruction emulation via iced-x86 (see P16.6i in todo.md)
 
 [dependencies]
 anyhow = { workspace = true }
@@ -39,6 +39,7 @@ serde_with = { workspace = true, default-features = false, features = [
   "macros",
 ] }
 thiserror = { workspace = true }
+themis-abi = { workspace = true, optional = true }
 vfio-ioctls = { workspace = true, default-features = false }
 vm-memory = { workspace = true, features = [
   "backend-atomic",

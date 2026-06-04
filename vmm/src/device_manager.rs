@@ -4423,9 +4423,12 @@ impl DeviceManager {
                     ivshmem_cfg.count.unwrap_or(0),
                     path_str,
                 )
-                .map_err(|e| DeviceManagerError::IvshmemCreate(
-                    devices::ivshmem::IvshmemError::CreateUserMemoryRegion,
-                ))?;
+                .map_err(|e| {
+                    error!("annotate_shmem failed: {e:?}");
+                    DeviceManagerError::IvshmemCreate(
+                        devices::ivshmem::IvshmemError::CreateUserMemoryRegion,
+                    )
+                })?;
         }
 
         ivshmem_device.lock().unwrap().set_region(region, mapping);
@@ -4436,6 +4439,7 @@ impl DeviceManager {
             .vm
             .register_ivshmem_bars(index as u32, bar0_gpa, start_addr, 0)
             .map_err(|e| {
+                error!("register_ivshmem_bars failed: {e:?}");
                 DeviceManagerError::IvshmemCreate(
                     devices::ivshmem::IvshmemError::CreateUserMemoryRegion,
                 )

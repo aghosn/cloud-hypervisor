@@ -1,896 +1,86 @@
+//! Themis backend for cloud-hypervisor's `Hypervisor` / `Vm` / `Vcpu` traits.
+//!
+//! # Trust model (read this before touching any stub)
+//!
+//! Themis is a capability-based hypervisor: capavisor (bare metal, L0) is the
+//! Trusted Computing Base; cloud-hypervisor (L1, dom0 userspace) is **not
+//! trusted**.  Capavisor owns all per-vCPU hardware state (VMCS guest area,
+//! FPU, LAPIC, MSRs, MP state) and configures it at VMCS init time in
+//! `themis/capavisor/src/arch/x86_64/boot/vmcs.rs`.  cloud-hypervisor reaches
+//! capavisor only through the THHV ioctl ABI exposed by `thhv.ko`, which
+//! enforces capability checks before any state change.
+//!
+//! This means many `Vcpu` methods that on KVM/MSHV write directly into the
+//! vCPU's hardware state are deliberately **no-ops** here: the corresponding
+//! state is set by capavisor, not by CHV.  Each such stub carries a
+//! `// Owned by capavisor:` comment.  Conversely, methods that *do* require
+//! capavisor cooperation (e.g. `set_sregs`, `set_regs`, `set_cpuid2` for the
+//! trap-and-emulate fallback path) go through THHV ioctls.
+//!
+//! Capabilities not supported at all (live migration: `state`/`set_state`,
+//! `get_clock`/`set_clock`, NMI injection: `nmi`) return
+//! `Err(... "not supported")` rather than silently succeeding.
+//!
+//! # Module layout (after refactor)
+//!
+//! - [`emulator`] — instruction emulation for trap-and-emulate paths.
+//! - (planned splits) `consts`, `abi`, `mmap`, `vm_state`, `vm`, `vcpu`,
+//!   `ioctl`.  Today everything below is in this single file pending the
+//!   split documented in the session plan.
+
 pub mod emulator;
+mod abi;
+mod consts;
+mod helpers;
+mod hypervisor_impl;
+mod mmap;
+mod vm_impl;
+mod vm_state;
 
-use std::any::Any;
-use std::fs::OpenOptions;
-use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use abi::*;
+use consts::*;
+use helpers::*;
+use mmap::MmapRegion;
+use vm_state::ThemisVmState;
+
+pub use hypervisor_impl::ThemisHypervisor;
+pub use vm_impl::ThemisVm;
+
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use anyhow::{Context, anyhow};
-use libc::{c_ulong, c_void};
-use serde::{Deserialize, Serialize};
-use vfio_ioctls::VfioDeviceFd;
+use anyhow::anyhow;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::arch::x86::{
-    CpuIdEntry, FpuState, LapicState, MsrEntry, SegmentRegister, SpecialRegisters,
+    CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters,
 };
 use crate::cpu::{self, HypervisorCpuError, Vcpu, VmExit};
-use crate::hypervisor::{self, Hypervisor};
-use crate::vm::{self, DataMatch, InterruptSourceConfig, VmOps};
-use crate::{
-    CpuState, HypervisorType, HypervisorVmConfig, IoEventAddress, IrqRoutingEntry, MpState,
-};
+use crate::vm::VmOps;
+use crate::{CpuState, MpState};
 
-const THHV_IOCTL_MAGIC: u8 = 0xB8;
-const THHV_SCHED_SYNC: u32 = 0;
-const THHV_MEM_F_UNMAP: u32 = 1 << 0;
-const THHV_MEM_F_ALIAS: u32 = 1 << 1;
-const THHV_MEM_R_READ: u32 = 1 << 0;
-const THHV_MEM_R_WRITE: u32 = 1 << 1;
-const THHV_MEM_R_EXEC: u32 = 1 << 2;
-const THHV_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
-const THHV_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
-const THHV_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
-const THHV_IOEVENTFD_FLAG_DEASSIGN: u32 = 1 << 2;
-const THHV_META_PAGES_PER_VP: usize = 3;
-const THHV_META_PAGES_SHARED: usize = 4;
-const THHV_QUERY_META_PAGES_PER_VP: u32 = 1;
-const THHV_QUERY_META_PAGES_SHARED: u32 = 2;
+pub use abi::{ThemisIrqRoutingEntry, ThemisStandardRegisters, VcpuThemisState, shmem_mode};
+pub use consts::policy_kind;
 
-const EXIT_REASON_EXCEPTION_NMI: u32 = 0;
-const EXIT_REASON_EXTERNAL_INTERRUPT: u32 = 1;
-const EXIT_REASON_TRIPLE_FAULT: u32 = 2;
-const EXIT_REASON_CPUID: u32 = 10;
-const EXIT_REASON_HLT: u32 = 12;
-const EXIT_REASON_VMCALL: u32 = 18;
-const EXIT_REASON_CR_ACCESS: u32 = 28;     // Intel SDM: MOV to/from CR0/CR3/CR4/CR8, CLTS, LMSW
-const EXIT_REASON_IO_INSTRUCTION: u32 = 30; // Intel SDM: IN, INS, OUT, OUTS
-const EXIT_REASON_RDMSR: u32 = 31;
-const EXIT_REASON_WRMSR: u32 = 32;
-const EXIT_REASON_EPT_VIOLATION: u32 = 48;
-const EXIT_REASON_APIC_ACCESS: u32 = 44;  // Intel SDM: APIC-access MMIO trap
 
-// Synthetic exit reasons (high bit set, not hardware VMX reasons)
-const THEMIS_EXIT_DOORBELL: u32 = 0x8000_0001;
-
-const THEMIC_MSG_SHUTDOWN: u32 = 0x0004;
-
-#[allow(dead_code)]
-const EPT_VIOLATION_DATA_READ: u64 = 1 << 0;
-const EPT_VIOLATION_DATA_WRITE: u64 = 1 << 1;
-const EPT_VIOLATION_EXECUTE: u64 = 1 << 2;
-
-// ── APIC register offsets (Intel SDM Vol 3A §10.4.1) ──────────────────────
-const APIC_REG_ICR_LOW: u32 = 0x300;
-const APIC_REG_ICR_HIGH: u32 = 0x310;
-const APIC_REG_EOI: u32 = 0x0B0;
-
-// ── ICR bit fields (Intel SDM Vol 3A §10.6.1) ────────────────────────────
-const ICR_VECTOR_MASK: u32 = 0xFF;
-const ICR_DELIVERY_MODE_SHIFT: u32 = 8;
-const ICR_DELIVERY_MODE_MASK: u32 = 0x7;
-const ICR_DEST_SHORTHAND_SHIFT: u32 = 18;
-const ICR_DEST_SHORTHAND_MASK: u32 = 0x3;
-const ICR_HIGH_DEST_SHIFT: u32 = 24;
-const ICR_HIGH_DEST_MASK: u32 = 0xFF;
-
-// ICR delivery modes
-const ICR_MODE_FIXED: u32 = 0;
-const ICR_MODE_LOWEST_PRIORITY: u32 = 1;
-const ICR_MODE_INIT: u32 = 5;
-const ICR_MODE_SIPI: u32 = 6;
-
-// MSI address field (Intel SDM Vol 3A §10.11.1)
-const MSI_ADDR_DEST_ID_SHIFT: u32 = 12;
-const MSI_ADDR_DEST_ID_MASK: u32 = 0xFF;
-
-// SIPI real-mode segment access rights (Intel SDM §8.4.4)
-const REALMODE_DATA_SEG_AR: u64 = 0x0093; // P=1, S=1, type=3 (R/W accessed)
-const REALMODE_CODE_SEG_AR: u64 = 0x009B; // P=1, S=1, type=B (exec/read accessed)
-
-const fn ioctl_code(dir: c_ulong, ty: u8, nr: u8, size: usize) -> c_ulong {
-    (dir << 30) | ((size as c_ulong) << 16) | ((ty as c_ulong) << 8) | nr as c_ulong
-}
-
-const fn ioctl_iow<T>(ty: u8, nr: u8) -> c_ulong {
-    ioctl_code(1, ty, nr, size_of::<T>())
-}
-
-const fn ioctl_iowr<T>(ty: u8, nr: u8) -> c_ulong {
-    ioctl_code(3, ty, nr, size_of::<T>())
-}
-
-const fn ioctl_io(ty: u8, nr: u8) -> c_ulong {
-    ioctl_code(0, ty, nr, 0)
-}
-
-const THHV_CREATE_PARTITION: c_ulong = ioctl_iowr::<ThhvCreatePartition>(THHV_IOCTL_MAGIC, 0x01);
-const THHV_QUERY: c_ulong = ioctl_iowr::<ThhvQuery>(THHV_IOCTL_MAGIC, 0x03);
-const THHV_INITIALIZE_PARTITION: c_ulong = ioctl_io(THHV_IOCTL_MAGIC, 0x10);
-const THHV_CREATE_VP: c_ulong = ioctl_iowr::<ThhvCreateVp>(THHV_IOCTL_MAGIC, 0x11);
-const THHV_SET_GUEST_MEMORY: c_ulong = ioctl_iow::<ThhvSetGuestMemory>(THHV_IOCTL_MAGIC, 0x12);
-const THHV_IRQFD: c_ulong = ioctl_iow::<ThhvIrqfd>(THHV_IOCTL_MAGIC, 0x13);
-const THHV_IOEVENTFD: c_ulong = ioctl_iow::<ThhvIoeventfd>(THHV_IOCTL_MAGIC, 0x14);
-const THHV_SEND_SHARED_META: c_ulong = ioctl_iow::<ThhvInitializePartition>(THHV_IOCTL_MAGIC, 0x17);
-const THHV_RUN_VP: c_ulong = ioctl_iowr::<ThhvRunVp>(THHV_IOCTL_MAGIC, 0x20);
-const THHV_GET_VP_STATE: c_ulong = ioctl_iowr::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x21);
-const THHV_SET_VP_STATE: c_ulong = ioctl_iow::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x22);
-const THHV_INJECT_INTERRUPT: c_ulong = ioctl_iow::<ThhvInjectInterrupt>(THHV_IOCTL_MAGIC, 0x19);
-const THHV_SET_POLICY: c_ulong = ioctl_iow::<ThhvSetPolicy>(THHV_IOCTL_MAGIC, 0x1a);
-
-// Policy-kind discriminants for THHV_SET_POLICY (mirrors THEMIS_POLICY_* in thhv.h).
-#[allow(dead_code)]
-pub mod policy_kind {
-    pub const CORES: u64 = 0;
-    pub const API_MONITOR: u64 = 1;
-    pub const DEFAULT_INTR_VISIBILITY: u64 = 2;
-    pub const VECTOR_VISIBILITY: u64 = 3;
-    pub const VECTOR_REG_READ_SET: u64 = 4;
-    pub const VECTOR_REG_WRITE_SET: u64 = 5;
-    pub const DEFAULT_EXIT_TRAP: u64 = 6;
-    pub const EXIT_REASON_TRAP: u64 = 7;
-    pub const EXIT_REASON_REG_READ_SET: u64 = 8;
-    pub const EXIT_REASON_REG_WRITE_SET: u64 = 9;
-    pub const CPUID_DEFAULT: u64 = 10;
-    pub const CPUID_RANGE: u64 = 11;
-    pub const CPUID_EMULATE: u64 = 12;
-    pub const MSR_DEFAULT: u64 = 13;
-    pub const MSR_RANGE: u64 = 14;
-    pub const MSR_EMULATE: u64 = 15;
-}
-
-const THHV_VP_REG_RAX: u64 = 0x00;
-const THHV_VP_REG_RBX: u64 = 0x01;
-const THHV_VP_REG_RCX: u64 = 0x02;
-const THHV_VP_REG_RDX: u64 = 0x03;
-const THHV_VP_REG_RSI: u64 = 0x04;
-const THHV_VP_REG_RDI: u64 = 0x05;
-const THHV_VP_REG_RBP: u64 = 0x06;
-const THHV_VP_REG_R8: u64 = 0x07;
-const THHV_VP_REG_R9: u64 = 0x08;
-const THHV_VP_REG_R10: u64 = 0x09;
-const THHV_VP_REG_R11: u64 = 0x0A;
-const THHV_VP_REG_R12: u64 = 0x0B;
-const THHV_VP_REG_R13: u64 = 0x0C;
-const THHV_VP_REG_R14: u64 = 0x0D;
-const THHV_VP_REG_R15: u64 = 0x0E;
-const THHV_VP_REG_RSP: u64 = 0x10;
-const THHV_VP_REG_RIP: u64 = 0x11;
-const THHV_VP_REG_RFLAGS: u64 = 0x12;
-const THHV_VP_REG_CR0: u64 = 0x20;
-const THHV_VP_REG_CR3: u64 = 0x21;
-const THHV_VP_REG_CR4: u64 = 0x22;
-const THHV_VP_REG_EFER: u64 = 0x23;
-const THHV_VP_REG_CS_SEL: u64 = 0x30;
-const THHV_VP_REG_DS_SEL: u64 = 0x31;
-const THHV_VP_REG_ES_SEL: u64 = 0x32;
-const THHV_VP_REG_FS_SEL: u64 = 0x33;
-const THHV_VP_REG_GS_SEL: u64 = 0x34;
-const THHV_VP_REG_SS_SEL: u64 = 0x35;
-const THHV_VP_REG_TR_SEL: u64 = 0x36;
-const THHV_VP_REG_LDTR_SEL: u64 = 0x37;
-const THHV_VP_REG_CS_BASE: u64 = 0x40;
-const THHV_VP_REG_DS_BASE: u64 = 0x41;
-const THHV_VP_REG_ES_BASE: u64 = 0x42;
-const THHV_VP_REG_FS_BASE: u64 = 0x43;
-const THHV_VP_REG_GS_BASE: u64 = 0x44;
-const THHV_VP_REG_SS_BASE: u64 = 0x45;
-const THHV_VP_REG_TR_BASE: u64 = 0x46;
-const THHV_VP_REG_LDTR_BASE: u64 = 0x47;
-const THHV_VP_REG_CS_LIM: u64 = 0x50;
-const THHV_VP_REG_DS_LIM: u64 = 0x51;
-const THHV_VP_REG_ES_LIM: u64 = 0x52;
-const THHV_VP_REG_FS_LIM: u64 = 0x53;
-const THHV_VP_REG_GS_LIM: u64 = 0x54;
-const THHV_VP_REG_SS_LIM: u64 = 0x55;
-const THHV_VP_REG_TR_LIM: u64 = 0x56;
-const THHV_VP_REG_LDTR_LIM: u64 = 0x57;
-const THHV_VP_REG_CS_AR: u64 = 0x60;
-const THHV_VP_REG_DS_AR: u64 = 0x61;
-const THHV_VP_REG_ES_AR: u64 = 0x62;
-const THHV_VP_REG_FS_AR: u64 = 0x63;
-const THHV_VP_REG_GS_AR: u64 = 0x64;
-const THHV_VP_REG_SS_AR: u64 = 0x65;
-const THHV_VP_REG_TR_AR: u64 = 0x66;
-const THHV_VP_REG_LDTR_AR: u64 = 0x67;
-const THHV_VP_REG_GDTR_BASE: u64 = 0x70;
-const THHV_VP_REG_GDTR_LIM: u64 = 0x71;
-const THHV_VP_REG_IDTR_BASE: u64 = 0x72;
-const THHV_VP_REG_IDTR_LIM: u64 = 0x73;
-const THHV_VP_REG_APIC_BASE: u64 = 0xA0;
-const THHV_VP_REG_ACTIVITY_STATE: u64 = 0xB0;
-
-const STANDARD_REG_NAMES: [u64; 18] = [
-    THHV_VP_REG_RAX,
-    THHV_VP_REG_RBX,
-    THHV_VP_REG_RCX,
-    THHV_VP_REG_RDX,
-    THHV_VP_REG_RSI,
-    THHV_VP_REG_RDI,
-    THHV_VP_REG_RSP,
-    THHV_VP_REG_RBP,
-    THHV_VP_REG_R8,
-    THHV_VP_REG_R9,
-    THHV_VP_REG_R10,
-    THHV_VP_REG_R11,
-    THHV_VP_REG_R12,
-    THHV_VP_REG_R13,
-    THHV_VP_REG_R14,
-    THHV_VP_REG_R15,
-    THHV_VP_REG_RIP,
-    THHV_VP_REG_RFLAGS,
-];
-
-const EMPTY_BOOT_MSRS: [MsrEntry; 0] = [];
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvCreatePartition {
-    cores_mask: u64,
-    api_flags: u64,
-    sched_policy: u32,
-    num_vps: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvCreateVp {
-    vp_index: u32,
-    rsvd: u32,
-    meta_uaddr: u64,
-    meta_size: u64,
-    comm_uaddr: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvInitializePartition {
-    meta_uaddr: u64,
-    meta_size: u64,
-    apic_access_uaddr: u64,
-    apic_access_size: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct ThhvSetGuestMemory {
-    guest_pfn: u64,
-    userspace_addr: u64,
-    size: u64,
-    flags: u32,
-    rights: u32,
-    attrs: u64,
-    shmem_mode: u32,
-    shmem_count: u32,
-    shmem_path: [u8; THHV_SHMEM_PATH_MAX],
-}
-
-impl Default for ThhvSetGuestMemory {
-    fn default() -> Self {
-        Self {
-            guest_pfn: 0,
-            userspace_addr: 0,
-            size: 0,
-            flags: 0,
-            rights: 0,
-            attrs: 0,
-            shmem_mode: 0,
-            shmem_count: 0,
-            shmem_path: [0u8; THHV_SHMEM_PATH_MAX],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvVpRegisters {
-    count: u32,
-    rsvd: u32,
-    regs: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvRegNameValue {
-    name: u64,
-    value: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvIrqfd {
-    fd: i32,
-    gsi: u32,
-    flags: u32,
-    vector: u32,     // MSI vector to inject (0 = use gsi as vector)
-    vp_index: u32,   // Target VP for injection (0 = BSP)
-    rsvd: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvIoeventfd {
-    fd: i32,
-    flags: u32,
-    addr: u64,
-    len: u32,
-    datamatch: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct ThhvRunVp {
-    msg_buf: [u8; 256],
-}
-
-impl Default for ThhvRunVp {
-    fn default() -> Self {
-        Self { msg_buf: [0; 256] }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvSetPolicy {
-    kind: u64,
-    key: u64,
-    sub_key: u64,
-    value: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvInjectInterrupt {
-    vp_index: u32,
-    vector: u8,
-    pad: [u8; 3],
-}
-
-const THHV_SHMEM_PATH_MAX: usize = 256;
-
-#[allow(dead_code)]
-pub mod shmem_mode {
-    pub const NONE: u32 = 0;
-    pub const ALIAS: u32 = 1;
-    pub const CARVE: u32 = 2;
-    pub const PLUG: u32 = 3;
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThhvQuery {
-    query_type: u32,
-    rsvd: u32,
-    result: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ThemicMessageHeader {
-    message_type: u32,
-    payload_size: u32,
-    sequence: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct ThemicInterceptMessage {
-    header: ThemicMessageHeader,
-    exit_reason: u32,
-    instruction_length: u32,
-    exit_qualification: u64,
-    guest_physical_address: u64,
-    guest_rip: u64,
-    guest_rflags: u64,
-    port_number: u16,
-    access_size: u8,
-    is_write: u8,
-    reserved: u32,
-    rax: u64,
-    instruction_bytes: [u8; 16],
-    cpuid_rax: u64,
-    cpuid_rcx: u64,
-    msr_number: u32,
-    rsvd2: u32,
-    msr_value: u64,
-}
-
-impl Default for ThemicInterceptMessage {
-    fn default() -> Self {
-        Self {
-            header: ThemicMessageHeader::default(),
-            exit_reason: 0,
-            instruction_length: 0,
-            exit_qualification: 0,
-            guest_physical_address: 0,
-            guest_rip: 0,
-            guest_rflags: 0,
-            port_number: 0,
-            access_size: 0,
-            is_write: 0,
-            reserved: 0,
-            rax: 0,
-            instruction_bytes: [0; 16],
-            cpuid_rax: 0,
-            cpuid_rcx: 0,
-            msr_number: 0,
-            rsvd2: 0,
-            msr_value: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ThemisStandardRegisters {
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rsp: u64,
-    pub rbp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub rip: u64,
-    pub rflags: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ThemisIrqRoutingEntry {
-    pub gsi: u32,
-    pub msi_address_lo: u32,
-    pub msi_address_hi: u32,
-    pub msi_data: u32,
-    pub irqchip: u32,
-    pub pin: u32,
-    pub is_msi: bool,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct VcpuThemisState {}
-
-struct MmapRegion {
-    addr: *mut c_void,
-    len: usize,
-}
-
-// SAFETY: The mapping lifetime is owned by the struct and access is coordinated by the VMM.
-unsafe impl Send for MmapRegion {}
-// SAFETY: The mapping points to shared memory supplied to the kernel; raw pointer sharing is intentional.
-unsafe impl Sync for MmapRegion {}
-
-impl MmapRegion {
-    fn new_shared_anonymous(len: usize) -> anyhow::Result<Self> {
-        // SAFETY: Valid mmap arguments for a shared anonymous region.
-        let addr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if addr == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error().into());
-        }
-
-        Ok(Self { addr, len })
-    }
-
-    fn as_u64(&self) -> u64 {
-        self.addr as usize as u64
-    }
-}
-
-impl Drop for MmapRegion {
-    fn drop(&mut self) {
-        if !self.addr.is_null() && self.addr != libc::MAP_FAILED {
-            // SAFETY: Region was created by mmap with this address/length.
-            unsafe {
-                libc::munmap(self.addr, self.len);
-            }
-        }
-    }
-}
-
-struct ThemisVmState {
-    fd: Arc<OwnedFd>,
-    initialized: Mutex<bool>,
-    page_size: usize,
-    vp_meta_pages: usize,
-    _shared_meta: MmapRegion,
-    /// APIC-access sentinel page mapped at GPA 0xFEE00000 in the child domain.
-    /// Kept alive here so the pinned page is not freed while the domain runs.
-    _apic_access: MmapRegion,
-    /// EventFd for the periodic timer interrupt injection.
-    /// Kept alive so the IRQFd registration in thhv.ko remains valid.
-    _timer_eventfd: Mutex<Option<EventFd>>,
-    /// Guest memory regions recorded during create_user_memory_region but not
-    /// yet sent to the domain.  THHV_SET_GUEST_MEMORY is deferred until
-    /// ensure_initialized() so that cloud-hypervisor can finish writing
-    /// firmware/ACPI/kernel data into the mmap'd pages while dom0 still holds
-    /// EPT access.  Once SET_GUEST_MEMORY fires the capavisor removes those
-    /// pages from dom0's EPT, so all writes must complete before then.
-    pending_memory: Mutex<Vec<ThhvSetGuestMemory>>,
-    /// GSI → (MSI vector, destination APIC ID) mapping.  Updated by
-    /// set_gsi_routing() when the guest configures MSI Address/Data.
-    gsi_vectors: Mutex<std::collections::HashMap<u32, (u8, u8)>>,
-    /// Per-vCPU file descriptors (raw), indexed by vCPU ID.  Used for
-    /// cross-vCPU state updates (e.g., BSP sending SIPI to an AP).
-    vp_fds: Mutex<Vec<RawFd>>,
-    /// Per-vCPU software LAPIC register state (1024 × u32 = 4 KiB per vCPU).
-    /// Used when VIRTUALIZE_APIC_ACCESSES is not available: LAPIC MMIO
-    /// accesses cause EPT violations that are emulated here in software.
-    lapic_regs: Mutex<Vec<[u32; 1024]>>,
-    /// CPUID entries to push as interposition Emulate policy before sealing.
-    /// Populated by the first vCPU's set_cpuid2() call.
-    cpuid_entries: Mutex<Vec<CpuIdEntry>>,
-    /// ivshmem BAR addresses for CPUID leaf 0x40000004 (Emulate override).
-    /// Each entry: (index, bar0_gpa, bar2_gpa).
-    ivshmem_bars: Mutex<Vec<(u32, u64, u64)>>,
-    /// IOEVENTFDs deferred until ensure_initialized().  The THHV_IOEVENTFD
-    /// ioctl calls REGISTER_DOORBELL which needs the child domain to exist
-    /// (after creation) but must happen before seal.
-    pending_ioeventfds: Mutex<Vec<(ThhvIoeventfd, EventFd)>>,
-    /// VTOM bit position (MAXPHYADDR - 1). Used to strip the VTOM bit from
-    /// MMIO GPAs when the CoCo kernel marks device accesses as shared.
-    vtom_bit: u32,
-    /// Confidential mode: guest RAM is CARVEd (dom0 loses access) instead of
-    /// ALIASed. MMIO regions remain ALIAS (shared by design).
-    confidential: bool,
-}
-
-impl ThemisVmState {
-    /// Known shared regions in a confidential guest.  These need ALIAS slots
-    /// (parent retains access) instead of CARVE, plus a vTOM mirror ALIAS.
-    const SHARED_REGIONS: &'static [(u64, u64)] = &[
-        (0xA0000, 0x100000), // EBDA / legacy ACPI firmware area
-    ];
-
-    /// Split pending memory regions for confidential mode.
-    ///
-    /// Any region that overlaps a known shared area is split into up to 3 parts:
-    ///   [region_start .. shared_start]  CARVE  (if non-empty)
-    ///   [shared_start .. shared_end]    ALIAS  (shared)
-    ///   [shared_end   .. region_end]    CARVE  (if non-empty)
-    /// Plus a vTOM mirror ALIAS at (vtom_bit | shared_start).
-    ///
-    /// Non-overlapping regions pass through unchanged.
-    fn split_confidential_regions(
-        regions: &[ThhvSetGuestMemory],
-        vtom_bit: u32,
-    ) -> Vec<ThhvSetGuestMemory> {
-        let all_rights = THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC;
-        let mut out = Vec::new();
-
-        for region in regions {
-            let r_start = region.guest_pfn << 12;
-            let r_end = r_start + region.size;
-
-            // MMIO regions are always ALIAS, no splitting needed.
-            if region.flags & THHV_MEM_F_ALIAS != 0 {
-                out.push(*region);
-                continue;
-            }
-
-            // Collect shared sub-ranges that overlap this region.
-            let mut cuts: Vec<(u64, u64)> = Vec::new();
-            for &(s_start, s_end) in Self::SHARED_REGIONS {
-                let lo = s_start.max(r_start);
-                let hi = s_end.min(r_end);
-                if lo < hi {
-                    cuts.push((lo, hi));
-                }
-            }
-
-            if cuts.is_empty() {
-                // No shared overlap — pass through as CARVE.
-                out.push(*region);
-                continue;
-            }
-
-            // Sort cuts by start address (already sorted for a single entry,
-            // but future-proof for multiple shared regions).
-            cuts.sort_by_key(|&(lo, _)| lo);
-
-            // Walk through the region, emitting CARVE gaps and ALIAS shared parts.
-            let mut cursor = r_start;
-            for (s_lo, s_hi) in &cuts {
-                // CARVE gap before this shared region.
-                if cursor < *s_lo {
-                    let gap_size = s_lo - cursor;
-                    out.push(ThhvSetGuestMemory {
-                        guest_pfn: cursor >> 12,
-                        userspace_addr: region.userspace_addr + (cursor - r_start),
-                        size: gap_size,
-                        flags: 0,
-                        rights: all_rights,
-                        attrs: 0,
-                        ..ThhvSetGuestMemory::default()
-                    });
-                }
-
-                // ALIAS for the shared region.
-                let shared_size = s_hi - s_lo;
-                out.push(ThhvSetGuestMemory {
-                    guest_pfn: s_lo >> 12,
-                    userspace_addr: region.userspace_addr + (s_lo - r_start),
-                    size: shared_size,
-                    flags: THHV_MEM_F_ALIAS,
-                    rights: all_rights,
-                    attrs: 0,
-                    ..ThhvSetGuestMemory::default()
-                });
-
-                // vTOM mirror ALIAS.
-                let vtom_gpa = s_lo | (1u64 << vtom_bit);
-                out.push(ThhvSetGuestMemory {
-                    guest_pfn: vtom_gpa >> 12,
-                    userspace_addr: region.userspace_addr + (s_lo - r_start),
-                    size: shared_size,
-                    flags: THHV_MEM_F_ALIAS,
-                    rights: all_rights,
-                    attrs: 0,
-                    ..ThhvSetGuestMemory::default()
-                });
-
-                cursor = *s_hi;
-            }
-
-            // CARVE tail after last shared region.
-            if cursor < r_end {
-                let tail_size = r_end - cursor;
-                out.push(ThhvSetGuestMemory {
-                    guest_pfn: cursor >> 12,
-                    userspace_addr: region.userspace_addr + (cursor - r_start),
-                    size: tail_size,
-                    flags: 0,
-                    rights: all_rights,
-                    attrs: 0,
-                    ..ThhvSetGuestMemory::default()
-                });
-            }
-        }
-
-        out
-    }
-
-    fn ensure_initialized(&self) -> anyhow::Result<()> {
-        let mut initialized = self.initialized.lock().unwrap();
-        if *initialized {
-            return Ok(());
-        }
-
-        // Flush all deferred SET_GUEST_MEMORY calls before sealing.
-        // After this point dom0 loses EPT access to dom1's guest pages.
-        let raw_regions: Vec<ThhvSetGuestMemory> =
-            self.pending_memory.lock().unwrap().drain(..).collect();
-
-        // In confidential mode, split regions around known shared areas (EBDA/ACPI).
-        // Shared regions become ALIAS slots (+ vTOM mirror), the rest stays CARVE.
-        let regions = if self.confidential {
-            Self::split_confidential_regions(&raw_regions, self.vtom_bit)
-        } else {
-            raw_regions
-        };
-
-        eprintln!("\r[THEMIS-DBG] ensure_initialized: flushing {} memory regions", regions.len());
-        for (i, mut region) in regions.iter().cloned().enumerate() {
-            let kind = if region.flags & THHV_MEM_F_ALIAS != 0 { "ALIAS" } else { "CARVE" };
-            let shmem_info = if region.shmem_mode != 0 {
-                let path = std::str::from_utf8(&region.shmem_path)
-                    .unwrap_or("<invalid>")
-                    .trim_end_matches('\0');
-                format!(" shmem_mode={} count={} path=\"{}\"",
-                    region.shmem_mode, region.shmem_count, path)
-            } else {
-                String::new()
-            };
-            eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] gfn=0x{:x} size=0x{:x} {kind}{shmem_info}",
-                region.guest_pfn, region.size);
-            ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut region)
-                .context("deferred THHV_SET_GUEST_MEMORY failed")?;
-            eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
-        }
-
-        // Push CPUID entries as Emulate overrides before sealing.
-        // Each entry becomes 2 set_policy calls (word 0 and word 1).
-        // Word 0: value = (eax << 32) | ebx — creates the entry.
-        // Word 1: value = (ecx << 32) | edx — updates remaining fields.
-        // Key encodes (leaf << 32 | subleaf), sub_key = word index.
-        let cpuid_entries: Vec<CpuIdEntry> =
-            self.cpuid_entries.lock().unwrap().clone();
-        if !cpuid_entries.is_empty() {
-            eprintln!(
-                "\r[THEMIS-DBG] pushing {} CPUID entries as Emulate policy",
-                cpuid_entries.len()
-            );
-            for entry in &cpuid_entries {
-                let key = ((entry.function as u64) << 32) | (entry.index as u64);
-                let word0 = ((entry.eax as u64) << 32) | (entry.ebx as u64);
-                let word1 = ((entry.ecx as u64) << 32) | (entry.edx as u64);
-                self.set_policy(policy_kind::CPUID_EMULATE, key, 0, word0)?;
-                self.set_policy(policy_kind::CPUID_EMULATE, key, 1, word1)?;
-            }
-        }
-
-        // Push ivshmem BAR addresses as Emulate CPUID leaf 0x40000004.
-        // Each ivshmem device gets its own subleaf (index).
-        // EAX = BAR0 GPA (32-bit), EBX = device count,
-        // ECX = BAR2 GPA (low 32), EDX = BAR2 GPA (high 32).
-        let ivshmem_bars = self.ivshmem_bars.lock().unwrap().clone();
-        if !ivshmem_bars.is_empty() {
-            let count = ivshmem_bars.len() as u32;
-            eprintln!(
-                "\r[THEMIS-DBG] pushing {} ivshmem CPUID entries (leaf 0x40000004)",
-                count
-            );
-            for &(index, bar0_gpa, bar2_gpa) in &ivshmem_bars {
-                let leaf: u64 = (0x40000004_u64 << 32) | (index as u64);
-                let eax = bar0_gpa as u32;
-                let ebx = count;
-                let ecx = bar2_gpa as u32;
-                let edx = (bar2_gpa >> 32) as u32;
-                let word0 = ((eax as u64) << 32) | (ebx as u64);
-                let word1 = ((ecx as u64) << 32) | (edx as u64);
-                self.set_policy(policy_kind::CPUID_EMULATE, leaf, 0, word0)?;
-                self.set_policy(policy_kind::CPUID_EMULATE, leaf, 1, word1)?;
-                eprintln!(
-                    "\r[THEMIS-DBG]   ivshmem[{index}]: bar0=0x{bar0_gpa:x} bar2=0x{bar2_gpa:x}"
-                );
-            }
-        }
-
-        // Push Native ranges for Themis hypervisor CPUID leaves so the child
-        // can discover the capavisor.  The capavisor handles these natively
-        // (signature, features, domcomm, limits, etc.).
-        //
-        // We must split the Native range around any Emulate leaves (ivshmem,
-        // CoCo detection) because the engine rejects overlapping entries.
-        // Collect Emulate leaf numbers, sort them, then emit Native segments
-        // that skip those leaves.
-        //
-        // CPUID_RANGE encoding: key = (start_leaf << 32) | start_sub,
-        //                       sub_key = (end_leaf << 32) | end_sub,
-        //                       value = 1 (Native).
-        {
-            let range_start: u32 = 0x40000000;
-            let range_end: u32 = 0x4FFFFFFF;
-
-            // Gather all Emulate leaf numbers that fall in the Native range.
-            let mut emulate_leaves: Vec<u32> = Vec::new();
-
-            // ivshmem leaves (one per device, all at leaf 0x40000004).
-            if !ivshmem_bars.is_empty() {
-                emulate_leaves.push(0x40000004);
-            }
-
-            // CoCo detection leaf.
-            if self.confidential {
-                emulate_leaves.push(0x40000100);
-            }
-
-            emulate_leaves.sort();
-            emulate_leaves.dedup();
-
-            // Emit Native segments between emulate gaps.
-            let mut cursor = range_start;
-            for &leaf in &emulate_leaves {
-                if cursor < leaf {
-                    let s: u64 = (cursor as u64) << 32;
-                    let e: u64 = ((leaf - 1) as u64) << 32 | 0xFFFFFFFF;
-                    self.set_policy(policy_kind::CPUID_RANGE, s, e, 1)?;
-                }
-                cursor = leaf + 1;
-            }
-            if cursor <= range_end {
-                let s: u64 = (cursor as u64) << 32;
-                let e: u64 = (range_end as u64) << 32 | 0xFFFFFFFF;
-                self.set_policy(policy_kind::CPUID_RANGE, s, e, 1)?;
-            }
-
-            eprintln!(
-                "\r[THEMIS-DBG] pushed Native CPUID ranges (split around {} emulate leaves)",
-                emulate_leaves.len()
-            );
-        }
-
-        // Push CoCo detection Emulate leaf (0x40000100) if confidential.
-        if self.confidential {
-            let coco_leaf: u64 = 0x40000100_u64 << 32;
-            let eax = self.vtom_bit;
-            let ebx = u32::from_le_bytes(*b"Them");
-            let ecx = u32::from_le_bytes(*b"isCo");
-            let edx = u32::from_le_bytes(*b"Co\0\0");
-            let word0 = ((eax as u64) << 32) | (ebx as u64);
-            let word1 = ((ecx as u64) << 32) | (edx as u64);
-            eprintln!("\r[THEMIS-DBG] pushing CoCo CPUID leaf 0x40000100: vtom_bit={}", self.vtom_bit);
-            self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 0, word0)?;
-            self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 1, word1)?;
-        }
-
-        // Flush deferred IOEVENTFDs — registers doorbells with capavisor.
-        // Must happen after domain creation but before seal.
-        {
-            let pending = self.pending_ioeventfds.lock().unwrap().drain(..).collect::<Vec<_>>();
-            for (mut ioevent, _owner) in pending {
-                eprintln!(
-                    "\r[THEMIS-DBG] deferred IOEVENTFD addr=0x{:x} fd={}",
-                    ioevent.addr, ioevent.fd
-                );
-                ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_IOEVENTFD, &mut ioevent)
-                    .context("deferred THHV_IOEVENTFD failed")?;
-            }
-        }
-
-        eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
-        ioctl_noarg(self.fd.as_raw_fd(), THHV_INITIALIZE_PARTITION)
-            .context("failed to initialize Themis partition")?;
-        eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION done");
-        *initialized = true;
-
-        // LAPIC timer emulation is set up per-vCPU in create_vcpu():
-        // timerfd + irqfd + background thread.  WRMSR 0x6E0 exits
-        // (trapped by the child MSR bitmap in capavisor) are handled
-        // in handle_wrmsr_exit() which reprograms the timerfd.
-
-        Ok(())
-    }
-
-    /// Unified policy-setting ioctl — wraps THHV_SET_POLICY.
-    fn set_policy(&self, kind: u64, key: u64, sub_key: u64, value: u64) -> anyhow::Result<()> {
-        let mut sp = ThhvSetPolicy {
-            kind,
-            key,
-            sub_key,
-            value,
-        };
-        ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_POLICY, &mut sp)
-            .context("THHV_SET_POLICY failed")?;
-        Ok(())
-    }
-}
-
-pub struct ThemisHypervisor {
-    fd: OwnedFd,
-    page_size: usize,
-    vp_meta_pages: usize,
-    shared_meta_pages: usize,
-}
-
-pub struct ThemisVm {
-    state: Arc<ThemisVmState>,
-}
 
 pub struct ThemisVcpu {
-    fd: OwnedFd,
-    _vp_index: u32,
-    vm_state: Arc<ThemisVmState>,
-    vm_ops: Option<Arc<dyn VmOps>>,
-    _meta: MmapRegion,
-    _comm: MmapRegion,
+    pub(super) fd: OwnedFd,
+    pub(super) _vp_index: u32,
+    pub(super) vm_state: Arc<ThemisVmState>,
+    pub(super) vm_ops: Option<Arc<dyn VmOps>>,
+    pub(super) _meta: MmapRegion,
+    pub(super) _comm: MmapRegion,
     /// CPUID policy set by CHV via set_cpuid2() before the first run.
     /// Searched by (function, index) on every CPUID exit.
-    cpuid: std::sync::Mutex<Vec<CpuIdEntry>>,
+    pub(super) cpuid: std::sync::Mutex<Vec<CpuIdEntry>>,
     /// LAPIC timer emulation: timerfd armed to the TSC deadline.
     /// A background thread reads the timerfd and signals `timer_irq`.
-    timer_fd: OwnedFd,
+    pub(super) timer_fd: OwnedFd,
     /// EventFd registered as irqfd for LOCAL_TIMER_VECTOR (0xEC).
     /// Signalled by the timer thread when the deadline fires.
-    _timer_irq: EventFd,
+    pub(super) _timer_irq: EventFd,
 }
 
 impl ThemisVcpu {
@@ -900,609 +90,7 @@ impl ThemisVcpu {
     }
 }
 
-impl ThemisHypervisor {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new() -> hypervisor::Result<Arc<dyn Hypervisor>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC)
-            .open("/dev/thhv")
-            .map_err(|e| hypervisor::HypervisorError::HypervisorCreate(e.into()))?;
 
-        let page_size =
-            page_size().map_err(|e| hypervisor::HypervisorError::HypervisorCreate(e.into()))?;
-        let fd: OwnedFd = file.into();
-        let vp_meta_pages = query_meta_pages(fd.as_raw_fd(), THHV_QUERY_META_PAGES_PER_VP)
-            .unwrap_or(THHV_META_PAGES_PER_VP as u64) as usize;
-        let shared_meta_pages = query_meta_pages(fd.as_raw_fd(), THHV_QUERY_META_PAGES_SHARED)
-            .unwrap_or(THHV_META_PAGES_SHARED as u64) as usize;
-
-        Ok(Arc::new(Self {
-            fd,
-            page_size,
-            vp_meta_pages,
-            shared_meta_pages,
-        }))
-    }
-
-    pub fn is_available() -> hypervisor::Result<bool> {
-        Ok(Path::new("/dev/thhv").exists())
-    }
-}
-
-impl Hypervisor for ThemisHypervisor {
-    fn hypervisor_type(&self) -> HypervisorType {
-        HypervisorType::Themis
-    }
-
-    fn create_vm(&self, _config: HypervisorVmConfig) -> hypervisor::Result<Arc<dyn vm::Vm>> {
-        let confidential = _config.confidential;
-        let mut create = ThhvCreatePartition {
-            cores_mask: !0,
-            api_flags: !0,
-            sched_policy: THHV_SCHED_SYNC,
-            num_vps: self.get_max_vcpus(),
-        };
-
-        let part_fd =
-            ioctl_with_mut_ref_ret_fd(self.fd.as_raw_fd(), THHV_CREATE_PARTITION, &mut create)
-                .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
-
-        let shared_meta = MmapRegion::new_shared_anonymous(self.shared_meta_pages * self.page_size)
-            .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
-        let apic_access = MmapRegion::new_shared_anonymous(self.page_size)
-            .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
-        let mut init = ThhvInitializePartition {
-            meta_uaddr: shared_meta.as_u64(),
-            meta_size: (self.shared_meta_pages * self.page_size) as u64,
-            apic_access_uaddr: apic_access.as_u64(),
-            apic_access_size: self.page_size as u64,
-        };
-        ioctl_with_mut_ref(part_fd.as_raw_fd(), THHV_SEND_SHARED_META, &mut init)
-            .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
-        // THHV_INITIALIZE_PARTITION (seal) is deferred until first run() via
-        // ensure_initialized().  This allows per-VP META pages to be sent via
-        // THHV_CREATE_VP while the domain is still unsealed, so the capavisor
-        // processes them as immediate GiveMetaMem updates rather than pending
-        // capabilities that would require a later ACCEPT before ADD_VP.
-
-        Ok(Arc::new(ThemisVm {
-            state: Arc::new(ThemisVmState {
-                fd: Arc::new(part_fd),
-                initialized: Mutex::new(false),
-                page_size: self.page_size,
-                vp_meta_pages: self.vp_meta_pages,
-                _shared_meta: shared_meta,
-                _apic_access: apic_access,
-                _timer_eventfd: Mutex::new(None),
-                pending_memory: Mutex::new(Vec::new()),
-                gsi_vectors: Mutex::new(std::collections::HashMap::new()),
-                vp_fds: Mutex::new(Vec::new()),
-                lapic_regs: Mutex::new(Vec::new()),
-                cpuid_entries: Mutex::new(Vec::new()),
-                ivshmem_bars: Mutex::new(Vec::new()),
-                pending_ioeventfds: Mutex::new(Vec::new()),
-                vtom_bit: if confidential {
-                    (unsafe { core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF }) - 1
-                } else {
-                    0
-                },
-                confidential,
-            }),
-        }))
-    }
-
-    fn get_supported_cpuid(&self) -> hypervisor::Result<Vec<CpuIdEntry>> {
-        // Read the host CPUID directly. Cloud-hypervisor will patch the result
-        // (hypervisor bit, APIC IDs, topology, etc.) before passing it to the guest.
-        // We enumerate standard leaves 0..=max and extended leaves 0x8000_0000..=max.
-        let mut entries: Vec<CpuIdEntry> = Vec::new();
-
-        let collect = |entries: &mut Vec<CpuIdEntry>, leaf: u32, max_leaf: u32| {
-            for function in leaf..=max_leaf {
-                // Most leaves only have index 0; subleaf enumeration is handled
-                // by generate_common_cpuid for the leaves it cares about (0x4, 0x7, 0xb, etc.).
-                for index in 0u32..=3 {
-                    let result = unsafe {
-                        std::arch::x86_64::__cpuid_count(function, index)
-                    };
-                    // Skip entirely-zero sub-leaves (not present).
-                    if result.eax == 0 && result.ebx == 0 && result.ecx == 0 && result.edx == 0 {
-                        if index > 0 { break; }
-                    }
-                    entries.push(CpuIdEntry {
-                        function,
-                        index,
-                        flags: 0,
-                        eax: result.eax,
-                        ebx: result.ebx,
-                        ecx: result.ecx,
-                        edx: result.edx,
-                    });
-                }
-            }
-        };
-
-        let max_leaf = unsafe { std::arch::x86_64::__cpuid(0).eax };
-        collect(&mut entries, 0, max_leaf.min(0x20));
-
-        let max_ext = unsafe { std::arch::x86_64::__cpuid(0x8000_0000).eax };
-        if max_ext >= 0x8000_0000 {
-            collect(&mut entries, 0x8000_0000, max_ext.min(0x8000_0020));
-        }
-
-        Ok(entries)
-    }
-
-    fn get_max_vcpus(&self) -> u32 {
-        256
-    }
-
-    fn get_guest_debug_hw_bps(&self) -> usize {
-        0
-    }
-}
-
-impl vm::Vm for ThemisVm {
-    fn set_identity_map_address(&self, _address: u64) -> vm::Result<()> {
-        Ok(())
-    }
-
-    fn set_tss_address(&self, _offset: usize) -> vm::Result<()> {
-        Ok(())
-    }
-
-    fn create_irq_chip(&self) -> vm::Result<()> {
-        Ok(())
-    }
-
-    fn register_irqfd(&self, fd: &EventFd, gsi: u32) -> vm::Result<()> {
-        let (vector, dest_apic) = self.state.gsi_vectors.lock().unwrap()
-            .get(&gsi).copied().unwrap_or((0, 0));
-        let vector = vector as u32;
-        eprintln!("\r[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} vp={dest_apic} fd={}", fd.as_raw_fd());
-        let mut irqfd = ThhvIrqfd {
-            fd: fd.as_raw_fd(),
-            gsi,
-            flags: 0,
-            vector,
-            vp_index: dest_apic as u32,
-            rsvd: 0,
-        };
-        let r = ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
-            .map_err(|e| vm::HypervisorVmError::RegisterIrqFd(e.into()));
-        eprintln!("\r[THEMIS-DBG] register_irqfd gsi={gsi} vec={vector} result={r:?}");
-        r
-    }
-
-    fn unregister_irqfd(&self, fd: &EventFd, gsi: u32) -> vm::Result<()> {
-        let mut irqfd = ThhvIrqfd {
-            fd: fd.as_raw_fd(),
-            gsi,
-            flags: THHV_IRQFD_FLAG_DEASSIGN,
-            vector: 0,
-            vp_index: 0,
-            rsvd: 0,
-        };
-        ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
-            .map_err(|e| vm::HypervisorVmError::UnregisterIrqFd(e.into()))
-    }
-
-    fn create_vcpu(&self, id: u32, vm_ops: Option<Arc<dyn VmOps>>) -> vm::Result<Box<dyn Vcpu>> {
-        let meta =
-            MmapRegion::new_shared_anonymous(self.state.vp_meta_pages * self.state.page_size)
-                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-        let comm = MmapRegion::new_shared_anonymous(self.state.page_size)
-            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-        let mut create = ThhvCreateVp {
-            vp_index: id,
-            rsvd: 0,
-            meta_uaddr: meta.as_u64(),
-            meta_size: (self.state.vp_meta_pages * self.state.page_size) as u64,
-            comm_uaddr: comm.as_u64(),
-        };
-        let vcpu_fd =
-            ioctl_with_mut_ref_ret_fd(self.state.fd.as_raw_fd(), THHV_CREATE_VP, &mut create)
-                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-
-        // ── LAPIC timer emulation ──
-        // Create a timerfd that the vCPU run-loop reprograms on each
-        // WRMSR IA32_TSC_DEADLINE (0x6E0).  A background thread bridges
-        // timerfd expirations to an irqfd → thhv injects vector 0xEC.
-        const LOCAL_TIMER_VECTOR: u32 = 0xEC;
-        let timer_fd = unsafe {
-            let fd = libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC);
-            if fd < 0 {
-                return Err(vm::HypervisorVmError::CreateVcpu(
-                    std::io::Error::last_os_error().into(),
-                ));
-            }
-            OwnedFd::from_raw_fd(fd)
-        };
-
-        let timer_irq = EventFd::new(libc::EFD_CLOEXEC)
-            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-
-        // Register the EventFd as an irqfd for vector 0xEC, targeting this vCPU.
-        {
-            let mut irqfd = ThhvIrqfd {
-                fd: timer_irq.as_raw_fd(),
-                gsi: LOCAL_TIMER_VECTOR,
-                flags: 0,
-                vector: LOCAL_TIMER_VECTOR,
-                vp_index: id as u32,
-                rsvd: 0,
-            };
-            ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
-                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-        }
-
-        // Spawn a thread that waits on timerfd and signals the irqfd.
-        let irq_clone = timer_irq.try_clone().unwrap();
-        let timer_fd_dup = unsafe {
-            let raw = libc::dup(timer_fd.as_raw_fd());
-            assert!(raw >= 0, "dup(timer_fd) failed");
-            OwnedFd::from_raw_fd(raw)
-        };
-        std::thread::Builder::new()
-            .name(format!("lapic-timer-{id}"))
-            .spawn(move || {
-                let raw = timer_fd_dup.as_raw_fd();
-                let mut buf = [0u8; 8];
-                loop {
-                    let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut c_void, 8) };
-                    if n <= 0 {
-                        break;
-                    }
-                    let _ = irq_clone.write(1);
-                }
-                drop(timer_fd_dup);
-            })
-            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-
-        eprintln!(
-            "\r[THEMIS-DBG] vCPU {id}: LAPIC timer emulation ready (timerfd={}, irqfd vec=0x{LOCAL_TIMER_VECTOR:X})",
-            timer_fd.as_raw_fd()
-        );
-
-        // Register VP fd for cross-vCPU state updates (SIPI delivery).
-        {
-            let raw_fd = vcpu_fd.as_raw_fd();
-            let mut fds = self.state.vp_fds.lock().unwrap();
-            // Grow to fit this vCPU ID.
-            while fds.len() <= id as usize {
-                fds.push(-1);
-            }
-            fds[id as usize] = raw_fd;
-        }
-
-        // Non-BSP vCPUs start in wait-for-SIPI state.  The thhv driver
-        // blocks VP_RUN until ACTIVITY_STATE is set back to 0 (by the
-        // BSP's SIPI handler in handle_run_exit).
-        if id > 0 {
-            let regs = [reg(THHV_VP_REG_ACTIVITY_STATE, 3)];
-            let mut regs = regs.to_vec();
-            let mut header = ThhvVpRegisters {
-                count: regs.len() as u32,
-                rsvd: 0,
-                regs: regs.as_mut_ptr() as usize as u64,
-            };
-            ioctl_with_mut_ref(vcpu_fd.as_raw_fd(), THHV_SET_VP_STATE, &mut header)
-                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-            eprintln!("\r[THEMIS-DBG] vCPU {id}: set ACTIVITY_STATE=3 (wait-for-SIPI)");
-        }
-
-        // Initialize per-vCPU software LAPIC state.
-        {
-            let mut lapic = self.state.lapic_regs.lock().unwrap();
-            while lapic.len() <= id as usize {
-                lapic.push([0u32; 1024]);
-            }
-            let regs = &mut lapic[id as usize];
-            regs[0x020 / 4] = (id as u32) << 24;        // APIC ID
-            regs[0x030 / 4] = 0x0005_0014;               // Version: v20, 6 LVT entries
-            regs[0x0D0 / 4] = 0;                          // LDR
-            regs[0x0E0 / 4] = 0xFFFF_FFFF;                // DFR: flat model
-            regs[0x0F0 / 4] = 0x0000_01FF;                // SVR: APIC enabled, vector 0xFF
-            // LVT entries: masked by default
-            regs[0x320 / 4] = 0x0001_0000;                // LVT Timer (masked)
-            regs[0x350 / 4] = 0x0001_0000;                // LVT LINT0 (masked)
-            regs[0x360 / 4] = 0x0001_0000;                // LVT LINT1 (masked)
-            regs[0x370 / 4] = 0x0001_0000;                // LVT Error (masked)
-            regs[0x340 / 4] = 0x0001_0000;                // LVT PerfMon (masked)
-            regs[0x330 / 4] = 0x0001_0000;                // LVT Thermal (masked)
-            regs[0x3E0 / 4] = 0x0000_000B;                // Timer DCR: divide by 1
-        }
-
-        Ok(Box::new(ThemisVcpu {
-            fd: vcpu_fd,
-            _vp_index: id,
-            vm_state: self.state.clone(),
-            vm_ops,
-            _meta: meta,
-            _comm: comm,
-            cpuid: std::sync::Mutex::new(Vec::new()),
-            timer_fd,
-            _timer_irq: timer_irq,
-        }))
-    }
-
-    fn register_ioevent(
-        &self,
-        fd: &EventFd,
-        addr: &IoEventAddress,
-        datamatch: Option<DataMatch>,
-    ) -> vm::Result<()> {
-        let (addr, len, mut flags) = match addr {
-            IoEventAddress::Pio(port) => (*port, 0, THHV_IOEVENTFD_FLAG_PIO),
-            IoEventAddress::Mmio(gpa) => (*gpa, 0, 0),
-        };
-        let datamatch = match datamatch {
-            Some(DataMatch::DataMatch32(v)) => {
-                flags |= THHV_IOEVENTFD_FLAG_DATAMATCH;
-                v
-            }
-            Some(DataMatch::DataMatch64(v)) if u32::try_from(v).is_ok() => {
-                flags |= THHV_IOEVENTFD_FLAG_DATAMATCH;
-                v as u32
-            }
-            Some(DataMatch::DataMatch64(_)) => {
-                return Err(vm::HypervisorVmError::RegisterIoEvent(anyhow!(
-                    "64-bit ioeventfd datamatch is not supported by thhv"
-                )));
-            }
-            None => 0,
-        };
-        let ioevent = ThhvIoeventfd {
-            fd: fd.as_raw_fd(),
-            flags,
-            addr,
-            len,
-            datamatch,
-        };
-        // If the domain is not yet sealed, defer the ioctl.  THHV_IOEVENTFD
-        // calls REGISTER_DOORBELL which needs the child domain to exist.
-        //
-        // IMPORTANT: when deferring, we MUST store the cloned fd's number,
-        // not the original.  The original `EventFd` belongs to the caller and
-        // is typically dropped right after `register_ioevent` returns, which
-        // closes its raw fd in the process.  By the time the deferred ioctl
-        // runs (inside ensure_initialized()), the original fd number may have
-        // been reassigned to a completely unrelated eventfd — and thhv would
-        // then register the doorbell against the wrong eventfd_ctx (in
-        // practice, this aliased onto `exit_evt`, so doorbell rings would
-        // tear the VM down).  The cloned fd is held alive in
-        // `pending_ioeventfds` so its number stays valid until flush.
-        if !*self.state.initialized.lock().unwrap() {
-            let fd_clone = fd.try_clone().map_err(|e|
-                vm::HypervisorVmError::RegisterIoEvent(e.into()))?;
-            let mut ioevent = ioevent;
-            ioevent.fd = fd_clone.as_raw_fd();
-            eprintln!(
-                "\r[THEMIS-DBG] deferring IOEVENTFD addr=0x{:x} flags=0x{:x}",
-                ioevent.addr, ioevent.flags
-            );
-            self.state.pending_ioeventfds.lock().unwrap().push((ioevent, fd_clone));
-            return Ok(());
-        }
-        let mut ioevent = ioevent;
-        ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IOEVENTFD, &mut ioevent)
-            .map_err(|e| vm::HypervisorVmError::RegisterIoEvent(e.into()))
-    }
-
-    fn unregister_ioevent(&self, fd: &EventFd, addr: &IoEventAddress) -> vm::Result<()> {
-        let (addr, len, flags) = match addr {
-            IoEventAddress::Pio(port) => (
-                *port,
-                0,
-                THHV_IOEVENTFD_FLAG_PIO | THHV_IOEVENTFD_FLAG_DEASSIGN,
-            ),
-            IoEventAddress::Mmio(gpa) => (*gpa, 0, THHV_IOEVENTFD_FLAG_DEASSIGN),
-        };
-        let mut ioevent = ThhvIoeventfd {
-            fd: fd.as_raw_fd(),
-            flags,
-            addr,
-            len,
-            datamatch: 0,
-        };
-        ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IOEVENTFD, &mut ioevent)
-            .map_err(|e| vm::HypervisorVmError::UnregisterIoEvent(e.into()))
-    }
-
-    fn make_routing_entry(&self, gsi: u32, config: &InterruptSourceConfig) -> IrqRoutingEntry {
-        let entry = match config {
-            InterruptSourceConfig::LegacyIrq(cfg) => ThemisIrqRoutingEntry {
-                gsi,
-                msi_address_lo: 0,
-                msi_address_hi: 0,
-                msi_data: 0,
-                irqchip: cfg.irqchip,
-                pin: cfg.pin,
-                is_msi: false,
-            },
-            InterruptSourceConfig::MsiIrq(cfg) => ThemisIrqRoutingEntry {
-                gsi,
-                msi_address_lo: cfg.low_addr,
-                msi_address_hi: cfg.high_addr,
-                msi_data: cfg.data,
-                irqchip: 0,
-                pin: 0,
-                is_msi: true,
-            },
-        };
-        IrqRoutingEntry::Themis(entry)
-    }
-
-    fn set_gsi_routing(&self, entries: &[IrqRoutingEntry]) -> vm::Result<()> {
-        let mut map = self.state.gsi_vectors.lock().unwrap();
-        map.clear();
-        for entry in entries {
-            if let IrqRoutingEntry::Themis(e) = entry {
-                if e.is_msi {
-                    let vector = (e.msi_data & ICR_VECTOR_MASK) as u8;
-                    // MSI address bits [19:12] = destination APIC ID
-                    let dest_apic = ((e.msi_address_lo >> MSI_ADDR_DEST_ID_SHIFT) & MSI_ADDR_DEST_ID_MASK) as u8;
-                    eprintln!("\r[THEMIS-DBG] gsi_routing: gsi={} → msi_vector={} dest_apic={}", e.gsi, vector, dest_apic);
-                    map.insert(e.gsi, (vector, dest_apic));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    unsafe fn create_user_memory_region(
-        &self,
-        _slot: u32,
-        guest_phys_addr: u64,
-        memory_size: usize,
-        userspace_addr: *mut u8,
-        _readonly: bool,
-        _log_dirty_pages: bool,
-    ) -> vm::Result<()> {
-        // In confidential mode, guest RAM uses CARVE (exclusive — dom0 loses
-        // access) while MMIO regions (PCI hole 0xC0000000–0xFFFFFFFF) stay ALIAS.
-        let is_mmio = guest_phys_addr >= 0xC000_0000 && guest_phys_addr < 0x1_0000_0000;
-        let flags = if self.state.confidential && !is_mmio {
-            0 // CARVE (no ALIAS flag)
-        } else {
-            THHV_MEM_F_ALIAS
-        };
-        let region = ThhvSetGuestMemory {
-            guest_pfn: guest_phys_addr >> 12,
-            userspace_addr: userspace_addr as usize as u64,
-            size: memory_size as u64,
-            flags,
-            rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
-            attrs: 0,
-            ..ThhvSetGuestMemory::default()
-        };
-        // Defer THHV_SET_GUEST_MEMORY until ensure_initialized() (just before
-        // first run()).  Cloud-hypervisor must finish all writes into dom1's
-        // guest memory (firmware, ACPI tables, etc.) before we hand those pages
-        // to the capavisor; the capavisor removes them from dom0's EPT on SEND.
-        self.state.pending_memory.lock().unwrap().push(region);
-        Ok(())
-    }
-
-    unsafe fn remove_user_memory_region(
-        &self,
-        _slot: u32,
-        guest_phys_addr: u64,
-        memory_size: usize,
-        userspace_addr: *mut u8,
-        _readonly: bool,
-        _log_dirty_pages: bool,
-    ) -> vm::Result<()> {
-        let mut region = ThhvSetGuestMemory {
-            guest_pfn: guest_phys_addr >> 12,
-            userspace_addr: userspace_addr as usize as u64,
-            size: memory_size as u64,
-            flags: THHV_MEM_F_UNMAP,
-            rights: THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC,
-            attrs: 0,
-            ..ThhvSetGuestMemory::default()
-        };
-        ioctl_with_mut_ref(
-            self.state.fd.as_raw_fd(),
-            THHV_SET_GUEST_MEMORY,
-            &mut region,
-        )
-        .map_err(|e| vm::HypervisorVmError::RemoveUserMemory(e.into()))
-    }
-
-    fn enable_split_irq(&self) -> vm::Result<()> {
-        Ok(())
-    }
-
-    fn get_clock(&self) -> vm::Result<crate::ClockData> {
-        Err(vm::HypervisorVmError::GetClock(anyhow!("not supported")))
-    }
-
-    fn set_clock(&self, _data: &crate::ClockData) -> vm::Result<()> {
-        Err(vm::HypervisorVmError::SetClock(anyhow!("not supported")))
-    }
-
-    fn create_passthrough_device(&self) -> vm::Result<VfioDeviceFd> {
-        Err(vm::HypervisorVmError::CreatePassthroughDevice(anyhow!(
-            "not supported"
-        )))
-    }
-
-    fn start_dirty_log(&self) -> vm::Result<()> {
-        Err(vm::HypervisorVmError::StartDirtyLog(anyhow!(
-            "not supported"
-        )))
-    }
-
-    fn stop_dirty_log(&self) -> vm::Result<()> {
-        Err(vm::HypervisorVmError::StopDirtyLog(anyhow!(
-            "not supported"
-        )))
-    }
-
-    fn get_dirty_log(&self, _slot: u32, _base_gpa: u64, _memory_size: u64) -> vm::Result<Vec<u64>> {
-        Err(vm::HypervisorVmError::GetDirtyLog(anyhow!("not supported")))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn annotate_shmem(
-        &self,
-        guest_gpa: u64,
-        mode: u32,
-        count: u32,
-        path: &str,
-    ) -> vm::Result<()> {
-        let guest_pfn = guest_gpa >> 12;
-        let mut pending = self.state.pending_memory.lock().unwrap();
-        let entry = pending.iter_mut().find(|e| e.guest_pfn == guest_pfn);
-        match entry {
-            Some(e) => {
-                e.shmem_mode = mode;
-                e.shmem_count = count;
-                // shmem_mode=ALIAS means dom0 keeps access → primary op is ALIAS.
-                if mode == shmem_mode::ALIAS {
-                    e.flags |= THHV_MEM_F_ALIAS;
-                }
-                let path_bytes = path.as_bytes();
-                let copy_len = path_bytes.len().min(THHV_SHMEM_PATH_MAX - 1);
-                e.shmem_path[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
-                eprintln!(
-                    "\r[THEMIS-DBG] annotated shmem gfn=0x{guest_pfn:x} path=\"{path}\" mode={mode} count={count}"
-                );
-                Ok(())
-            }
-            None => {
-                eprintln!(
-                    "\r[THEMIS-DBG] annotate_shmem: no pending entry for gfn=0x{guest_pfn:x}"
-                );
-                Err(vm::HypervisorVmError::CreateUserMemory(
-                    anyhow::anyhow!("no pending entry for shmem annotation"),
-                ))
-            }
-        }
-    }
-
-    fn register_ivshmem_bars(
-        &self,
-        index: u32,
-        bar0_gpa: u64,
-        bar2_gpa: u64,
-        _count: u32,
-    ) -> vm::Result<()> {
-        let mut bars = self.state.ivshmem_bars.lock().unwrap();
-        bars.push((index, bar0_gpa, bar2_gpa));
-        eprintln!(
-            "\r[THEMIS-DBG] registered ivshmem[{index}] bar0=0x{bar0_gpa:x} bar2=0x{bar2_gpa:x} (total={})",
-            bars.len()
-        );
-        Ok(())
-    }
-}
 
 impl Vcpu for ThemisVcpu {
     fn create_standard_regs(&self) -> crate::StandardRegisters {
@@ -1510,7 +98,7 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn get_regs(&self) -> cpu::Result<crate::StandardRegisters> {
-        let values = self.get_reg_values(&STANDARD_REG_NAMES)?;
+        let values = self.get_reg_values(&STANDARD_REGS)?;
         Ok(crate::StandardRegisters::Themis(ThemisStandardRegisters {
             rax: values[0],
             rbx: values[1],
@@ -1545,24 +133,24 @@ impl Vcpu for ThemisVcpu {
         };
 
         let regs = [
-            reg(THHV_VP_REG_RAX, regs.rax),
-            reg(THHV_VP_REG_RBX, regs.rbx),
-            reg(THHV_VP_REG_RCX, regs.rcx),
-            reg(THHV_VP_REG_RDX, regs.rdx),
-            reg(THHV_VP_REG_RSI, regs.rsi),
-            reg(THHV_VP_REG_RDI, regs.rdi),
-            reg(THHV_VP_REG_RSP, regs.rsp),
-            reg(THHV_VP_REG_RBP, regs.rbp),
-            reg(THHV_VP_REG_R8, regs.r8),
-            reg(THHV_VP_REG_R9, regs.r9),
-            reg(THHV_VP_REG_R10, regs.r10),
-            reg(THHV_VP_REG_R11, regs.r11),
-            reg(THHV_VP_REG_R12, regs.r12),
-            reg(THHV_VP_REG_R13, regs.r13),
-            reg(THHV_VP_REG_R14, regs.r14),
-            reg(THHV_VP_REG_R15, regs.r15),
-            reg(THHV_VP_REG_RIP, regs.rip),
-            reg(THHV_VP_REG_RFLAGS, regs.rflags),
+            reg(VpRegister::Rax, regs.rax),
+            reg(VpRegister::Rbx, regs.rbx),
+            reg(VpRegister::Rcx, regs.rcx),
+            reg(VpRegister::Rdx, regs.rdx),
+            reg(VpRegister::Rsi, regs.rsi),
+            reg(VpRegister::Rdi, regs.rdi),
+            reg(VpRegister::Rsp, regs.rsp),
+            reg(VpRegister::Rbp, regs.rbp),
+            reg(VpRegister::R8, regs.r8),
+            reg(VpRegister::R9, regs.r9),
+            reg(VpRegister::R10, regs.r10),
+            reg(VpRegister::R11, regs.r11),
+            reg(VpRegister::R12, regs.r12),
+            reg(VpRegister::R13, regs.r13),
+            reg(VpRegister::R14, regs.r14),
+            reg(VpRegister::R15, regs.r15),
+            reg(VpRegister::Rip, regs.rip),
+            reg(VpRegister::Rflags, regs.rflags),
         ];
         let result = self.set_reg_values(&regs)
             .map_err(|e| HypervisorCpuError::SetStandardRegs(anyhow!(e.to_string())));
@@ -1574,47 +162,47 @@ impl Vcpu for ThemisVcpu {
 
     fn get_sregs(&self) -> cpu::Result<SpecialRegisters> {
         let names = [
-            THHV_VP_REG_CR0,
-            THHV_VP_REG_CR3,
-            THHV_VP_REG_CR4,
-            THHV_VP_REG_EFER,
-            THHV_VP_REG_APIC_BASE,
-            THHV_VP_REG_CS_SEL,
-            THHV_VP_REG_CS_BASE,
-            THHV_VP_REG_CS_LIM,
-            THHV_VP_REG_CS_AR,
-            THHV_VP_REG_DS_SEL,
-            THHV_VP_REG_DS_BASE,
-            THHV_VP_REG_DS_LIM,
-            THHV_VP_REG_DS_AR,
-            THHV_VP_REG_ES_SEL,
-            THHV_VP_REG_ES_BASE,
-            THHV_VP_REG_ES_LIM,
-            THHV_VP_REG_ES_AR,
-            THHV_VP_REG_FS_SEL,
-            THHV_VP_REG_FS_BASE,
-            THHV_VP_REG_FS_LIM,
-            THHV_VP_REG_FS_AR,
-            THHV_VP_REG_GS_SEL,
-            THHV_VP_REG_GS_BASE,
-            THHV_VP_REG_GS_LIM,
-            THHV_VP_REG_GS_AR,
-            THHV_VP_REG_SS_SEL,
-            THHV_VP_REG_SS_BASE,
-            THHV_VP_REG_SS_LIM,
-            THHV_VP_REG_SS_AR,
-            THHV_VP_REG_TR_SEL,
-            THHV_VP_REG_TR_BASE,
-            THHV_VP_REG_TR_LIM,
-            THHV_VP_REG_TR_AR,
-            THHV_VP_REG_LDTR_SEL,
-            THHV_VP_REG_LDTR_BASE,
-            THHV_VP_REG_LDTR_LIM,
-            THHV_VP_REG_LDTR_AR,
-            THHV_VP_REG_GDTR_BASE,
-            THHV_VP_REG_GDTR_LIM,
-            THHV_VP_REG_IDTR_BASE,
-            THHV_VP_REG_IDTR_LIM,
+            VpRegister::Cr0,
+            VpRegister::Cr3,
+            VpRegister::Cr4,
+            VpRegister::Efer,
+            VpRegister::ApicBase,
+            VpRegister::CsSelector,
+            VpRegister::CsBase,
+            VpRegister::CsLimit,
+            VpRegister::CsAccessRights,
+            VpRegister::DsSelector,
+            VpRegister::DsBase,
+            VpRegister::DsLimit,
+            VpRegister::DsAccessRights,
+            VpRegister::EsSelector,
+            VpRegister::EsBase,
+            VpRegister::EsLimit,
+            VpRegister::EsAccessRights,
+            VpRegister::FsSelector,
+            VpRegister::FsBase,
+            VpRegister::FsLimit,
+            VpRegister::FsAccessRights,
+            VpRegister::GsSelector,
+            VpRegister::GsBase,
+            VpRegister::GsLimit,
+            VpRegister::GsAccessRights,
+            VpRegister::SsSelector,
+            VpRegister::SsBase,
+            VpRegister::SsLimit,
+            VpRegister::SsAccessRights,
+            VpRegister::TrSelector,
+            VpRegister::TrBase,
+            VpRegister::TrLimit,
+            VpRegister::TrAccessRights,
+            VpRegister::LdtrSelector,
+            VpRegister::LdtrBase,
+            VpRegister::LdtrLimit,
+            VpRegister::LdtrAccessRights,
+            VpRegister::GdtrBase,
+            VpRegister::GdtrLimit,
+            VpRegister::IdtrBase,
+            VpRegister::IdtrLimit,
         ];
         let values = self.get_reg_values(&names)?;
 
@@ -1649,85 +237,90 @@ impl Vcpu for ThemisVcpu {
     fn set_sregs(&self, sregs: &SpecialRegisters) -> cpu::Result<()> {
         let mut regs = Vec::new();
         regs.extend_from_slice(&[
-            reg(THHV_VP_REG_CR0, sregs.cr0),
-            reg(THHV_VP_REG_CR3, sregs.cr3),
-            reg(THHV_VP_REG_CR4, sregs.cr4),
-            reg(THHV_VP_REG_EFER, sregs.efer),
-            reg(THHV_VP_REG_APIC_BASE, sregs.apic_base),
+            reg(VpRegister::Cr0, sregs.cr0),
+            reg(VpRegister::Cr3, sregs.cr3),
+            reg(VpRegister::Cr4, sregs.cr4),
+            reg(VpRegister::Efer, sregs.efer),
+            reg(VpRegister::ApicBase, sregs.apic_base),
         ]);
         regs.extend_from_slice(&segment_regs(
-            THHV_VP_REG_CS_SEL,
-            THHV_VP_REG_CS_BASE,
-            THHV_VP_REG_CS_LIM,
-            THHV_VP_REG_CS_AR,
+            VpRegister::CsSelector,
+            VpRegister::CsBase,
+            VpRegister::CsLimit,
+            VpRegister::CsAccessRights,
             &sregs.cs,
         ));
         regs.extend_from_slice(&segment_regs(
-            THHV_VP_REG_DS_SEL,
-            THHV_VP_REG_DS_BASE,
-            THHV_VP_REG_DS_LIM,
-            THHV_VP_REG_DS_AR,
+            VpRegister::DsSelector,
+            VpRegister::DsBase,
+            VpRegister::DsLimit,
+            VpRegister::DsAccessRights,
             &sregs.ds,
         ));
         regs.extend_from_slice(&segment_regs(
-            THHV_VP_REG_ES_SEL,
-            THHV_VP_REG_ES_BASE,
-            THHV_VP_REG_ES_LIM,
-            THHV_VP_REG_ES_AR,
+            VpRegister::EsSelector,
+            VpRegister::EsBase,
+            VpRegister::EsLimit,
+            VpRegister::EsAccessRights,
             &sregs.es,
         ));
         regs.extend_from_slice(&segment_regs(
-            THHV_VP_REG_FS_SEL,
-            THHV_VP_REG_FS_BASE,
-            THHV_VP_REG_FS_LIM,
-            THHV_VP_REG_FS_AR,
+            VpRegister::FsSelector,
+            VpRegister::FsBase,
+            VpRegister::FsLimit,
+            VpRegister::FsAccessRights,
             &sregs.fs,
         ));
         regs.extend_from_slice(&segment_regs(
-            THHV_VP_REG_GS_SEL,
-            THHV_VP_REG_GS_BASE,
-            THHV_VP_REG_GS_LIM,
-            THHV_VP_REG_GS_AR,
+            VpRegister::GsSelector,
+            VpRegister::GsBase,
+            VpRegister::GsLimit,
+            VpRegister::GsAccessRights,
             &sregs.gs,
         ));
         regs.extend_from_slice(&segment_regs(
-            THHV_VP_REG_SS_SEL,
-            THHV_VP_REG_SS_BASE,
-            THHV_VP_REG_SS_LIM,
-            THHV_VP_REG_SS_AR,
+            VpRegister::SsSelector,
+            VpRegister::SsBase,
+            VpRegister::SsLimit,
+            VpRegister::SsAccessRights,
             &sregs.ss,
         ));
         regs.extend_from_slice(&segment_regs(
-            THHV_VP_REG_TR_SEL,
-            THHV_VP_REG_TR_BASE,
-            THHV_VP_REG_TR_LIM,
-            THHV_VP_REG_TR_AR,
+            VpRegister::TrSelector,
+            VpRegister::TrBase,
+            VpRegister::TrLimit,
+            VpRegister::TrAccessRights,
             &sregs.tr,
         ));
         regs.extend_from_slice(&segment_regs(
-            THHV_VP_REG_LDTR_SEL,
-            THHV_VP_REG_LDTR_BASE,
-            THHV_VP_REG_LDTR_LIM,
-            THHV_VP_REG_LDTR_AR,
+            VpRegister::LdtrSelector,
+            VpRegister::LdtrBase,
+            VpRegister::LdtrLimit,
+            VpRegister::LdtrAccessRights,
             &sregs.ldt,
         ));
         regs.extend_from_slice(&[
-            reg(THHV_VP_REG_GDTR_BASE, sregs.gdt.base),
-            reg(THHV_VP_REG_GDTR_LIM, sregs.gdt.limit as u64),
-            reg(THHV_VP_REG_IDTR_BASE, sregs.idt.base),
-            reg(THHV_VP_REG_IDTR_LIM, sregs.idt.limit as u64),
+            reg(VpRegister::GdtrBase, sregs.gdt.base),
+            reg(VpRegister::GdtrLimit, sregs.gdt.limit as u64),
+            reg(VpRegister::IdtrBase, sregs.idt.base),
+            reg(VpRegister::IdtrLimit, sregs.idt.limit as u64),
         ]);
         self.set_reg_values(&regs)
             .map_err(|e| HypervisorCpuError::SetSpecialRegs(anyhow!(e.to_string())))
     }
 
     fn get_fpu(&self) -> cpu::Result<FpuState> {
+        // Owned by capavisor: FPU state lives in the per-vCPU XSAVE area
+        // controlled by capavisor's VMCS init.  CHV has no read path.
         Err(HypervisorCpuError::GetFloatingPointRegs(anyhow!(
             "not supported"
         )))
     }
 
     fn set_fpu(&self, _fpu: &FpuState) -> cpu::Result<()> {
+        // Owned by capavisor: FCW/MXCSR defaults are programmed at VMCS init
+        // time.  Silently swallow the CHV setup_fpu() call (see
+        // arch/src/x86_64/regs.rs).
         Ok(())
     }
 
@@ -1744,34 +337,53 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn enable_hyperv_synic(&self) -> cpu::Result<()> {
+        // HyperV-specific; not supported.  Returning Ok is consistent with
+        // mshv's stub for non-HyperV guests.
         Ok(())
     }
 
     fn get_cpuid2(&self, _num_entries: usize) -> cpu::Result<Vec<CpuIdEntry>> {
+        // Owned by capavisor: guest CPUID is masked by capavisor on each
+        // VMEXIT(CPUID).  CHV's set_cpuid2() is captured into vm_state for the
+        // trap-and-emulate fallback only; readback from hardware is not
+        // available.
         Ok(Vec::new())
     }
 
     fn get_lapic(&self) -> cpu::Result<LapicState> {
+        // Owned by capavisor: LAPIC virtualization is in capavisor.  CHV uses
+        // this only for save/restore (live migration), which Themis does not
+        // support.
         Ok(LapicState::default())
     }
 
     fn set_lapic(&self, _lapic: &LapicState) -> cpu::Result<()> {
+        // Owned by capavisor: see get_lapic.
         Ok(())
     }
 
     fn get_msrs(&self, _msrs: &mut Vec<MsrEntry>) -> cpu::Result<usize> {
+        // Owned by capavisor: guest MSRs are managed via the VMCS MSR-load /
+        // MSR-store areas configured by capavisor at VMCS init.  CHV has no
+        // direct read path.  Pair with `boot_msr_entries() -> &EMPTY_BOOT_MSRS`
+        // so that arch::x86_64::regs::setup_msrs() is a no-op.
         Ok(0)
     }
 
     fn set_msrs(&self, _msrs: &[MsrEntry]) -> cpu::Result<usize> {
+        // Owned by capavisor: see get_msrs.
         Ok(0)
     }
 
     fn get_mp_state(&self) -> cpu::Result<MpState> {
+        // MP state is internal to capavisor (INIT/SIPI handled there); we
+        // expose a Themis-flavored MpState variant so CHV's state machine
+        // round-trips without the value being meaningful.
         Ok(MpState::Themis)
     }
 
     fn set_mp_state(&self, _mp_state: MpState) -> cpu::Result<()> {
+        // Owned by capavisor: see get_mp_state.
         Ok(())
     }
 
@@ -1780,8 +392,8 @@ impl Vcpu for ThemisVcpu {
         // EBX/EAX is the TSC-to-crystal multiplier/denominator; ECX is the
         // crystal frequency in Hz.  If ECX is 0 (common in older models) we
         // fall back to the Tiger/Ice-Lake nominal 19.2 MHz crystal.
-        // SAFETY: CPUID is always available on x86_64.
-        let leaf15 = unsafe { std::arch::x86_64::__cpuid(0x15) };
+        // CPUID is always available on x86_64.
+        let leaf15 = std::arch::x86_64::__cpuid(0x15);
         if leaf15.eax != 0 && leaf15.ebx != 0 {
             let crystal_hz = if leaf15.ecx != 0 {
                 leaf15.ecx as u64
@@ -1797,7 +409,7 @@ impl Vcpu for ThemisVcpu {
 
         // Try CPUID leaf 0x16: Processor Frequency Information.
         // EAX[15:0] = processor base frequency in MHz.
-        let leaf16 = unsafe { std::arch::x86_64::__cpuid(0x16) };
+        let leaf16 = std::arch::x86_64::__cpuid(0x16);
         if (leaf16.eax & 0xffff) != 0 {
             return Ok(Some((leaf16.eax & 0xffff) * 1000));
         }
@@ -1806,12 +418,14 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn state(&self) -> cpu::Result<CpuState> {
+        // vCPU state save/restore is for live migration; not supported.
         Err(HypervisorCpuError::GetCpuid(anyhow!(
             "state save not supported"
         )))
     }
 
     fn set_state(&self, _state: &CpuState) -> cpu::Result<()> {
+        // See state().
         Err(HypervisorCpuError::SetCpuid(anyhow!(
             "state restore not supported"
         )))
@@ -1839,16 +453,20 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn boot_msr_entries(&self) -> &'static [MsrEntry] {
+        // Pair with set_msrs/get_msrs no-ops: capavisor sets boot MSRs at
+        // VMCS init time, so we tell CHV there is nothing to push.
         &EMPTY_BOOT_MSRS
     }
 
     fn nmi(&self) -> cpu::Result<()> {
+        // NMI injection is part of capavisor's interrupt model; CHV cannot
+        // raise NMIs into a guest directly.
         Err(HypervisorCpuError::Nmi(anyhow!("not supported")))
     }
 }
 
 impl ThemisVcpu {
-    fn get_reg_values(&self, names: &[u64]) -> cpu::Result<Vec<u64>> {
+    fn get_reg_values(&self, names: &[VpRegister]) -> cpu::Result<Vec<u64>> {
         let mut regs: Vec<ThhvRegNameValue> =
             names.iter().copied().map(|name| reg(name, 0)).collect();
         let mut header = ThhvVpRegisters {
@@ -1884,11 +502,9 @@ impl ThemisVcpu {
             return Ok(VmExit::Shutdown);
         }
 
-        // Temporary: log exit reason distribution
+        // Temporary: log first few exits for visibility (no AP-specific logging today).
         static EXIT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let en = EXIT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Always log AP exits (vp_index > 0) for the first 20 + every 5000th
-        let is_ap = self._vp_index > 0;
         if en < 5 {
             eprintln!(
                 "\r[THEMIS-EXIT] #{en} vp={} reason={} rip={:#x} msr_num={:#x}",
@@ -1920,11 +536,11 @@ impl ThemisVcpu {
                 Ok(VmExit::Ignore)
             }
             EXIT_REASON_TRIPLE_FAULT => {
-                let cr0  = self.get_reg_values(&[THHV_VP_REG_CR0]).unwrap_or_default();
-                let cr3  = self.get_reg_values(&[THHV_VP_REG_CR3]).unwrap_or_default();
-                let cr4  = self.get_reg_values(&[THHV_VP_REG_CR4]).unwrap_or_default();
-                let efer = self.get_reg_values(&[THHV_VP_REG_EFER]).unwrap_or_default();
-                let rax  = self.get_reg_values(&[THHV_VP_REG_RAX]).unwrap_or_default();
+                let cr0  = self.get_reg_values(&[VpRegister::Cr0]).unwrap_or_default();
+                let cr3  = self.get_reg_values(&[VpRegister::Cr3]).unwrap_or_default();
+                let cr4  = self.get_reg_values(&[VpRegister::Cr4]).unwrap_or_default();
+                let efer = self.get_reg_values(&[VpRegister::Efer]).unwrap_or_default();
+                let rax  = self.get_reg_values(&[VpRegister::Rax]).unwrap_or_default();
                 eprintln!("\r[TRIPLE-FAULT] rip={:#x} cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} rax={:#x}",
                     msg.guest_rip,
                     cr0.first().copied().unwrap_or(0),
@@ -2073,25 +689,25 @@ impl ThemisVcpu {
 
         // Map Intel qualification register index to THHV_VP_REG_* discriminant.
         // Note: VpRegister ordering differs from Intel's.
-        let thhv_gpr = |idx: u32| -> u64 {
+        let thhv_gpr = |idx: u32| -> VpRegister {
             match idx {
-                0  => THHV_VP_REG_RAX,
-                1  => THHV_VP_REG_RCX,
-                2  => THHV_VP_REG_RDX,
-                3  => THHV_VP_REG_RBX,
-                4  => THHV_VP_REG_RSP,
-                5  => THHV_VP_REG_RBP,
-                6  => THHV_VP_REG_RSI,
-                7  => THHV_VP_REG_RDI,
-                8  => THHV_VP_REG_R8,
-                9  => THHV_VP_REG_R9,
-                10 => THHV_VP_REG_R10,
-                11 => THHV_VP_REG_R11,
-                12 => THHV_VP_REG_R12,
-                13 => THHV_VP_REG_R13,
-                14 => THHV_VP_REG_R14,
-                15 => THHV_VP_REG_R15,
-                _  => THHV_VP_REG_RAX,
+                0  => VpRegister::Rax,
+                1  => VpRegister::Rcx,
+                2  => VpRegister::Rdx,
+                3  => VpRegister::Rbx,
+                4  => VpRegister::Rsp,
+                5  => VpRegister::Rbp,
+                6  => VpRegister::Rsi,
+                7  => VpRegister::Rdi,
+                8  => VpRegister::R8,
+                9  => VpRegister::R9,
+                10 => VpRegister::R10,
+                11 => VpRegister::R11,
+                12 => VpRegister::R12,
+                13 => VpRegister::R13,
+                14 => VpRegister::R14,
+                15 => VpRegister::R15,
+                _  => VpRegister::Rax,
             }
         };
 
@@ -2104,27 +720,27 @@ impl ThemisVcpu {
                 0 => {
                     // When enabling paging (PG bit) while EFER.LME=1, also set EFER.LMA.
                     // Preserve host-forced FIXED0 bits (bits always set in old_cr0 due to mask).
-                    let old_cr0 = self.get_reg_values(&[THHV_VP_REG_CR0])?[0];
+                    let old_cr0 = self.get_reg_values(&[VpRegister::Cr0])?[0];
                     // Keep bits that the host must own (in FIXED0 mask) that guest wants to clear.
                     let forced_bits = old_cr0 & !src_val;
                     let new_cr0 = src_val | forced_bits;
                     let pg_bit  = 1u64 << 31;
-                    let mut updates = vec![reg(THHV_VP_REG_CR0, new_cr0)];
+                    let mut updates = vec![reg(VpRegister::Cr0, new_cr0)];
                     if (old_cr0 & pg_bit) == 0 && (new_cr0 & pg_bit) != 0 {
-                        let efer = self.get_reg_values(&[THHV_VP_REG_EFER])?[0];
+                        let efer = self.get_reg_values(&[VpRegister::Efer])?[0];
                         if efer & (1 << 8) != 0 {
                             // LME set → activate LMA now that PG is going on.
-                            updates.push(reg(THHV_VP_REG_EFER, efer | (1 << 10)));
+                            updates.push(reg(VpRegister::Efer, efer | (1 << 10)));
                         }
                     }
                     self.set_reg_values(&updates)?;
                 }
                 3 => {
-                    self.set_reg_values(&[reg(THHV_VP_REG_CR3, src_val)])?;
+                    self.set_reg_values(&[reg(VpRegister::Cr3, src_val)])?;
                 }
                 4 => {
                     // Preserve VMXE (bit 13) — guest cannot clear it.
-                    self.set_reg_values(&[reg(THHV_VP_REG_CR4, src_val | (1u64 << 13))])?;
+                    self.set_reg_values(&[reg(VpRegister::Cr4, src_val | (1u64 << 13))])?;
                 }
                 8 => { /* CR8 / TPR — ignore */ }
                 _ => {}
@@ -2132,9 +748,9 @@ impl ThemisVcpu {
         } else if acc == 1 {
             // MOV from CR: read CR value and write to the destination register.
             let cr_reg = match cr_num {
-                0 => Some(THHV_VP_REG_CR0),
-                3 => Some(THHV_VP_REG_CR3),
-                4 => Some(THHV_VP_REG_CR4),
+                0 => Some(VpRegister::Cr0),
+                3 => Some(VpRegister::Cr3),
+                4 => Some(VpRegister::Cr4),
                 _ => None,
             };
             if let Some(r) = cr_reg {
@@ -2160,8 +776,8 @@ impl ThemisVcpu {
             let guard = self.cpuid.lock().unwrap();
             if guard.is_empty() {
                 // No policy yet — pass through host CPUID as-is.
-                // SAFETY: CPUID is always available on x86_64 and has no side effects.
-                let r = unsafe { std::arch::x86_64::__cpuid_count(leaf, subleaf) };
+                // CPUID is always available on x86_64 and has no side effects.
+                let r = std::arch::x86_64::__cpuid_count(leaf, subleaf);
                 (r.eax, r.ebx, r.ecx, r.edx)
             } else {
                 // Search stored policy. Most leaves use index=0 only; indexed
@@ -2195,10 +811,10 @@ impl ThemisVcpu {
         };
 
         self.set_reg_values(&[
-            reg(THHV_VP_REG_RAX, u64::from(eax)),
-            reg(THHV_VP_REG_RBX, u64::from(ebx)),
-            reg(THHV_VP_REG_RCX, u64::from(ecx)),
-            reg(THHV_VP_REG_RDX, u64::from(edx)),
+            reg(VpRegister::Rax, u64::from(eax)),
+            reg(VpRegister::Rbx, u64::from(ebx)),
+            reg(VpRegister::Rcx, u64::from(ecx)),
+            reg(VpRegister::Rdx, u64::from(edx)),
             // RIP already advanced by capavisor before forwarding the exit.
         ])?;
         Ok(())
@@ -2242,7 +858,7 @@ impl ThemisVcpu {
         let mask = 0xffff_ffffu32 >> (32 - len * 8);
         let eax = (msg.rax as u32 & !mask) | (v & mask);
         // Only set RAX with the read result; RIP already advanced by capavisor.
-        self.set_reg_values(&[reg(THHV_VP_REG_RAX, eax as u64)])
+        self.set_reg_values(&[reg(VpRegister::Rax, eax as u64)])
     }
 
     fn handle_mmio_exit(&mut self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
@@ -2690,58 +1306,58 @@ impl ThemisVcpu {
 
             let regs = [
                 // CS from SIPI vector
-                reg(THHV_VP_REG_CS_SEL, cs_selector),
-                reg(THHV_VP_REG_CS_BASE, startup_addr),
-                reg(THHV_VP_REG_CS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_CS_AR, REALMODE_CODE_SEG_AR),
+                reg(VpRegister::CsSelector, cs_selector),
+                reg(VpRegister::CsBase, startup_addr),
+                reg(VpRegister::CsLimit, 0xFFFF),
+                reg(VpRegister::CsAccessRights, REALMODE_CODE_SEG_AR.into()),
                 // DS/ES/FS/GS/SS = 0:0 with 64K limit (real-mode reset)
-                reg(THHV_VP_REG_DS_SEL, 0),
-                reg(THHV_VP_REG_DS_BASE, 0),
-                reg(THHV_VP_REG_DS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_DS_AR, REALMODE_DATA_SEG_AR),
-                reg(THHV_VP_REG_ES_SEL, 0),
-                reg(THHV_VP_REG_ES_BASE, 0),
-                reg(THHV_VP_REG_ES_LIM, 0xFFFF),
-                reg(THHV_VP_REG_ES_AR, REALMODE_DATA_SEG_AR),
-                reg(THHV_VP_REG_FS_SEL, 0),
-                reg(THHV_VP_REG_FS_BASE, 0),
-                reg(THHV_VP_REG_FS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_FS_AR, REALMODE_DATA_SEG_AR),
-                reg(THHV_VP_REG_GS_SEL, 0),
-                reg(THHV_VP_REG_GS_BASE, 0),
-                reg(THHV_VP_REG_GS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_GS_AR, REALMODE_DATA_SEG_AR),
-                reg(THHV_VP_REG_SS_SEL, 0),
-                reg(THHV_VP_REG_SS_BASE, 0),
-                reg(THHV_VP_REG_SS_LIM, 0xFFFF),
-                reg(THHV_VP_REG_SS_AR, REALMODE_DATA_SEG_AR),
+                reg(VpRegister::DsSelector, 0),
+                reg(VpRegister::DsBase, 0),
+                reg(VpRegister::DsLimit, 0xFFFF),
+                reg(VpRegister::DsAccessRights, REALMODE_DATA_SEG_AR.into()),
+                reg(VpRegister::EsSelector, 0),
+                reg(VpRegister::EsBase, 0),
+                reg(VpRegister::EsLimit, 0xFFFF),
+                reg(VpRegister::EsAccessRights, REALMODE_DATA_SEG_AR.into()),
+                reg(VpRegister::FsSelector, 0),
+                reg(VpRegister::FsBase, 0),
+                reg(VpRegister::FsLimit, 0xFFFF),
+                reg(VpRegister::FsAccessRights, REALMODE_DATA_SEG_AR.into()),
+                reg(VpRegister::GsSelector, 0),
+                reg(VpRegister::GsBase, 0),
+                reg(VpRegister::GsLimit, 0xFFFF),
+                reg(VpRegister::GsAccessRights, REALMODE_DATA_SEG_AR.into()),
+                reg(VpRegister::SsSelector, 0),
+                reg(VpRegister::SsBase, 0),
+                reg(VpRegister::SsLimit, 0xFFFF),
+                reg(VpRegister::SsAccessRights, REALMODE_DATA_SEG_AR.into()),
                 // GDT/IDT with zero base (Linux trampoline sets its own)
-                reg(THHV_VP_REG_GDTR_BASE, 0),
-                reg(THHV_VP_REG_GDTR_LIM, 0xFFFF),
-                reg(THHV_VP_REG_IDTR_BASE, 0),
-                reg(THHV_VP_REG_IDTR_LIM, 0xFFFF),
+                reg(VpRegister::GdtrBase, 0),
+                reg(VpRegister::GdtrLimit, 0xFFFF),
+                reg(VpRegister::IdtrBase, 0),
+                reg(VpRegister::IdtrLimit, 0xFFFF),
                 // RIP = 0 (offset within CS segment)
-                reg(THHV_VP_REG_RIP, 0),
+                reg(VpRegister::Rip, 0),
                 // RFLAGS = 0x2 (reserved bit 1 always set)
-                reg(THHV_VP_REG_RFLAGS, 0x2),
+                reg(VpRegister::Rflags, 0x2),
                 // CR0: PE=0 for real mode. The capavisor's vmcs_adjust_cr0()
                 // will add NE/ET bits required by IA32_VMX_CR0_FIXED0.
                 // UNRESTRICTED_GUEST exempts PE and PG from FIXED0 requirements.
-                reg(THHV_VP_REG_CR0, 0x00),
-                reg(THHV_VP_REG_CR3, 0),
-                reg(THHV_VP_REG_CR4, 0),
-                reg(THHV_VP_REG_EFER, 0),
+                reg(VpRegister::Cr0, 0x00),
+                reg(VpRegister::Cr3, 0),
+                reg(VpRegister::Cr4, 0),
+                reg(VpRegister::Efer, 0),
                 // Clear GP regs
-                reg(THHV_VP_REG_RAX, 0),
-                reg(THHV_VP_REG_RBX, 0),
-                reg(THHV_VP_REG_RCX, 0),
-                reg(THHV_VP_REG_RDX, 0),
-                reg(THHV_VP_REG_RSI, 0),
-                reg(THHV_VP_REG_RDI, 0),
-                reg(THHV_VP_REG_RBP, 0),
-                reg(THHV_VP_REG_RSP, 0),
+                reg(VpRegister::Rax, 0),
+                reg(VpRegister::Rbx, 0),
+                reg(VpRegister::Rcx, 0),
+                reg(VpRegister::Rdx, 0),
+                reg(VpRegister::Rsi, 0),
+                reg(VpRegister::Rdi, 0),
+                reg(VpRegister::Rbp, 0),
+                reg(VpRegister::Rsp, 0),
                 // Wake the AP
-                reg(THHV_VP_REG_ACTIVITY_STATE, 0),
+                reg(VpRegister::ActivityState, 0),
             ];
             let mut regs = regs.to_vec();
             let mut header = ThhvVpRegisters {
@@ -2769,108 +1385,5 @@ impl ThemisVcpu {
         let icr_val = msg.rax as u32;
         let icr_high = msg.msr_number;
         self.deliver_ipi(icr_val, icr_high);
-    }
-}
-
-fn reg(name: u64, value: u64) -> ThhvRegNameValue {
-    ThhvRegNameValue { name, value }
-}
-
-fn segment_regs(
-    sel: u64,
-    base: u64,
-    lim: u64,
-    ar: u64,
-    seg: &SegmentRegister,
-) -> [ThhvRegNameValue; 4] {
-    [
-        reg(sel, seg.selector.into()),
-        reg(base, seg.base),
-        reg(lim, seg.limit.into()),
-        reg(ar, segment_access_rights(seg).into()),
-    ]
-}
-
-fn segment_from_raw(selector: u64, base: u64, limit: u64, access_rights: u64) -> SegmentRegister {
-    let ar = access_rights as u32;
-    SegmentRegister {
-        base,
-        limit: limit as u32,
-        selector: selector as u16,
-        type_: (ar & 0x0f) as u8,
-        s: ((ar >> 4) & 0x1) as u8,
-        dpl: ((ar >> 5) & 0x3) as u8,
-        present: ((ar >> 7) & 0x1) as u8,
-        avl: ((ar >> 12) & 0x1) as u8,
-        l: ((ar >> 13) & 0x1) as u8,
-        db: ((ar >> 14) & 0x1) as u8,
-        g: ((ar >> 15) & 0x1) as u8,
-        unusable: ((ar >> 16) & 0x1) as u8,
-    }
-}
-
-fn segment_access_rights(seg: &SegmentRegister) -> u32 {
-    u32::from(seg.type_ & 0x0f)
-        | (u32::from(seg.s & 0x1) << 4)
-        | (u32::from(seg.dpl & 0x3) << 5)
-        | (u32::from(seg.present & 0x1) << 7)
-        | (u32::from(seg.avl & 0x1) << 12)
-        | (u32::from(seg.l & 0x1) << 13)
-        | (u32::from(seg.db & 0x1) << 14)
-        | (u32::from(seg.g & 0x1) << 15)
-        | (u32::from(seg.unusable & 0x1) << 16)
-}
-
-fn page_size() -> anyhow::Result<usize> {
-    // SAFETY: sysconf is thread-safe for this name.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page_size <= 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(page_size as usize)
-}
-
-fn query_meta_pages(fd: i32, query_type: u32) -> anyhow::Result<u64> {
-    let mut query = ThhvQuery {
-        query_type,
-        rsvd: 0,
-        result: 0,
-    };
-    ioctl_with_mut_ref(fd, THHV_QUERY, &mut query)?;
-    Ok(query.result)
-}
-
-fn ioctl_noarg(fd: i32, request: c_ulong) -> std::io::Result<()> {
-    // SAFETY: ioctl is called with a valid fd and no third argument.
-    let ret = unsafe { libc::ioctl(fd, request) };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn ioctl_with_mut_ref<T>(fd: i32, request: c_ulong, arg: &mut T) -> std::io::Result<()> {
-    // SAFETY: ioctl is called with a valid fd and a pointer to a live repr(C) object.
-    let ret = unsafe { libc::ioctl(fd, request, arg as *mut T) };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn ioctl_with_mut_ref_ret_fd<T>(
-    fd: i32,
-    request: c_ulong,
-    arg: &mut T,
-) -> std::io::Result<OwnedFd> {
-    // SAFETY: ioctl is called with a valid fd and a pointer to a live repr(C) object.
-    let ret = unsafe { libc::ioctl(fd, request, arg as *mut T) };
-    if ret < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        // SAFETY: ioctl returned a new owned fd.
-        Ok(unsafe { OwnedFd::from_raw_fd(ret) })
     }
 }

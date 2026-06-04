@@ -1040,6 +1040,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "themis-abi",
  "thiserror 2.0.18",
  "vfio-ioctls",
  "vm-memory",
@@ -2147,6 +2148,10 @@ dependencies = [
  "vmm-sys-util",
  "wait-timeout",
 ]
+
+[[package]]
+name = "themis-abi"
+version = "0.1.0"
 
 [[package]]
 name = "thiserror"
