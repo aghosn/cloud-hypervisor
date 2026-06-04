@@ -12,7 +12,7 @@ use super::abi::{
     THHV_CREATE_PARTITION, THHV_SEND_SHARED_META, ThhvCreatePartition, ThhvInitializePartition,
 };
 use super::consts::{
-    THHV_META_PAGES_PER_VP, THHV_META_PAGES_SHARED, THHV_QUERY_META_PAGES_PER_VP,
+    THEMIS_MAX_VCPUS, THHV_META_PAGES_PER_VP, THHV_META_PAGES_SHARED, THHV_QUERY_META_PAGES_PER_VP,
     THHV_QUERY_META_PAGES_SHARED, THHV_SCHED_SYNC,
 };
 use super::helpers::{
@@ -166,7 +166,7 @@ impl Hypervisor for ThemisHypervisor {
     }
 
     fn get_max_vcpus(&self) -> u32 {
-        256
+        THEMIS_MAX_VCPUS
     }
 
     fn get_guest_debug_hw_bps(&self) -> usize {

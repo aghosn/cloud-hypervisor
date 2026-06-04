@@ -20,13 +20,14 @@ use super::abi::{
     THHV_SET_VP_STATE,
 };
 use super::consts::{
-    APIC_REG_EOI, APIC_REG_ICR_HIGH, APIC_REG_ICR_LOW, EMPTY_BOOT_MSRS, EPT_VIOLATION_EXECUTE,
-    EXIT_REASON_APIC_ACCESS, EXIT_REASON_CPUID, EXIT_REASON_CR_ACCESS, EXIT_REASON_EPT_VIOLATION,
-    EXIT_REASON_EXCEPTION_NMI, EXIT_REASON_EXTERNAL_INTERRUPT, EXIT_REASON_HLT,
-    EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR, EXIT_REASON_TRIPLE_FAULT, EXIT_REASON_VMCALL,
-    EXIT_REASON_WRMSR, ICR_DELIVERY_MODE_MASK, ICR_DELIVERY_MODE_SHIFT, ICR_DEST_SHORTHAND_MASK,
-    ICR_DEST_SHORTHAND_SHIFT, ICR_HIGH_DEST_MASK, ICR_HIGH_DEST_SHIFT, ICR_MODE_FIXED,
-    ICR_MODE_INIT, ICR_MODE_LOWEST_PRIORITY, ICR_MODE_SIPI, ICR_VECTOR_MASK, REALMODE_CODE_SEG_AR,
+    APIC_REG_EOI, APIC_REG_ICR_HIGH, APIC_REG_ICR_LOW, CPUID_LEAF_PROC_FREQ, CPUID_LEAF_TSC_FREQ,
+    EMPTY_BOOT_MSRS, EPT_VIOLATION_EXECUTE, EXIT_REASON_APIC_ACCESS, EXIT_REASON_CPUID,
+    EXIT_REASON_CR_ACCESS, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_NMI,
+    EXIT_REASON_EXTERNAL_INTERRUPT, EXIT_REASON_HLT, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR,
+    EXIT_REASON_TRIPLE_FAULT, EXIT_REASON_VMCALL, EXIT_REASON_WRMSR, ICR_DELIVERY_MODE_MASK,
+    ICR_DELIVERY_MODE_SHIFT, ICR_DEST_SHORTHAND_MASK, ICR_DEST_SHORTHAND_SHIFT, ICR_HIGH_DEST_MASK,
+    ICR_HIGH_DEST_SHIFT, ICR_MODE_FIXED, ICR_MODE_INIT, ICR_MODE_LOWEST_PRIORITY, ICR_MODE_SIPI,
+    ICR_VECTOR_MASK, LAPIC_MMIO_BASE, LAPIC_MMIO_END, LAPIC_MMIO_OFFSET_MASK, REALMODE_CODE_SEG_AR,
     REALMODE_DATA_SEG_AR, STANDARD_REGS, THEMIC_MSG_SHUTDOWN, THEMIS_EXIT_DOORBELL, VpRegister,
 };
 use super::emulator;
@@ -366,7 +367,7 @@ impl Vcpu for ThemisVcpu {
         // crystal frequency in Hz.  If ECX is 0 (common in older models) we
         // fall back to the Tiger/Ice-Lake nominal 19.2 MHz crystal.
         // CPUID is always available on x86_64.
-        let leaf15 = std::arch::x86_64::__cpuid(0x15);
+        let leaf15 = std::arch::x86_64::__cpuid(CPUID_LEAF_TSC_FREQ);
         if leaf15.eax != 0 && leaf15.ebx != 0 {
             let crystal_hz = if leaf15.ecx != 0 {
                 leaf15.ecx as u64
@@ -382,7 +383,7 @@ impl Vcpu for ThemisVcpu {
 
         // Try CPUID leaf 0x16: Processor Frequency Information.
         // EAX[15:0] = processor base frequency in MHz.
-        let leaf16 = std::arch::x86_64::__cpuid(0x16);
+        let leaf16 = std::arch::x86_64::__cpuid(CPUID_LEAF_PROC_FREQ);
         if (leaf16.eax & 0xffff) != 0 {
             return Ok(Some((leaf16.eax & 0xffff) * 1000));
         }
@@ -848,7 +849,7 @@ impl ThemisVcpu {
         // LAPIC MMIO fast-path: when VIRTUALIZE_APIC_ACCESSES is not
         // supported, LAPIC accesses cause EPT violations.  Handle them
         // here with per-vCPU software LAPIC state + instruction decode.
-        if gpa >= 0xFEE0_0000 && gpa < 0xFEE0_1000 {
+        if gpa >= LAPIC_MMIO_BASE && gpa < LAPIC_MMIO_END {
             return self.handle_lapic_mmio(msg);
         }
 
@@ -918,7 +919,8 @@ impl ThemisVcpu {
 
     // ── Software LAPIC emulation (EPT-violation fallback) ──────────── //
 
-    /// Handle an EPT violation at the LAPIC MMIO range (0xFEE00000-0xFEE00FFF).
+    /// Handle an EPT violation at the LAPIC MMIO range
+    /// (`LAPIC_MMIO_BASE..LAPIC_MMIO_END`).
     ///
     /// When hardware VIRTUALIZE_APIC_ACCESSES is not available, the LAPIC page
     /// is left unmapped in the child EPT.  All accesses cause EPT violations
@@ -927,7 +929,7 @@ impl ThemisVcpu {
     fn handle_lapic_mmio(&mut self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
         use iced_x86::{Decoder, DecoderOptions, OpKind};
 
-        let offset = (msg.guest_physical_address & 0xFFF) as u32;
+        let offset = (msg.guest_physical_address & LAPIC_MMIO_OFFSET_MASK) as u32;
         let is_write = (msg.exit_qualification >> 1) & 1 != 0;
 
         // Decode the faulting instruction.

@@ -52,6 +52,28 @@ pub(super) const THHV_QUERY_META_PAGES_SHARED: u32 = 2;
 // Only EXECUTE is consumed today; add READ/WRITE here if a future handler needs them.
 pub(super) const EPT_VIOLATION_EXECUTE: u64 = 1 << 2;
 
+// ── LAPIC MMIO range (Intel SDM Vol 3A §10.4.1, default xAPIC base) ───────
+// Single 4 KiB page at the architectural default reset value of IA32_APIC_BASE.
+// We pin it here (rather than tracking IA32_APIC_BASE writes) because guests
+// running under Themis are not permitted to relocate the LAPIC.
+pub(super) const LAPIC_MMIO_BASE: u64 = 0xFEE0_0000;
+pub(super) const LAPIC_MMIO_SIZE: u64 = 0x1000;
+pub(super) const LAPIC_MMIO_END: u64 = LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE;
+/// Mask isolating the page-offset within the LAPIC MMIO frame.
+pub(super) const LAPIC_MMIO_OFFSET_MASK: u64 = LAPIC_MMIO_SIZE - 1;
+
+// ── CPUID leaves consumed for host-frequency discovery ────────────────────
+/// Intel SDM Vol 3A §18.7.3 — Time Stamp Counter and Nominal Core Crystal
+/// Clock Information leaf.  EAX/EBX/ECX expose the TSC ↔ crystal ratio.
+pub(super) const CPUID_LEAF_TSC_FREQ: u32 = 0x15;
+/// Intel SDM Vol 3A §3.2 — Processor Frequency Information leaf.
+/// EAX = base MHz, EBX = max MHz, ECX = bus reference MHz.
+pub(super) const CPUID_LEAF_PROC_FREQ: u32 = 0x16;
+
+/// Maximum number of vCPUs the Themis backend advertises to upper layers.
+/// Mirrors the cap used by the KVM and MSHV backends.
+pub(super) const THEMIS_MAX_VCPUS: u32 = 256;
+
 // ── APIC register offsets (Intel SDM Vol 3A §10.4.1) ──────────────────────
 pub(super) const APIC_REG_ICR_LOW: u32 = 0x300;
 pub(super) const APIC_REG_ICR_HIGH: u32 = 0x310;
