@@ -21,6 +21,16 @@ pub(super) use themis_abi::regs::THEMIC_MSG_SHUTDOWN;
 // SIPI real-mode segment access rights (VMX encoding).
 pub(super) use themis_abi::regs::access_rights::CODE16 as REALMODE_CODE_SEG_AR;
 pub(super) use themis_abi::regs::access_rights::DATA16 as REALMODE_DATA_SEG_AR;
+// Intel SDM VMX basic exit reasons (Intel SDM Vol 3C §27.2.1, Appendix C).
+pub(super) use themis_abi::vmx_exit_reasons::{
+    APIC_ACCESS as EXIT_REASON_APIC_ACCESS, CPUID as EXIT_REASON_CPUID,
+    CR_ACCESS as EXIT_REASON_CR_ACCESS, EPT_VIOLATION as EXIT_REASON_EPT_VIOLATION,
+    EXCEPTION_NMI as EXIT_REASON_EXCEPTION_NMI,
+    EXTERNAL_INTERRUPT as EXIT_REASON_EXTERNAL_INTERRUPT, HLT as EXIT_REASON_HLT,
+    IO_INSTRUCTION as EXIT_REASON_IO_INSTRUCTION, RDMSR as EXIT_REASON_RDMSR,
+    TRIPLE_FAULT as EXIT_REASON_TRIPLE_FAULT, VMCALL as EXIT_REASON_VMCALL,
+    WRMSR as EXIT_REASON_WRMSR,
+};
 
 pub(super) const THHV_IOCTL_MAGIC: u8 = 0xB8;
 pub(super) const THHV_SCHED_SYNC: u32 = 0;
@@ -37,19 +47,6 @@ pub(super) const THHV_META_PAGES_PER_VP: usize = 3;
 pub(super) const THHV_META_PAGES_SHARED: usize = 4;
 pub(super) const THHV_QUERY_META_PAGES_PER_VP: u32 = 1;
 pub(super) const THHV_QUERY_META_PAGES_SHARED: u32 = 2;
-
-pub(super) const EXIT_REASON_EXCEPTION_NMI: u32 = 0;
-pub(super) const EXIT_REASON_EXTERNAL_INTERRUPT: u32 = 1;
-pub(super) const EXIT_REASON_TRIPLE_FAULT: u32 = 2;
-pub(super) const EXIT_REASON_CPUID: u32 = 10;
-pub(super) const EXIT_REASON_HLT: u32 = 12;
-pub(super) const EXIT_REASON_VMCALL: u32 = 18;
-pub(super) const EXIT_REASON_CR_ACCESS: u32 = 28;     // Intel SDM: MOV to/from CR0/CR3/CR4/CR8, CLTS, LMSW
-pub(super) const EXIT_REASON_IO_INSTRUCTION: u32 = 30; // Intel SDM: IN, INS, OUT, OUTS
-pub(super) const EXIT_REASON_RDMSR: u32 = 31;
-pub(super) const EXIT_REASON_WRMSR: u32 = 32;
-pub(super) const EXIT_REASON_EPT_VIOLATION: u32 = 48;
-pub(super) const EXIT_REASON_APIC_ACCESS: u32 = 44;  // Intel SDM: APIC-access MMIO trap
 
 // EPT-violation exit-qualification bits (Intel SDM Vol 3C §28.2.1).
 // Only EXECUTE is consumed today; add READ/WRITE here if a future handler needs them.
