@@ -9,7 +9,7 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::anyhow;
 use vmm_sys_util::eventfd::EventFd;
@@ -38,6 +38,73 @@ use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegist
 use crate::cpu::{self, HypervisorCpuError, Vcpu, VmExit};
 use crate::vm::VmOps;
 use crate::{CpuState, MpState};
+
+// ── Host TSC frequency discovery ───────────────────────────────────────── //
+//
+// Both `Vcpu::tsc_khz()` and the IA32_TSC_DEADLINE WRMSR handler need to
+// know the host TSC rate in kHz.  The value is process-global, so we cache
+// it once via the CPUID-based discovery used by `tsc_khz()`.  Behaviour
+// matches the previous `tsc_khz()` method exactly.
+
+/// Last-resort fallback when CPUID leaves 0x15 *and* 0x16 both fail.  Loud
+/// log line at first use so a wrong value is noticed.  Tracked as the
+/// `chv-tsc-khz-from-cpuid` bug todo if it ever fires in practice.
+const TSC_KHZ_FALLBACK: u32 = 3_000_000;
+
+static HOST_TSC_KHZ: OnceLock<Option<u32>> = OnceLock::new();
+
+/// CPUID-derived host TSC kHz, or `None` if neither leaf 0x15 nor leaf 0x16
+/// produced a usable value.  Computed once and cached.
+fn discover_host_tsc_khz() -> Option<u32> {
+    *HOST_TSC_KHZ.get_or_init(|| {
+        // Leaf 0x15: TSC/Crystal ratio (Intel SDM Vol. 3A §18.7.3).
+        // EBX/EAX is the TSC-to-crystal multiplier/denominator; ECX is the
+        // crystal frequency in Hz.  If ECX is 0 (common on older CPUs) we
+        // fall back to the Tiger/Ice-Lake nominal 19.2 MHz crystal.
+        let leaf15 = std::arch::x86_64::__cpuid(CPUID_LEAF_TSC_FREQ);
+        if leaf15.eax != 0 && leaf15.ebx != 0 {
+            let crystal_hz = if leaf15.ecx != 0 {
+                leaf15.ecx as u64
+            } else {
+                19_200_000u64
+            };
+            let tsc_khz =
+                (crystal_hz * leaf15.ebx as u64 / leaf15.eax as u64 / 1000) as u32;
+            if tsc_khz > 0 {
+                return Some(tsc_khz);
+            }
+        }
+
+        // Leaf 0x16: Processor Frequency Information.
+        // EAX[15:0] = processor base frequency in MHz.
+        let leaf16 = std::arch::x86_64::__cpuid(CPUID_LEAF_PROC_FREQ);
+        if (leaf16.eax & 0xffff) != 0 {
+            return Some((leaf16.eax & 0xffff) * 1000);
+        }
+
+        None
+    })
+}
+
+/// Like [`discover_host_tsc_khz`] but always returns a value.  When CPUID
+/// discovery fails we log once and fall back to a 3 GHz placeholder.  Used
+/// in places (notably TSC-deadline arithmetic) where a panic or `None`
+/// branch would be worse than a stale-but-plausible value.
+fn host_tsc_khz_or_fallback() -> u32 {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if let Some(v) = discover_host_tsc_khz() {
+        v
+    } else {
+        WARNED.get_or_init(|| {
+            eprintln!(
+                "\r[THEMIS] WARNING: CPUID 0x15/0x16 reported no TSC frequency, \
+                 falling back to {} kHz — TSC-deadline timer accuracy may suffer",
+                TSC_KHZ_FALLBACK
+            );
+        });
+        TSC_KHZ_FALLBACK
+    }
+}
 
 pub struct ThemisVcpu {
     pub(super) fd: OwnedFd,
@@ -362,33 +429,7 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn tsc_khz(&self) -> cpu::Result<Option<u32>> {
-        // Try CPUID leaf 0x15: TSC/Crystal ratio (Intel SDM Vol. 3A §18.7.3).
-        // EBX/EAX is the TSC-to-crystal multiplier/denominator; ECX is the
-        // crystal frequency in Hz.  If ECX is 0 (common in older models) we
-        // fall back to the Tiger/Ice-Lake nominal 19.2 MHz crystal.
-        // CPUID is always available on x86_64.
-        let leaf15 = std::arch::x86_64::__cpuid(CPUID_LEAF_TSC_FREQ);
-        if leaf15.eax != 0 && leaf15.ebx != 0 {
-            let crystal_hz = if leaf15.ecx != 0 {
-                leaf15.ecx as u64
-            } else {
-                19_200_000u64
-            };
-            let tsc_khz =
-                (crystal_hz * leaf15.ebx as u64 / leaf15.eax as u64 / 1000) as u32;
-            if tsc_khz > 0 {
-                return Ok(Some(tsc_khz));
-            }
-        }
-
-        // Try CPUID leaf 0x16: Processor Frequency Information.
-        // EAX[15:0] = processor base frequency in MHz.
-        let leaf16 = std::arch::x86_64::__cpuid(CPUID_LEAF_PROC_FREQ);
-        if (leaf16.eax & 0xffff) != 0 {
-            return Ok(Some((leaf16.eax & 0xffff) * 1000));
-        }
-
-        Ok(None)
+        Ok(discover_host_tsc_khz())
     }
 
     fn state(&self) -> cpu::Result<CpuState> {
@@ -558,10 +599,15 @@ impl ThemisVcpu {
     /// timer emulation.  The guest wrote a TSC deadline value; we arm a
     /// timerfd so the interrupt fires at the right wall-clock time.
     ///
-    /// TSC_KHZ must match the value exposed to the guest via CPUID leaf 0x15.
+    /// The TSC kHz used here is read from host CPUID (leaf 0x15 / 0x16) via
+    /// [`host_tsc_khz_or_fallback`]; the same value backs the guest-visible
+    /// `Vcpu::tsc_khz()`, so the two cannot drift.
     fn handle_wrmsr_exit(&self, msg: &ThemicInterceptMessage) {
         const IA32_TSC_DEADLINE: u32 = 0x6E0;
-        const TSC_KHZ: u64 = 3_000_000; // 3 GHz — matches CPUID 0x15
+        // Host TSC kHz (CPUID 0x15/0x16, falling back to a 3 GHz placeholder
+        // with a one-shot warning).  Same value the guest sees via
+        // `Vcpu::tsc_khz()`, so the two cannot drift.
+        let tsc_khz: u64 = host_tsc_khz_or_fallback() as u64;
 
         // Log ALL WRMSR exits (first 20 + every 100th) to verify trapping works.
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -603,9 +649,13 @@ impl ThemisVcpu {
             } else {
                 0
             };
+            // Convert TSC ticks → microseconds exactly:
+            //   us = ticks * 1_000 / tsc_khz
+            // u128 to avoid overflow on multi-second deltas at GHz rates.
+            let diff_us = ((diff as u128) * 1_000 / tsc_khz as u128) as u64;
             eprintln!(
                 "\r[THEMIS-TIMER] #{n} deadline={:#x} now={:#x} delta_tsc={} ({} us)",
-                deadline_tsc, now_tsc, diff, diff / (TSC_KHZ / 1_000_000)
+                deadline_tsc, now_tsc, diff, diff_us
             );
         }
 
@@ -626,8 +676,12 @@ impl ThemisVcpu {
         }
 
         let delta_tsc = deadline_tsc - now_tsc;
-        // delta_ns = delta_tsc * 1_000_000 / TSC_KHZ  (avoiding overflow)
-        let delta_ns = delta_tsc / (TSC_KHZ / 1_000_000);
+        // Convert TSC ticks → nanoseconds exactly:
+        //   ns = ticks * 1_000_000 / tsc_khz
+        // u128 to avoid overflow on multi-second deltas at GHz rates.
+        // (Worst-case `delta_tsc * 1_000_000` is < 2^84 for a 1-day deadline
+        // at 5 GHz, well within u128.)
+        let delta_ns = ((delta_tsc as u128) * 1_000_000 / tsc_khz as u128) as u64;
 
         let tv_sec = (delta_ns / 1_000_000_000) as i64;
         let tv_nsec = (delta_ns % 1_000_000_000) as i64;
