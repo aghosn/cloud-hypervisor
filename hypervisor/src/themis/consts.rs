@@ -71,8 +71,10 @@ pub(super) const CPUID_LEAF_TSC_FREQ: u32 = 0x15;
 pub(super) const CPUID_LEAF_PROC_FREQ: u32 = 0x16;
 
 /// Maximum number of vCPUs the Themis backend advertises to upper layers.
-/// Mirrors the cap used by the KVM and MSHV backends.
-pub(super) const THEMIS_MAX_VCPUS: u32 = 256;
+/// Sourced from `themis_abi::MAX_VPS_PER_DOMAIN` so the cap matches what the
+/// capavisor and thhv enforce.  Renamed here to keep the CHV-side name
+/// (`THEMIS_MAX_VCPUS`) consistent with the KVM/MSHV backends.
+pub(super) use themis_abi::MAX_VPS_PER_DOMAIN as THEMIS_MAX_VCPUS;
 
 // ── APIC register offsets (Intel SDM Vol 3A §10.4.1) ──────────────────────
 pub(super) const APIC_REG_ICR_LOW: u32 = 0x300;
