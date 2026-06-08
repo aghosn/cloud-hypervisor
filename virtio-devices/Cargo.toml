@@ -10,6 +10,14 @@ default = []
 kvm = ["pci/kvm"]
 mshv = ["pci/mshv"]
 sev_snp = ["mshv-ioctls"]
+# Themis backend: kernel ioeventfd is not wired for virtio kicks today, so MMIO
+# writes to the notification BAR reach userspace.  This feature enables the
+# same userspace fallback used by SEV-SNP (signal the matching queue eventfd
+# from the BAR-write handler) so virtio kicks actually take effect.
+# See themis/capavisor/src/hypercall/doorbell.rs for the future kernel-side
+# fast path (THEMIS_RING_DOORBELL); until that path matches on EPT violations,
+# this fallback is the only way virtio drivers in dom1 can notify the device.
+themis = []
 
 [dependencies]
 anyhow = { workspace = true }
