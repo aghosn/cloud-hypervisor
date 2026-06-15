@@ -332,6 +332,19 @@ impl ThemisVmState {
             self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 1, word1)?;
         }
 
+        // ── MSR interposition policy ───────────────────────────────────
+        //
+        // IA32_TSC_DEADLINE (0x6E0): mark Emulate so capavisor's internal
+        // emulator handles WRMSR via the VMX preemption timer (no userspace
+        // round-trip). The MSR bitmap is set to trap WRMSR 0x6E0 by
+        // capavisor's add_vp; without an Emulate policy, capavisor would
+        // forward the exit to us (legacy timerfd path). The stored value
+        // is 0 (unused; writes are intercepted by the capavisor handler).
+        //
+        // MSR_EMULATE encoding: key = msr_number, sub_key = word_index, value = u32 word.
+        self.set_policy(policy_kind::MSR_EMULATE, 0x6E0, 0, 0)?;
+        eprintln!("\r[THEMIS-DBG] pushed MSR_EMULATE for 0x6E0 (TSC_DEADLINE)");
+
         // Flush deferred IOEVENTFDs — registers doorbells with capavisor.
         // Must happen after domain creation but before seal.
         {
