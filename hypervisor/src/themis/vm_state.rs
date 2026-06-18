@@ -209,6 +209,13 @@ impl ThemisVmState {
             return Ok(());
         }
 
+        // Themis feature bit gating: capavisor advertises
+        // FEATURE_X2APIC_VIRT (themis_abi::cpuid::feature_bits) when the
+        // hardware exposes VIRT_X2APIC_MODE + APIC_REGISTER_VIRT + VID.
+        // In nested envs (KVM-as-L0) these are typically absent — keep the
+        // child in xAPIC mode, pushing only the TSC-deadline emulate.
+        let x2apic_virt = themis_x2apic_virt_supported();
+
         // MSR_DEFAULT = Native: every MSR not explicitly overridden runs
         // natively (no VM exit). This matches the historical behavior of
         // dom1 (zeroed MSR bitmap at child seal). To harden a future
@@ -229,7 +236,68 @@ impl ThemisVmState {
         // value = u32 word.
         self.set_policy(policy_kind::MSR_EMULATE, 0x6E0, 0, 0)?;
 
-        eprintln!("\r[THEMIS-DBG] pushed MSR policy: default=Native, Emulate(0x6E0)");
+        // x2APIC virtualization (Intel SDM Vol 3C §29.5):
+        //
+        //   • VMCS for child VMs sets VIRTUALIZE_X2APIC_MODE +
+        //     APIC_REGISTER_VIRT + VID, with IA32_APIC_BASE pinned to
+        //     EN|EXTD via the Emulate policy below.  Children boot
+        //     directly in x2APIC mode — the xAPIC MMIO decoder in
+        //     capavisor (handle_apic_access_exit) is never reached.
+        //
+        //   • Self-IPI WRMSR(0x83F) under VID=1 is fully hardware-handled
+        //     (zero exits).  This is the primary motivation: it kills the
+        //     LAPIC IPI flood from the TSC-deadline path.
+        //
+        //   • Cross-CPU IPI via ICR (MSR 0x830) must still exit because
+        //     dispatch is software-routed.  We mark it Trap and forward
+        //     to handle_wrmsr_exit → deliver_ipi.
+        //
+        //   • Skipped entirely when the host does not advertise
+        //     FEATURE_X2APIC_VIRT (nested-KVM case): without hardware
+        //     virtualization, pre-setting EXTD lets Linux switch to
+        //     x2APIC ops and then #GP on the first native RDMSR 0x802.
+        //
+        // MSR_RANGE encoding: key = start_msr, sub_key = end_msr (inclusive),
+        // value = DefaultAction (0=Trap, 1=Native).
+        // Ranges must be non-overlapping, so split 0x800..=0x83F around 0x830.
+        if x2apic_virt {
+            self.set_policy(policy_kind::MSR_RANGE, 0x800, 0x82F, 1)?; // Native
+            self.set_policy(policy_kind::MSR_RANGE, 0x830, 0x830, 0)?; // Trap (ICR)
+            self.set_policy(policy_kind::MSR_RANGE, 0x831, 0x83F, 1)?; // Native
+
+            // IA32_APIC_BASE (0x1B): Emulate.  Stored value advertises the
+            // architectural LAPIC base with EN (bit 11) and EXTD (bit 10) set
+            // — Linux sees x2APIC already enabled and skips the xAPIC→x2APIC
+            // transition entirely.  WRMSR is consumed (no-op) by capavisor's
+            // msr_emulator handler to prevent the guest from disabling EXTD.
+            //
+            //   bit 8  (BSP):  intentionally NOT set — Linux derives BSP from
+            //                  the MADT, and the per-domain policy is the same
+            //                  value for all vCPUs.
+            //   bit 10 (EXTD): x2APIC mode enabled.
+            //   bit 11 (EN):   xAPIC global enable (also required for x2APIC).
+            //   bits 35:12     LAPIC base physical frame (0xFEE00 << 12).
+            const IA32_APIC_BASE_VALUE: u64 = 0xFEE0_0000 | (1 << 11) | (1 << 10);
+            self.set_policy(
+                policy_kind::MSR_EMULATE,
+                0x1B,
+                0,
+                IA32_APIC_BASE_VALUE & 0xFFFF_FFFF,
+            )?;
+            self.set_policy(
+                policy_kind::MSR_EMULATE,
+                0x1B,
+                1,
+                IA32_APIC_BASE_VALUE >> 32,
+            )?;
+        }
+
+        eprintln!(
+            "\r[THEMIS-DBG] pushed MSR policy: default=Native, Emulate(0x6E0{}), \
+             x2apic_virt={}",
+            if x2apic_virt { ",0x1B" } else { "" },
+            x2apic_virt
+        );
         *pushed = true;
         Ok(())
     }
@@ -277,8 +345,30 @@ impl ThemisVmState {
         // Word 0: value = (eax << 32) | ebx — creates the entry.
         // Word 1: value = (ecx << 32) | edx — updates remaining fields.
         // Key encodes (leaf << 32 | subleaf), sub_key = word index.
-        let cpuid_entries: Vec<CpuIdEntry> =
+        //
+        // Patch leaf 1 ECX bit 21 (X2APIC) to 1 unconditionally — children
+        // are pinned to x2APIC mode by the VMCS controls (see
+        // vmcs/controls.rs and the MSR_EMULATE(0x1B) policy above).  The
+        // bit is normally set on modern Intel hosts, but the capa engine
+        // is the only source of truth for the guest's CPUID, so we force
+        // it here to keep the policy self-consistent independent of host
+        // CPUID quirks.
+        // Patch leaf 1 ECX bit 21 (X2APIC) to 1 only when capavisor
+        // advertises FEATURE_X2APIC_VIRT and we therefore pushed the
+        // x2APIC MSR policy in ensure_msr_policy_pushed.  Forcing the bit
+        // without that backing policy would let the guest switch to
+        // x2APIC ops with no hardware virtualization, #GP'ing on the
+        // first RDMSR 0x802.
+        let x2apic_virt = themis_x2apic_virt_supported();
+        let mut cpuid_entries: Vec<CpuIdEntry> =
             self.cpuid_entries.lock().unwrap().clone();
+        if x2apic_virt {
+            for entry in cpuid_entries.iter_mut() {
+                if entry.function == 1 && entry.index == 0 {
+                    entry.ecx |= 1 << 21; // X2APIC
+                }
+            }
+        }
         if !cpuid_entries.is_empty() {
             eprintln!(
                 "\r[THEMIS-DBG] pushing {} CPUID entries as Emulate policy",
@@ -438,4 +528,34 @@ impl ThemisVmState {
             .context("THHV_SET_POLICY failed")?;
         Ok(())
     }
+}
+
+/// Probe the Themis hypervisor CPUID feature leaf (0x4000_0001) to determine
+/// whether hardware x2APIC virtualization (VIRT_X2APIC_MODE +
+/// APIC_REGISTER_VIRT + VID) is available.  Capavisor sets
+/// `FEATURE_X2APIC_VIRT` only when all three controls are in
+/// `IA32_VMX_PROCBASED_CTLS2` allowed-1; nested KVM (L0) usually clears them.
+///
+/// Computed once and cached — CPUID exits trap to capavisor and we don't want
+/// to add a vmexit on every policy push.
+fn themis_x2apic_virt_supported() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=no, 2=yes
+    match CACHED.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    // SAFETY: CPUID is unprivileged. Capavisor intercepts the Themis leaf
+    // range and synthesises the response.
+    let supported = unsafe {
+        let r = std::arch::x86_64::__cpuid(themis_abi::cpuid::LEAF_FEATURES);
+        (r.eax & themis_abi::cpuid::feature_bits::FEATURE_X2APIC_VIRT) != 0
+    };
+    CACHED.store(if supported { 2 } else { 1 }, Ordering::Relaxed);
+    eprintln!(
+        "\r[THEMIS-DBG] Themis CPUID 0x40000001 -> FEATURE_X2APIC_VIRT={}",
+        supported
+    );
+    supported
 }

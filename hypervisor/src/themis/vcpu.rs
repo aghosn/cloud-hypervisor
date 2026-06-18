@@ -604,6 +604,7 @@ impl ThemisVcpu {
     /// `Vcpu::tsc_khz()`, so the two cannot drift.
     fn handle_wrmsr_exit(&self, msg: &ThemicInterceptMessage) {
         const IA32_TSC_DEADLINE: u32 = 0x6E0;
+        const IA32_X2APIC_ICR: u32 = 0x830;
         // Host TSC kHz (CPUID 0x15/0x16, falling back to a 3 GHz placeholder
         // with a one-shot warning).  Same value the guest sees via
         // `Vcpu::tsc_khz()`, so the two cannot drift.
@@ -618,6 +619,22 @@ impl ThemisVcpu {
                 "\r[THEMIS-MSR] #{n} WRMSR msr={:#x} val={:#x} rip={:#x}",
                 msg.msr_number, msg.msr_value, msg.guest_rip
             );
+        }
+
+        if msg.msr_number == IA32_X2APIC_ICR {
+            // x2APIC ICR is a 64-bit MSR: bits [31:0] = ICR_LOW (same
+            // layout as xAPIC ICR_LOW), bits [63:32] = destination APIC
+            // ID (32-bit, no shift, unlike xAPIC ICR_HIGH which puts the
+            // 8-bit dest in bits [31:24]).  Repack into xAPIC layout so
+            // deliver_ipi (originally written for xAPIC ICR writes) can
+            // decode unchanged.  Themis APIC IDs are vp_index 1:1 and fit
+            // in 8 bits, so the upper bits of the x2APIC dest field are
+            // never used.
+            let icr_low = msg.msr_value as u32;
+            let dest_apic_id_x2 = (msg.msr_value >> 32) as u32;
+            let icr_high = (dest_apic_id_x2 & 0xFF) << ICR_HIGH_DEST_SHIFT;
+            self.deliver_ipi(icr_low, icr_high);
+            return;
         }
 
         if msg.msr_number != IA32_TSC_DEADLINE {
