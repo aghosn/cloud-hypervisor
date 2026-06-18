@@ -103,6 +103,7 @@ impl Hypervisor for ThemisHypervisor {
             state: Arc::new(ThemisVmState {
                 fd: Arc::new(part_fd),
                 initialized: Mutex::new(false),
+                msr_policy_pushed: Mutex::new(false),
                 page_size: self.page_size,
                 vp_meta_pages: self.vp_meta_pages,
                 _shared_meta: shared_meta,

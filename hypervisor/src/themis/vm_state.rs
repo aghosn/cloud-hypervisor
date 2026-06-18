@@ -19,6 +19,15 @@ use crate::arch::x86::CpuIdEntry;
 pub(crate) struct ThemisVmState {
     pub fd: Arc<OwnedFd>,
     pub initialized: Mutex<bool>,
+    /// Whether the per-domain MSR interposition policy has been pushed to
+    /// the capa engine. Pushed lazily but **before** the first
+    /// `THHV_CREATE_VP`, because capavisor's `do_add_vp` builds the VMCS
+    /// MSR bitmap as a pure projection of `MsrPolicy` (see
+    /// `themis/capavisor/src/arch/x86_64/msr_bitmap.rs`). If the policy
+    /// is not in place at that moment, the engine's restricted-child
+    /// default (Trap) is projected, every MSR access exits, and the
+    /// boot path corrupts. Idempotent: only the first call pushes.
+    pub msr_policy_pushed: Mutex<bool>,
     pub page_size: usize,
     pub vp_meta_pages: usize,
     pub _shared_meta: MmapRegion,
@@ -178,6 +187,53 @@ impl ThemisVmState {
         out
     }
 
+    /// Push the per-domain MSR interposition policy to the capa engine.
+    ///
+    /// **Must be called before the first `THHV_CREATE_VP`.** The capavisor
+    /// builds the VMCS MSR bitmap inside `do_add_vp` as a pure projection
+    /// of `MsrPolicy` (see `themis/capavisor/src/arch/x86_64/msr_bitmap.rs`).
+    /// If this hasn't run by then, the engine's default for restricted
+    /// children (`DefaultAction::Trap`, set by
+    /// `capability_engine::domain::Domain::new_restricted`) gets projected
+    /// into the bitmap — every MSR access exits, including FS_BASE /
+    /// GS_BASE / SYSCALL MSRs that have VMCS shadow fields, and the
+    /// passthrough handler in `vmexit/msr.rs` writes to physical MSRs
+    /// without updating the VMCS shadows, corrupting the guest on the
+    /// next VMENTRY.
+    ///
+    /// Idempotent: the `msr_policy_pushed` guard ensures the engine
+    /// hypercalls only fire once per VM.
+    pub(super) fn ensure_msr_policy_pushed(&self) -> anyhow::Result<()> {
+        let mut pushed = self.msr_policy_pushed.lock().unwrap();
+        if *pushed {
+            return Ok(());
+        }
+
+        // MSR_DEFAULT = Native: every MSR not explicitly overridden runs
+        // natively (no VM exit). This matches the historical behavior of
+        // dom1 (zeroed MSR bitmap at child seal). To harden a future
+        // child, flip this to Trap and push explicit Native ranges for
+        // the MSRs the guest is allowed to access without mediation.
+        //
+        // MSR_DEFAULT encoding: value = DefaultAction (0=Trap, 1=Native).
+        self.set_policy(policy_kind::MSR_DEFAULT, 0, 0, 1)?;
+
+        // IA32_TSC_DEADLINE (0x6E0): Emulate so the capavisor's internal
+        // emulator handles WRMSR via the VMX preemption timer (no
+        // userspace round-trip). The Emulate policy causes capavisor's
+        // bitmap projection to trap both RDMSR and WRMSR for 0x6E0; the
+        // capavisor's `msr_emulator` consumes the WRMSR. The stored value
+        // is 0 (unused; writes are intercepted by the capavisor handler).
+        //
+        // MSR_EMULATE encoding: key = msr_number, sub_key = word_index,
+        // value = u32 word.
+        self.set_policy(policy_kind::MSR_EMULATE, 0x6E0, 0, 0)?;
+
+        eprintln!("\r[THEMIS-DBG] pushed MSR policy: default=Native, Emulate(0x6E0)");
+        *pushed = true;
+        Ok(())
+    }
+
     pub(super) fn ensure_initialized(&self) -> anyhow::Result<()> {
         let mut initialized = self.initialized.lock().unwrap();
         if *initialized {
@@ -333,17 +389,14 @@ impl ThemisVmState {
         }
 
         // ── MSR interposition policy ───────────────────────────────────
-        //
-        // IA32_TSC_DEADLINE (0x6E0): mark Emulate so capavisor's internal
-        // emulator handles WRMSR via the VMX preemption timer (no userspace
-        // round-trip). The MSR bitmap is set to trap WRMSR 0x6E0 by
-        // capavisor's add_vp; without an Emulate policy, capavisor would
-        // forward the exit to us (legacy timerfd path). The stored value
-        // is 0 (unused; writes are intercepted by the capavisor handler).
-        //
-        // MSR_EMULATE encoding: key = msr_number, sub_key = word_index, value = u32 word.
-        self.set_policy(policy_kind::MSR_EMULATE, 0x6E0, 0, 0)?;
-        eprintln!("\r[THEMIS-DBG] pushed MSR_EMULATE for 0x6E0 (TSC_DEADLINE)");
+        // Already pushed by `ensure_msr_policy_pushed()` before the first
+        // `THHV_CREATE_VP`. Calling it again here is a cheap no-op (the
+        // guard mutex returns immediately). Done this way because the
+        // capavisor builds the MSR bitmap during `do_add_vp` as a
+        // projection of `MsrPolicy`; the policy must be in place before
+        // the first VP is created or the engine's restricted-child
+        // default (Trap) is projected, every MSR exits, and boot dies.
+        self.ensure_msr_policy_pushed()?;
 
         // Flush deferred IOEVENTFDs — registers doorbells with capavisor.
         // Must happen after domain creation but before seal.
