@@ -1112,4 +1112,32 @@ mod tests {
         assert_eq!(ivs[0].capa_mode.as_deref(), Some("carve"));
         assert_eq!(ivs[0].cpuid_leaf, Some(0x40000004));
     }
+
+    /// The four `eunomia/policies/wrmsr/*.json` policies used by the
+    /// wrmsr workload's `--policy-suite` runner must parse cleanly,
+    /// resolve `extends: "standard"`, and pass full validation.
+    #[test]
+    fn eunomia_wrmsr_policies_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../eunomia/policies/wrmsr");
+        assert!(dir.is_dir(), "policies dir missing: {}", dir.display());
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 4, "expected 4 wrmsr policies, got {:?}", files);
+        for f in &files {
+            let cfg = ThemisConfig::load_from_file(f)
+                .unwrap_or_else(|e| panic!("failed to load {}: {e}", f.display()));
+            // Every policy carries the "Euno" discriminator via CPUID 0x40000F00
+            // as an Emulate override.
+            let cpuid = &cfg.policies.cpuid;
+            let has_disc = cpuid.overrides.iter().any(|o| {
+                o.leaf == Some(0x40000F00) && matches!(o.action, OverrideAction::Emulate)
+            });
+            assert!(has_disc, "{}: missing 0x40000F00 discriminator", f.display());
+        }
+    }
 }
