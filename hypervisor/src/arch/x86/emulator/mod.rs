@@ -677,6 +677,9 @@ mod mock_vmm {
                     let std_regs: StandardRegisters = kvm_bindings::kvm_regs::default().into();
                 } else if #[cfg(feature = "mshv")] {
                     let std_regs: StandardRegisters = mshv_bindings::StandardRegisters::default().into();
+                } else if #[cfg(feature = "themis")] {
+                    let std_regs: StandardRegisters =
+                        StandardRegisters::Themis(crate::themis::ThemisStandardRegisters::default());
                 } else {
                     panic!("Unsupported hypervisor type!")
                 }

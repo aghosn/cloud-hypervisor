@@ -37,15 +37,18 @@
 pub mod emulator;
 
 mod abi;
+mod config;
 mod consts;
 mod helpers;
 mod hypervisor_impl;
 mod mmap;
+mod policy_walker;
 mod vcpu;
 mod vm_impl;
 mod vm_state;
 
 pub use abi::{shmem_mode, ThemisIrqRoutingEntry, ThemisStandardRegisters, VcpuThemisState};
+pub use config::{set_default_override, DefaultProfile, ThemisConfig, ThemisConfigError};
 pub use consts::policy_kind;
 pub use hypervisor_impl::ThemisHypervisor;
 pub use vcpu::ThemisVcpu;

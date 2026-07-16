@@ -1,0 +1,39 @@
+{
+  "general": {
+    "name": "themis-default-standard",
+    "confidential": false,
+    "shared_regions": []
+  },
+  "policies": {
+    "cores": {},
+    "api": { "allow": "ALL" },
+    "interrupts": {
+      "default": {
+        "visibility": "Report",
+        "read_set": "ALL",
+        "write_set": "ALL"
+      }
+    },
+    "exits": {
+      "default": {
+        "trap": true,
+        "read_set": "ALL",
+        "write_set": "ALL"
+      }
+    },
+    "msrs": {
+      "default": "Native",
+      "overrides": [
+        {
+          "msr": "0x6E0",
+          "action": "Emulate",
+          "value": 0
+        }
+      ]
+    },
+    "cpuid": {
+      "default": "Native",
+      "hypervisor_range_native": true
+    }
+  }
+}

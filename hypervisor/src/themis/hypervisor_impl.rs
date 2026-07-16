@@ -70,6 +70,21 @@ impl Hypervisor for ThemisHypervisor {
 
     fn create_vm(&self, _config: HypervisorVmConfig) -> hypervisor::Result<Arc<dyn vm::Vm>> {
         let confidential = _config.confidential;
+        // Resolve the Themis policy config:
+        //   - if the user passed --themis-config, use it verbatim
+        //   - otherwise load the bundled default profile matching `confidential`
+        //   - fall back to embedded default on load failure (should not happen
+        //     since the JSON is checked at compile time via include_str! +
+        //     parse tests, but degrade to Standard rather than panic in prod)
+        let themis_config: Arc<super::config::ThemisConfig> = _config.themis.unwrap_or_else(|| {
+            let profile = if confidential {
+                super::config::DefaultProfile::Confidential
+            } else {
+                super::config::DefaultProfile::Standard
+            };
+            Arc::new(super::config::ThemisConfig::builtin_default(profile).unwrap_or_default())
+        });
+
         let mut create = ThhvCreatePartition {
             cores_mask: !0,
             api_flags: !0,
@@ -117,11 +132,19 @@ impl Hypervisor for ThemisHypervisor {
                 ivshmem_bars: Mutex::new(Vec::new()),
                 pending_ioeventfds: Mutex::new(Vec::new()),
                 vtom_bit: if confidential {
-                    (core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF) - 1
+                    // Resolution priority: themis config's `general.vtom_bit`
+                    // override wins; else auto-derive from CPUID leaf
+                    // 0x80000008 (MAXPHYADDR - 1).
+                    themis_config.general.vtom_bit.map(|b| b as u32).unwrap_or_else(|| {
+                        // CPUID is unprivileged; capavisor intercepts
+                        // hypervisor leaves but 0x80000008 is passed through.
+                        (core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF) - 1
+                    })
                 } else {
                     0
                 },
                 confidential,
+                themis_config,
             }),
         }))
     }

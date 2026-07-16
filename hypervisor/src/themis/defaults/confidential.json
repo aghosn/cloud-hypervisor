@@ -1,0 +1,51 @@
+{
+  "general": {
+    "name": "themis-default-confidential",
+    "confidential": true,
+    "vtom_bit": null,
+    "shared_regions": []
+  },
+  "policies": {
+    "cores": {},
+    "api": { "allow": "ALL" },
+    "interrupts": {
+      "default": {
+        "visibility": "Report",
+        "read_set": "ALL",
+        "write_set": "ALL"
+      }
+    },
+    "exits": {
+      "default": {
+        "trap": true,
+        "read_set": "ALL",
+        "write_set": "ALL"
+      }
+    },
+    "msrs": {
+      "default": "Native",
+      "overrides": [
+        {
+          "msr": "0x6E0",
+          "action": "Emulate",
+          "value": 0
+        }
+      ]
+    },
+    "cpuid": {
+      "default": "Native",
+      "hypervisor_range_native": true,
+      "overrides": [
+        {
+          "leaf": "0x40000100",
+          "subleaf": 0,
+          "action": "Emulate",
+          "eax": "auto:vtom_bit",
+          "ebx": "Them",
+          "ecx": "isCo",
+          "edx": "Co\u0000\u0000"
+        }
+      ]
+    }
+  }
+}

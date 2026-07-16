@@ -178,7 +178,7 @@ impl ClockData {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HypervisorVmConfig {
     #[cfg(feature = "tdx")]
     pub tdx_enabled: bool,
@@ -189,6 +189,11 @@ pub struct HypervisorVmConfig {
     pub nested: bool,
     pub smt_enabled: bool,
     pub confidential: bool,
+    /// Themis child-domain policy config (resolved from `--themis-config`
+    /// or `--platform confidential=on|off` default profile).  Only set
+    /// when the `themis` feature is enabled at compile time.
+    #[cfg(feature = "themis")]
+    pub themis: Option<std::sync::Arc<crate::themis::ThemisConfig>>,
 }
 
 #[derive(Copy, Clone)]

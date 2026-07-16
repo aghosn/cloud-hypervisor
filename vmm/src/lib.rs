@@ -235,6 +235,8 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
                 .platform
                 .as_ref()
                 .is_some_and(|p| p.confidential),
+            #[cfg(feature = "themis")]
+            themis: _value.themis.as_ref().map(|c| std::sync::Arc::new(c.clone())),
         }
     }
 }
@@ -2622,6 +2624,8 @@ mod unit_tests {
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            #[cfg(feature = "themis")]
+            themis: None,
         })
     }
 

@@ -102,6 +102,9 @@ enum Error {
     CreateLandlock(#[source] LandlockError),
     #[error("Failed to apply Landlock")]
     ApplyLandlock(#[source] LandlockError),
+    #[cfg(feature = "themis")]
+    #[error("Bad --themis-default-override argument (expected \"standard=<path>\" or \"confidential=<path>\"): {0}")]
+    BadThemisDefaultOverride(String),
 }
 
 #[derive(Error, Debug)]
@@ -393,6 +396,26 @@ fn get_cli_options_sorted(
             )
             .num_args(1)
             .group("vm-config"),
+        #[cfg(feature = "themis")]
+        Arg::new("themis-config")
+            .long("themis-config")
+            .help(
+                "Path to a JSON file describing the Themis child-domain policy \
+                (general, policies, comm.ivshmem).  See docs/chv-themis-config.md."
+            )
+            .num_args(1)
+            .group("vm-config"),
+        #[cfg(feature = "themis")]
+        Arg::new("themis-default-override")
+            .long("themis-default-override")
+            .help(
+                "Dev flag: replace one of the embedded default profiles with a \
+                file loaded from disk.  Syntax: \"standard=<path>\" or \
+                \"confidential=<path>\".  May be given twice to override both."
+            )
+            .num_args(1..)
+            .action(ArgAction::Append)
+            .group("vm-config"),
         Arg::new("pmem")
             .long("pmem")
             .help(PmemConfig::SYNTAX)
@@ -527,6 +550,28 @@ fn start_vmm(cmd_arguments: &ArgMatches) -> Result<Option<String>, Error> {
     }))
     .map(|()| log::set_max_level(log_level))
     .map_err(Error::LoggerSetup)?;
+
+    #[cfg(feature = "themis")]
+    if let Some(specs) = cmd_arguments.get_many::<String>("themis-default-override") {
+        for spec in specs {
+            let (name, path) = spec
+                .split_once('=')
+                .ok_or_else(|| Error::BadThemisDefaultOverride(spec.clone()))?;
+            let profile = match name.trim() {
+                "standard" => hypervisor::themis::DefaultProfile::Standard,
+                "confidential" => hypervisor::themis::DefaultProfile::Confidential,
+                _ => return Err(Error::BadThemisDefaultOverride(spec.clone())),
+            };
+            hypervisor::themis::set_default_override(
+                profile,
+                Some(std::path::PathBuf::from(path.trim())),
+            );
+            log::warn!(
+                "themis: default profile {profile:?} overridden by {path} \
+                 (dev flag; production runs should use the embedded default)"
+            );
+        }
+    }
 
     let (api_socket_path, api_socket_fd) =
         if let Some(socket_config) = cmd_arguments.get_one::<String>("api-socket") {

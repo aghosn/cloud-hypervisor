@@ -204,6 +204,22 @@ pub enum Error {
     /// Missing fields in Landlock rules
     #[error("Error parsing --landlock-rules: path/access field missing")]
     ParseLandlockMissingFields,
+    /// Failed reading/parsing --themis-config file
+    #[cfg(feature = "themis")]
+    #[error("Error loading --themis-config")]
+    ParseThemisConfig(#[source] hypervisor::themis::ThemisConfigError),
+    /// Duplicate ivshmem id in themis config
+    #[cfg(all(feature = "themis", feature = "ivshmem"))]
+    #[error("themis.comm.ivshmem: duplicate id {0}")]
+    ThemisIvshmemDupId(u32),
+    /// Same ivshmem path in both CLI and themis config (or twice in one)
+    #[cfg(all(feature = "themis", feature = "ivshmem"))]
+    #[error("ivshmem: duplicate path {0:?} across --ivshmem and --themis-config")]
+    ThemisIvshmemDupPath(std::path::PathBuf),
+    /// Unknown capa_mode in themis config
+    #[cfg(all(feature = "themis", feature = "ivshmem"))]
+    #[error("themis.comm.ivshmem: unknown capa_mode {0:?} (want alias|carve|plug|none)")]
+    ThemisIvshmemBadCapaMode(String),
     #[cfg(feature = "fw_cfg")]
     /// Failed Parsing FwCfgItem config
     #[error("Error parsing --fw-cfg-config items")]
@@ -459,6 +475,8 @@ pub struct VmParams<'a> {
     pub fw_cfg_config: Option<&'a str>,
     #[cfg(feature = "ivshmem")]
     pub ivshmem: Option<Vec<&'a str>>,
+    #[cfg(feature = "themis")]
+    pub themis_config: Option<&'a str>,
 }
 
 impl<'a> VmParams<'a> {
@@ -536,6 +554,9 @@ impl<'a> VmParams<'a> {
         let ivshmem: Option<Vec<&str>> = args
             .get_many::<String>("ivshmem")
             .map(|x| x.map(|y| y as &str).collect());
+        #[cfg(feature = "themis")]
+        let themis_config: Option<&str> =
+            args.get_one::<String>("themis-config").map(|x| x as &str);
         VmParams {
             cpus,
             memory,
@@ -580,6 +601,8 @@ impl<'a> VmParams<'a> {
             fw_cfg_config,
             #[cfg(feature = "ivshmem")]
             ivshmem,
+            #[cfg(feature = "themis")]
+            themis_config,
         }
     }
 }
@@ -2836,6 +2859,69 @@ impl IvshmemConfig {
     }
 }
 
+/// Merge `themis.comm.ivshmem[]` into the CLI-derived ivshmem list.
+///
+/// See docs/chv-themis-config.md §Ivshmem reconciliation.  Rules:
+///   1. Key = `id`.  themis entries with no explicit `id` inherit their
+///      array index.  CLI entries are appended after themis entries in
+///      CLI order.
+///   2. Duplicate `id` inside themis → `ThemisIvshmemDupId`.
+///   3. Duplicate `path` across all entries → `ThemisIvshmemDupPath`.
+///   4. `capa_mode: "none"` → vanilla (`mode = None`).
+///   5. If `themis` is `None` or its ivshmem list is empty, the CLI list
+///      is returned unchanged.
+#[cfg(all(feature = "themis", feature = "ivshmem"))]
+fn merge_themis_ivshmem(
+    cli: Option<Vec<IvshmemConfig>>,
+    themis: Option<&hypervisor::themis::ThemisConfig>,
+) -> Result<Option<Vec<IvshmemConfig>>> {
+    let Some(cfg) = themis else { return Ok(cli) };
+    let Some(comm) = cfg.comm.as_ref() else { return Ok(cli) };
+    if comm.ivshmem.is_empty() {
+        return Ok(cli);
+    }
+
+    use std::collections::{BTreeMap, HashSet};
+    let mut by_id: BTreeMap<u32, IvshmemConfig> = BTreeMap::new();
+    for (idx, entry) in comm.ivshmem.iter().enumerate() {
+        let id = entry.id.unwrap_or(idx as u32);
+        let mode = match entry.capa_mode.as_deref() {
+            None | Some("none") => None,
+            Some(m @ ("alias" | "carve" | "plug")) => Some(m.to_string()),
+            Some(other) => return Err(Error::ThemisIvshmemBadCapaMode(other.to_string())),
+        };
+        let ic = IvshmemConfig {
+            path: entry.path.clone(),
+            size: entry.size as usize,
+            mode,
+            count: entry.count,
+        };
+        if by_id.insert(id, ic).is_some() {
+            return Err(Error::ThemisIvshmemDupId(id));
+        }
+    }
+
+    let mut paths: HashSet<PathBuf> = HashSet::new();
+    for ic in by_id.values() {
+        if !paths.insert(ic.path.clone()) {
+            return Err(Error::ThemisIvshmemDupPath(ic.path.clone()));
+        }
+    }
+    if let Some(ref cli_list) = cli {
+        for ic in cli_list {
+            if !paths.insert(ic.path.clone()) {
+                return Err(Error::ThemisIvshmemDupPath(ic.path.clone()));
+            }
+        }
+    }
+
+    let mut merged: Vec<IvshmemConfig> = by_id.into_values().collect();
+    if let Some(cli_list) = cli {
+        merged.extend(cli_list);
+    }
+    Ok(Some(merged))
+}
+
 impl VmConfig {
     fn validate_identifier(
         id_list: &mut BTreeSet<String>,
@@ -3423,6 +3509,21 @@ impl VmConfig {
             ivshmem = Some(ivshmem_config_list);
         }
 
+        #[cfg(feature = "themis")]
+        let themis: Option<hypervisor::themis::ThemisConfig> = match vm_params.themis_config {
+            Some(path) => Some(
+                hypervisor::themis::ThemisConfig::load_from_file(path)
+                    .map_err(Error::ParseThemisConfig)?,
+            ),
+            None => None,
+        };
+
+        // ── Reconcile --ivshmem CLI list with themis.comm.ivshmem[] ─────────
+        #[cfg(all(feature = "themis", feature = "ivshmem"))]
+        {
+            ivshmem = merge_themis_ivshmem(ivshmem, themis.as_ref())?;
+        }
+
         let mut config = VmConfig {
             cpus: CpusConfig::parse(vm_params.cpus)?,
             memory: MemoryConfig::parse(vm_params.memory, vm_params.memory_zones)?,
@@ -3459,6 +3560,8 @@ impl VmConfig {
             landlock_rules,
             #[cfg(feature = "ivshmem")]
             ivshmem,
+            #[cfg(feature = "themis")]
+            themis,
         };
         config.validate().map_err(Error::Validation)?;
         Ok(config)
@@ -3596,6 +3699,8 @@ impl Clone for VmConfig {
             landlock_rules: self.landlock_rules.clone(),
             #[cfg(feature = "ivshmem")]
             ivshmem: self.ivshmem.clone(),
+            #[cfg(feature = "themis")]
+            themis: self.themis.clone(),
             ..*self
         }
     }
@@ -4698,6 +4803,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            #[cfg(feature = "themis")]
+            themis: None,
         };
 
         let valid_config = RestoreConfig {
@@ -4907,6 +5014,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
+            #[cfg(feature = "themis")]
+            themis: None,
         };
 
         valid_config.validate().unwrap();
@@ -5621,5 +5730,158 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             },
         );
         Ok(())
+    }
+
+    // ── Ivshmem reconciliation (--ivshmem CLI vs themis.comm.ivshmem[]) ──
+    #[cfg(all(feature = "themis", feature = "ivshmem"))]
+    mod themis_ivshmem_merge {
+        use super::super::*;
+        use hypervisor::themis::ThemisConfig;
+
+        fn cli(path: &str, size: usize) -> IvshmemConfig {
+            IvshmemConfig {
+                path: PathBuf::from(path),
+                size,
+                mode: None,
+                count: None,
+            }
+        }
+
+        fn themis_from_json(json: &str) -> ThemisConfig {
+            ThemisConfig::from_json_str(json).expect("themis json parse")
+        }
+
+        #[test]
+        fn no_themis_returns_cli_unchanged() {
+            let cli_list = Some(vec![cli("/tmp/a", 4096)]);
+            let out = merge_themis_ivshmem(cli_list.clone(), None).unwrap();
+            assert_eq!(out, cli_list);
+        }
+
+        #[test]
+        fn empty_comm_returns_cli_unchanged() {
+            let cfg = themis_from_json(r#"{}"#);
+            let cli_list = Some(vec![cli("/tmp/a", 4096)]);
+            let out = merge_themis_ivshmem(cli_list.clone(), Some(&cfg)).unwrap();
+            assert_eq!(out, cli_list);
+        }
+
+        #[test]
+        fn themis_entries_prepend_cli_entries() {
+            let cfg = themis_from_json(
+                r#"{
+                    "comm": {
+                        "ivshmem": [
+                            { "id": 5, "path": "/tmp/t5", "size": 4096, "capa_mode": "carve" },
+                            { "id": 1, "path": "/tmp/t1", "size": 8192 }
+                        ]
+                    }
+                }"#,
+            );
+            let cli_list = Some(vec![cli("/tmp/c0", 2048)]);
+            let out = merge_themis_ivshmem(cli_list, Some(&cfg)).unwrap().unwrap();
+            // Sorted by id ascending, CLI entries appended.
+            assert_eq!(out.len(), 3);
+            assert_eq!(out[0].path, PathBuf::from("/tmp/t1"));
+            assert_eq!(out[1].path, PathBuf::from("/tmp/t5"));
+            assert_eq!(out[1].mode.as_deref(), Some("carve"));
+            assert_eq!(out[2].path, PathBuf::from("/tmp/c0"));
+        }
+
+        #[test]
+        fn capa_mode_none_maps_to_vanilla() {
+            let cfg = themis_from_json(
+                r#"{
+                    "comm": {
+                        "ivshmem": [
+                            { "path": "/tmp/x", "size": 4096, "capa_mode": "none" }
+                        ]
+                    }
+                }"#,
+            );
+            let out = merge_themis_ivshmem(None, Some(&cfg)).unwrap().unwrap();
+            assert!(out[0].mode.is_none());
+        }
+
+        #[test]
+        fn implicit_id_from_array_index() {
+            let cfg = themis_from_json(
+                r#"{
+                    "comm": {
+                        "ivshmem": [
+                            { "path": "/tmp/a", "size": 4096 },
+                            { "path": "/tmp/b", "size": 4096 }
+                        ]
+                    }
+                }"#,
+            );
+            let out = merge_themis_ivshmem(None, Some(&cfg)).unwrap().unwrap();
+            assert_eq!(out[0].path, PathBuf::from("/tmp/a"));
+            assert_eq!(out[1].path, PathBuf::from("/tmp/b"));
+        }
+
+        #[test]
+        fn duplicate_themis_id_errors() {
+            let cfg = themis_from_json(
+                r#"{
+                    "comm": {
+                        "ivshmem": [
+                            { "id": 2, "path": "/tmp/a", "size": 4096 },
+                            { "id": 2, "path": "/tmp/b", "size": 4096 }
+                        ]
+                    }
+                }"#,
+            );
+            let err = merge_themis_ivshmem(None, Some(&cfg)).unwrap_err();
+            assert!(matches!(err, Error::ThemisIvshmemDupId(2)));
+        }
+
+        #[test]
+        fn duplicate_path_across_cli_and_themis_errors() {
+            let cfg = themis_from_json(
+                r#"{
+                    "comm": {
+                        "ivshmem": [ { "path": "/tmp/dup", "size": 4096 } ]
+                    }
+                }"#,
+            );
+            let cli_list = Some(vec![cli("/tmp/dup", 4096)]);
+            let err = merge_themis_ivshmem(cli_list, Some(&cfg)).unwrap_err();
+            assert!(matches!(err, Error::ThemisIvshmemDupPath(_)));
+        }
+
+        #[test]
+        fn duplicate_path_within_themis_errors() {
+            let cfg = themis_from_json(
+                r#"{
+                    "comm": {
+                        "ivshmem": [
+                            { "id": 0, "path": "/tmp/same", "size": 4096 },
+                            { "id": 1, "path": "/tmp/same", "size": 4096 }
+                        ]
+                    }
+                }"#,
+            );
+            let err = merge_themis_ivshmem(None, Some(&cfg)).unwrap_err();
+            assert!(matches!(err, Error::ThemisIvshmemDupPath(_)));
+        }
+
+        #[test]
+        fn bad_capa_mode_errors() {
+            let cfg = themis_from_json(
+                r#"{
+                    "comm": {
+                        "ivshmem": [
+                            { "path": "/tmp/a", "size": 4096, "capa_mode": "wobble" }
+                        ]
+                    }
+                }"#,
+            );
+            let err = merge_themis_ivshmem(None, Some(&cfg)).unwrap_err();
+            match err {
+                Error::ThemisIvshmemBadCapaMode(s) => assert_eq!(s, "wobble"),
+                other => panic!("wrong error: {other:?}"),
+            }
+        }
     }
 }

@@ -1012,6 +1012,8 @@ pub struct VmConfig {
     pub landlock_rules: Option<Vec<LandlockConfig>>,
     #[cfg(feature = "ivshmem")]
     pub ivshmem: Option<Vec<IvshmemConfig>>,
+    #[cfg(feature = "themis")]
+    pub themis: Option<hypervisor::themis::ThemisConfig>,
 }
 
 impl VmConfig {

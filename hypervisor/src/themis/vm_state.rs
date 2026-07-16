@@ -14,6 +14,9 @@ use super::abi::*;
 use super::consts::*;
 use super::helpers::{ioctl_noarg, ioctl_with_mut_ref};
 use super::mmap::MmapRegion;
+use super::policy_walker::{
+    hypervisor_range_native_segments, walk_cpuid_emulates, walk_msrs, PolicyOp, WalkContext,
+};
 use crate::arch::x86::CpuIdEntry;
 
 pub(crate) struct ThemisVmState {
@@ -70,6 +73,11 @@ pub(crate) struct ThemisVmState {
     /// Confidential mode: guest RAM is CARVEd (dom0 loses access) instead of
     /// ALIASed. MMIO regions remain ALIAS (shared by design).
     pub confidential: bool,
+    /// Resolved policy config used to build the THHV_SET_POLICY stream at
+    /// seal time.  Either the user's `--themis-config` file, or the bundled
+    /// default profile (`standard.json` / `confidential.json`) selected on
+    /// the `confidential` flag.
+    pub themis_config: Arc<crate::themis::ThemisConfig>,
 }
 
 impl ThemisVmState {
@@ -216,26 +224,22 @@ impl ThemisVmState {
         // child in xAPIC mode, pushing only the TSC-deadline emulate.
         let x2apic_virt = themis_x2apic_virt_supported();
 
-        // MSR_DEFAULT = Native: every MSR not explicitly overridden runs
-        // natively (no VM exit). This matches the historical behavior of
-        // dom1 (zeroed MSR bitmap at child seal). To harden a future
-        // child, flip this to Trap and push explicit Native ranges for
-        // the MSRs the guest is allowed to access without mediation.
+        // ── Config-driven baseline ─────────────────────────────────────
         //
-        // MSR_DEFAULT encoding: value = DefaultAction (0=Trap, 1=Native).
-        self.set_policy(policy_kind::MSR_DEFAULT, 0, 0, 1)?;
+        // MSR_DEFAULT + `msrs.overrides` come from the resolved ThemisConfig
+        // (user file or bundled default profile).  The `policy_walker`
+        // module produces the exact stream that used to be hardcoded here;
+        // see `policy_walker::tests` for the byte-identical regression
+        // check on the default profiles.
+        let ctx = WalkContext { vtom_bit: self.vtom_bit };
+        let baseline_ops = walk_msrs(&self.themis_config, ctx)
+            .context("themis config: walk MSR policy")?;
+        for op in &baseline_ops {
+            self.emit_policy_op(op)?;
+        }
 
-        // IA32_TSC_DEADLINE (0x6E0): Emulate so the capavisor's internal
-        // emulator handles WRMSR via the VMX preemption timer (no
-        // userspace round-trip). The Emulate policy causes capavisor's
-        // bitmap projection to trap both RDMSR and WRMSR for 0x6E0; the
-        // capavisor's `msr_emulator` consumes the WRMSR. The stored value
-        // is 0 (unused; writes are intercepted by the capavisor handler).
+        // ── Runtime-conditional: x2APIC virtualization ────────────────
         //
-        // MSR_EMULATE encoding: key = msr_number, sub_key = word_index,
-        // value = u32 word.
-        self.set_policy(policy_kind::MSR_EMULATE, 0x6E0, 0, 0)?;
-
         // x2APIC virtualization (Intel SDM Vol 3C §29.5):
         //
         //   • VMCS for child VMs sets VIRTUALIZE_X2APIC_MODE +
@@ -257,9 +261,11 @@ impl ThemisVmState {
         //     virtualization, pre-setting EXTD lets Linux switch to
         //     x2APIC ops and then #GP on the first native RDMSR 0x802.
         //
-        // MSR_RANGE encoding: key = start_msr, sub_key = end_msr (inclusive),
-        // value = DefaultAction (0=Trap, 1=Native).
-        // Ranges must be non-overlapping, so split 0x800..=0x83F around 0x830.
+        // This block is NOT driven from the config yet because it depends
+        // on runtime host-CPUID probing (`themis_x2apic_virt_supported`);
+        // moving it into the config would let users override that probe,
+        // which is out of scope for the initial apply refactor.  Kept as
+        // an in-source runtime injection.
         if x2apic_virt {
             self.set_policy(policy_kind::MSR_RANGE, 0x800, 0x82F, 1)?; // Native
             self.set_policy(policy_kind::MSR_RANGE, 0x830, 0x830, 0)?; // Trap (ICR)
@@ -293,9 +299,8 @@ impl ThemisVmState {
         }
 
         eprintln!(
-            "\r[THEMIS-DBG] pushed MSR policy: default=Native, Emulate(0x6E0{}), \
-             x2apic_virt={}",
-            if x2apic_virt { ",0x1B" } else { "" },
+            "\r[THEMIS-DBG] pushed MSR policy: {} baseline op(s) from config, x2apic_virt={}",
+            baseline_ops.len(),
             x2apic_virt
         );
         *pushed = true;
@@ -416,66 +421,62 @@ impl ThemisVmState {
         //
         // We must split the Native range around any Emulate leaves (ivshmem,
         // CoCo detection) because the engine rejects overlapping entries.
-        // Collect Emulate leaf numbers, sort them, then emit Native segments
-        // that skip those leaves.
+        // Collect Emulate leaf numbers (from both runtime injections and the
+        // config-declared Emulate overrides), then delegate the split to
+        // `policy_walker::hypervisor_range_native_segments`.
         //
         // CPUID_RANGE encoding: key = (start_leaf << 32) | start_sub,
         //                       sub_key = (end_leaf << 32) | end_sub,
         //                       value = 1 (Native).
-        {
-            let range_start: u32 = 0x40000000;
-            let range_end: u32 = 0x4FFFFFFF;
+        //
+        // Config-declared Emulate overrides (e.g. CoCo detection leaf
+        // 0x40000100 in `confidential.json`) are pushed BEFORE the Native
+        // range segments so the seal-time stream stays in the same order as
+        // the pre-refactor implementation: [runtime CPUID entries, ivshmem
+        // BARs, Native ranges (split), config-declared CPUID Emulate
+        // overrides].
+        //
+        // For the confidential default profile this reproduces the exact
+        // sequence of `THHV_SET_POLICY` ops that used to be hardcoded
+        // (see `policy_walker::tests::confidential_default_...`).
+        let ctx = WalkContext { vtom_bit: self.vtom_bit };
+        let (cpuid_emulate_ops, config_emulate_leaves) =
+            walk_cpuid_emulates(&self.themis_config, ctx)
+                .context("themis config: walk CPUID Emulate overrides")?;
 
-            // Gather all Emulate leaf numbers that fall in the Native range.
-            let mut emulate_leaves: Vec<u32> = Vec::new();
+        let range_start: u32 = 0x40000000;
+        let range_end: u32 = 0x4FFFFFFF;
+        let mut emulate_leaves: Vec<u32> = Vec::new();
+        if !ivshmem_bars.is_empty() {
+            emulate_leaves.push(0x40000004);
+        }
+        emulate_leaves.extend(config_emulate_leaves.iter().copied());
 
-            // ivshmem leaves (one per device, all at leaf 0x40000004).
-            if !ivshmem_bars.is_empty() {
-                emulate_leaves.push(0x40000004);
-            }
-
-            // CoCo detection leaf.
-            if self.confidential {
-                emulate_leaves.push(0x40000100);
-            }
-
-            emulate_leaves.sort();
-            emulate_leaves.dedup();
-
-            // Emit Native segments between emulate gaps.
-            let mut cursor = range_start;
-            for &leaf in &emulate_leaves {
-                if cursor < leaf {
-                    let s: u64 = (cursor as u64) << 32;
-                    let e: u64 = ((leaf - 1) as u64) << 32 | 0xFFFFFFFF;
-                    self.set_policy(policy_kind::CPUID_RANGE, s, e, 1)?;
-                }
-                cursor = leaf + 1;
-            }
-            if cursor <= range_end {
-                let s: u64 = (cursor as u64) << 32;
-                let e: u64 = (range_end as u64) << 32 | 0xFFFFFFFF;
+        if self.themis_config.policies.cpuid.hypervisor_range_native {
+            for (lo, hi) in
+                hypervisor_range_native_segments(range_start, range_end, emulate_leaves.clone())
+            {
+                let s: u64 = (lo as u64) << 32;
+                let e: u64 = ((hi as u64) << 32) | 0xFFFFFFFF;
                 self.set_policy(policy_kind::CPUID_RANGE, s, e, 1)?;
             }
-
             eprintln!(
                 "\r[THEMIS-DBG] pushed Native CPUID ranges (split around {} emulate leaves)",
                 emulate_leaves.len()
             );
         }
 
-        // Push CoCo detection Emulate leaf (0x40000100) if confidential.
-        if self.confidential {
-            let coco_leaf: u64 = 0x40000100_u64 << 32;
-            let eax = self.vtom_bit;
-            let ebx = u32::from_le_bytes(*b"Them");
-            let ecx = u32::from_le_bytes(*b"isCo");
-            let edx = u32::from_le_bytes(*b"Co\0\0");
-            let word0 = ((eax as u64) << 32) | (ebx as u64);
-            let word1 = ((ecx as u64) << 32) | (edx as u64);
-            eprintln!("\r[THEMIS-DBG] pushing CoCo CPUID leaf 0x40000100: vtom_bit={}", self.vtom_bit);
-            self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 0, word0)?;
-            self.set_policy(policy_kind::CPUID_EMULATE, coco_leaf, 1, word1)?;
+        // Emit config-declared CPUID Emulate overrides (e.g. CoCo leaf
+        // 0x40000100 with the vTOM signature).  Order matches
+        // vm_state.rs pre-refactor: after Native ranges, before seal.
+        for op in &cpuid_emulate_ops {
+            self.emit_policy_op(op)?;
+        }
+        if !cpuid_emulate_ops.is_empty() {
+            eprintln!(
+                "\r[THEMIS-DBG] pushed {} CPUID Emulate op(s) from themis config",
+                cpuid_emulate_ops.len()
+            );
         }
 
         // ── MSR interposition policy ───────────────────────────────────
@@ -527,6 +528,13 @@ impl ThemisVmState {
         ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_POLICY, &mut sp)
             .context("THHV_SET_POLICY failed")?;
         Ok(())
+    }
+
+    /// Push a walker-emitted [`PolicyOp`].  Thin adapter around
+    /// [`Self::set_policy`] — kept as its own method so the walker doesn't
+    /// have to know about ThemisVmState fields.
+    pub(super) fn emit_policy_op(&self, op: &PolicyOp) -> anyhow::Result<()> {
+        self.set_policy(op.kind, op.key, op.sub_key, op.value)
     }
 }
 
