@@ -79,6 +79,17 @@ impl vm::Vm for ThemisVm {
     }
 
     fn create_vcpu(&self, id: u32, vm_ops: Option<Arc<dyn VmOps>>) -> vm::Result<Box<dyn Vcpu>> {
+        // Push the resolved MSR interposition policy BEFORE the first
+        // THHV_CREATE_VP: the capavisor builds the VMCS MSR bitmap inside
+        // `do_add_vp` as a pure projection of MsrPolicy. If the policy
+        // hasn't been pushed yet, the engine's restricted-child default
+        // (Trap) is projected — every MSR access exits, including EFER
+        // writes needed to enter long mode, and boot triple-faults.
+        // Idempotent: subsequent calls are cheap no-ops.
+        self.state
+            .ensure_msr_policy_pushed()
+            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+
         let meta =
             MmapRegion::new_shared_anonymous(self.state.vp_meta_pages * self.state.page_size)
                 .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
