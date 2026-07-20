@@ -122,6 +122,14 @@ pub struct ThemisVcpu {
     /// EventFd registered as irqfd for LOCAL_TIMER_VECTOR (0xEC).
     /// Signalled by the timer thread when the deadline fires.
     pub(super) _timer_irq: EventFd,
+    /// Per-vCPU shadow of Trap-policy MSRs.  When the capavisor forwards
+    /// a WRMSR exit for an MSR whose per-domain policy is Trap and CHV
+    /// has no dedicated emulator (TSC_DEADLINE / X2APIC_ICR), the write
+    /// is stashed here; the matching RDMSR retrieves it and pushes the
+    /// value into the child's RAX/RDX via the dirty-COMM path.  Trap
+    /// therefore means "parent owns the guest-visible value of this MSR
+    /// for this vCPU" — the physical MSR is never touched.
+    pub(super) msr_shadow: std::sync::Mutex<std::collections::HashMap<u32, u64>>,
 }
 
 impl ThemisVcpu {
@@ -544,8 +552,11 @@ impl ThemisVcpu {
         match msg.exit_reason {
             EXIT_REASON_EXCEPTION_NMI
             | EXIT_REASON_EXTERNAL_INTERRUPT
-            | EXIT_REASON_VMCALL
-            | EXIT_REASON_RDMSR => Ok(VmExit::Ignore),
+            | EXIT_REASON_VMCALL => Ok(VmExit::Ignore),
+            EXIT_REASON_RDMSR => {
+                self.handle_rdmsr_exit(&msg)?;
+                Ok(VmExit::Ignore)
+            }
             EXIT_REASON_WRMSR => {
                 self.handle_wrmsr_exit(&msg);
                 Ok(VmExit::Ignore)
@@ -638,6 +649,15 @@ impl ThemisVcpu {
         }
 
         if msg.msr_number != IA32_TSC_DEADLINE {
+            // Unknown Trap-forwarded WRMSR: stash the value in the
+            // per-vCPU shadow so a subsequent RDMSR returns it.  The
+            // physical MSR is never touched — Trap means the parent owns
+            // the guest-visible value.  Guest RIP was already advanced
+            // by capavisor's forward_child_exit path (switch.rs), so we
+            // just record the write and return.
+            if let Ok(mut shadow) = self.msr_shadow.lock() {
+                shadow.insert(msg.msr_number, msg.msr_value);
+            }
             return;
         }
 
@@ -715,6 +735,27 @@ impl ThemisVcpu {
                 self.timer_fd.as_raw_fd(), 0, &arm, std::ptr::null_mut(),
             );
         }
+    }
+
+    /// Handle a Trap-forwarded RDMSR VM exit.
+    ///
+    /// Retrieves the last value written to this MSR via `handle_wrmsr_exit`
+    /// (defaulting to 0 if never written) and pushes RAX_lo / RDX_hi into
+    /// the child's dirty-COMM path.  The capavisor already advanced the
+    /// guest RIP past the RDMSR instruction before forwarding the exit,
+    /// so we only need to expose the shadow value.  Trap semantics: the
+    /// physical MSR is never read; the parent owns the guest-visible value.
+    fn handle_rdmsr_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
+        let value = self
+            .msr_shadow
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&msg.msr_number).copied())
+            .unwrap_or(0);
+        self.set_reg_values(&[
+            reg(VpRegister::Rax, value & 0xFFFF_FFFF),
+            reg(VpRegister::Rdx, (value >> 32) & 0xFFFF_FFFF),
+        ])
     }
 
     /// Handle a CR_ACCESS VM exit (exit reason 28, Intel SDM §27.1 Table C-1).

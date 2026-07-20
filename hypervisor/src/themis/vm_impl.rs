@@ -225,6 +225,7 @@ impl vm::Vm for ThemisVm {
             cpuid: std::sync::Mutex::new(Vec::new()),
             timer_fd,
             _timer_irq: timer_irq,
+            msr_shadow: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
