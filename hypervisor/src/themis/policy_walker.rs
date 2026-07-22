@@ -22,8 +22,12 @@
 //! leaves) are still layered on top by `vm_state.rs` — this walker
 //! provides the helpers they need to compose the final stream.
 
+use themis_abi::regs::VpRegister;
+use themis_abi::vmx_exit_reasons;
+
 use super::config::{
-    DefaultAction, MsrOverride, OverrideAction, ThemisConfig, ValueOrExpr,
+    DefaultAction, ExitReason, MsrOverride, OverrideAction, RegSet, RegSetSymbolic, ThemisConfig,
+    ValueOrExpr,
 };
 use super::consts::policy_kind;
 
@@ -65,6 +69,143 @@ pub(super) enum WalkError {
     MsrOverrideMissingTarget,
     #[error("msr range [{lo:#x},{hi:#x}] with action Emulate — Emulate requires a single MSR")]
     EmulateOverMsrRange { lo: u32, hi: u32 },
+    #[error("unknown VMEXIT reason: {0:?}")]
+    UnknownExitReason(String),
+    #[error("unknown VP register name in register set: {0:?}")]
+    UnknownRegister(String),
+}
+
+// ── VMEXIT walker ───────────────────────────────────────────────────────── //
+
+/// Emit the VMEXIT policy stream for `cfg`.
+///
+/// The wire API exposes the default trap bit plus complete per-reason
+/// overrides. Default read/write sets are not separately addressable by the
+/// current ABI; they remain at the engine default (`ALL`).
+pub(super) fn walk_exits(cfg: &ThemisConfig) -> Result<Vec<PolicyOp>, WalkError> {
+    let mut out = vec![PolicyOp::new(
+        policy_kind::DEFAULT_EXIT_TRAP,
+        0,
+        0,
+        u64::from(cfg.policies.exits.default.trap),
+    )];
+
+    for ov in &cfg.policies.exits.overrides {
+        let reason = resolve_exit_reason(&ov.reason)?;
+        out.push(PolicyOp::new(
+            policy_kind::EXIT_REASON_TRAP,
+            reason as u64,
+            0,
+            u64::from(ov.action.trap),
+        ));
+
+        for (word, bits) in reg_set_words(&ov.action.read_set)?.into_iter().enumerate() {
+            out.push(PolicyOp::new(
+                policy_kind::EXIT_REASON_REG_READ_SET,
+                reason as u64,
+                word as u64,
+                bits,
+            ));
+        }
+        for (word, bits) in reg_set_words(&ov.action.write_set)?.into_iter().enumerate() {
+            out.push(PolicyOp::new(
+                policy_kind::EXIT_REASON_REG_WRITE_SET,
+                reason as u64,
+                word as u64,
+                bits,
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+fn resolve_exit_reason(reason: &ExitReason) -> Result<u32, WalkError> {
+    let ExitReason::Name(name) = reason else {
+        return Ok(match reason {
+            ExitReason::Number(value) => *value,
+            ExitReason::Name(_) => unreachable!(),
+        });
+    };
+
+    if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16)
+            .map_err(|_| WalkError::UnknownExitReason(name.clone()));
+    }
+    if let Ok(value) = name.parse::<u32>() {
+        return Ok(value);
+    }
+
+    match name.as_str() {
+        "EXCEPTION_NMI" => Ok(vmx_exit_reasons::EXCEPTION_NMI),
+        "EXTERNAL_INTERRUPT" => Ok(vmx_exit_reasons::EXTERNAL_INTERRUPT),
+        "TRIPLE_FAULT" => Ok(vmx_exit_reasons::TRIPLE_FAULT),
+        "INIT_SIGNAL" => Ok(vmx_exit_reasons::INIT_SIGNAL),
+        "SIPI" => Ok(vmx_exit_reasons::SIPI),
+        "INTERRUPT_WINDOW" => Ok(vmx_exit_reasons::INTERRUPT_WINDOW),
+        "CPUID" => Ok(vmx_exit_reasons::CPUID),
+        "HLT" => Ok(vmx_exit_reasons::HLT),
+        "VMCALL" => Ok(vmx_exit_reasons::VMCALL),
+        "CR_ACCESS" => Ok(vmx_exit_reasons::CR_ACCESS),
+        "IO_INSTRUCTION" => Ok(vmx_exit_reasons::IO_INSTRUCTION),
+        "RDMSR" => Ok(vmx_exit_reasons::RDMSR),
+        "WRMSR" => Ok(vmx_exit_reasons::WRMSR),
+        "VMENTRY_INVALID_GUEST" => Ok(vmx_exit_reasons::VMENTRY_INVALID_GUEST),
+        "APIC_ACCESS" => Ok(vmx_exit_reasons::APIC_ACCESS),
+        "EOI_INDUCED" => Ok(vmx_exit_reasons::EOI_INDUCED),
+        "EPT_VIOLATION" => Ok(vmx_exit_reasons::EPT_VIOLATION),
+        "EPT_MISCONFIG" => Ok(vmx_exit_reasons::EPT_MISCONFIG),
+        "VMX_PREEMPTION_TIMER" => Ok(vmx_exit_reasons::VMX_PREEMPTION_TIMER),
+        "XSETBV" => Ok(vmx_exit_reasons::XSETBV),
+        "APIC_WRITE" => Ok(vmx_exit_reasons::APIC_WRITE),
+        _ => Err(WalkError::UnknownExitReason(name.clone())),
+    }
+}
+
+fn reg_set_words(set: &RegSet) -> Result<[u64; 3], WalkError> {
+    match set {
+        RegSet::Symbolic(RegSetSymbolic::ALL) => Ok([u64::MAX; 3]),
+        RegSet::Symbolic(RegSetSymbolic::NONE) => Ok([0; 3]),
+        RegSet::Bitmap(bits) => Ok([*bits, 0, 0]),
+        RegSet::List(names) => {
+            let mut words = [0; 3];
+            for name in names {
+                let id = register_id(name)?;
+                words[(id / 64) as usize] |= 1u64 << (id % 64);
+            }
+            Ok(words)
+        }
+    }
+}
+
+fn register_id(name: &str) -> Result<u64, WalkError> {
+    let reg = match name {
+        "RAX" => VpRegister::Rax,
+        "RBX" => VpRegister::Rbx,
+        "RCX" => VpRegister::Rcx,
+        "RDX" => VpRegister::Rdx,
+        "RSI" => VpRegister::Rsi,
+        "RDI" => VpRegister::Rdi,
+        "RBP" => VpRegister::Rbp,
+        "R8" => VpRegister::R8,
+        "R9" => VpRegister::R9,
+        "R10" => VpRegister::R10,
+        "R11" => VpRegister::R11,
+        "R12" => VpRegister::R12,
+        "R13" => VpRegister::R13,
+        "R14" => VpRegister::R14,
+        "R15" => VpRegister::R15,
+        "RSP" => VpRegister::Rsp,
+        "RIP" => VpRegister::Rip,
+        "RFLAGS" => VpRegister::Rflags,
+        "CR0" => VpRegister::Cr0,
+        "CR3" => VpRegister::Cr3,
+        "CR4" => VpRegister::Cr4,
+        "EFER" => VpRegister::Efer,
+        "DR7" => VpRegister::Dr7,
+        _ => return Err(WalkError::UnknownRegister(name.to_string())),
+    };
+    Ok(reg as u64)
 }
 
 // ── MSR walker ─────────────────────────────────────────────────────────── //
@@ -383,6 +524,69 @@ mod tests {
         let (ops, leaves) = walk_cpuid_emulates(&cfg, ctx).unwrap();
         assert!(ops.is_empty());
         assert!(leaves.is_empty());
+    }
+
+    #[test]
+    fn no_exit_default_emits_local_exit_policy() {
+        let cfg = ThemisConfig::from_json_str(
+            r#"{
+                "policies": {
+                    "exits": {
+                        "default": {
+                            "trap": false,
+                            "read_set": "ALL",
+                            "write_set": "ALL"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            walk_exits(&cfg).unwrap(),
+            vec![PolicyOp::new(policy_kind::DEFAULT_EXIT_TRAP, 0, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn exit_override_emits_trap_and_register_words() {
+        let cfg = ThemisConfig::from_json_str(
+            r#"{
+                "policies": {
+                    "exits": {
+                        "overrides": [{
+                            "reason": "IO_INSTRUCTION",
+                            "trap": true,
+                            "read_set": ["RAX", "RIP"],
+                            "write_set": "NONE"
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let ops = walk_exits(&cfg).unwrap();
+        assert_eq!(
+            ops[0],
+            PolicyOp::new(policy_kind::DEFAULT_EXIT_TRAP, 0, 0, 1)
+        );
+        assert_eq!(
+            ops[1],
+            PolicyOp::new(
+                policy_kind::EXIT_REASON_TRAP,
+                vmx_exit_reasons::IO_INSTRUCTION as u64,
+                0,
+                1,
+            )
+        );
+        assert_eq!(ops[2].value, 1 | (1 << (VpRegister::Rip as u64)));
+        assert_eq!(ops[3].value, 0);
+        assert_eq!(ops[4].value, 0);
+        assert_eq!(ops[5].value, 0);
+        assert_eq!(ops[6].value, 0);
+        assert_eq!(ops[7].value, 0);
     }
 
     #[test]

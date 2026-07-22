@@ -15,7 +15,8 @@ use super::consts::*;
 use super::helpers::{ioctl_noarg, ioctl_with_mut_ref};
 use super::mmap::MmapRegion;
 use super::policy_walker::{
-    hypervisor_range_native_segments, walk_cpuid_emulates, walk_msrs, PolicyOp, WalkContext,
+    hypervisor_range_native_segments, walk_cpuid_emulates, walk_exits, walk_msrs, PolicyOp,
+    WalkContext,
 };
 use crate::arch::x86::CpuIdEntry;
 
@@ -344,6 +345,20 @@ impl ThemisVmState {
                 .context("deferred THHV_SET_GUEST_MEMORY failed")?;
             eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
         }
+
+        // Apply the config's VMEXIT routing before sealing. Previously the
+        // JSON parser accepted `policies.exits`, but no THHV_SET_POLICY calls
+        // were emitted, so every child silently retained the engine's
+        // trap-all default.
+        let exit_ops =
+            walk_exits(&self.themis_config).context("themis config: walk VMEXIT policy")?;
+        for op in &exit_ops {
+            self.emit_policy_op(op)?;
+        }
+        eprintln!(
+            "\r[THEMIS-DBG] pushed VMEXIT policy: {} op(s) from config",
+            exit_ops.len()
+        );
 
         // Push CPUID entries as Emulate overrides before sealing.
         // Each entry becomes 2 set_policy calls (word 0 and word 1).
