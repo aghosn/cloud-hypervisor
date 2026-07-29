@@ -525,13 +525,14 @@ impl ThemisVcpu {
             return Ok(VmExit::Shutdown);
         }
 
-        // Temporary: log first few exits for visibility (no AP-specific logging today).
+        // Log the first few exits for visibility (no AP-specific logging today).
         static EXIT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let en = EXIT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if en < 5 {
             eprintln!(
-                "\r[THEMIS-EXIT] #{en} vp={} reason={} rip={:#x} msr_num={:#x}",
-                self._vp_index, msg.exit_reason, msg.guest_rip, msg.msr_number
+                "\r[THEMIS-EXIT] #{en} vp={} reason={} rip={:#x} msr_num={:#x} qual={:#x} gpa={:#x}",
+                self._vp_index, msg.exit_reason, msg.guest_rip, msg.msr_number,
+                msg.exit_qualification, msg.guest_physical_address
             );
         }
 
@@ -927,7 +928,13 @@ impl ThemisVcpu {
                 let data = msg.rax.to_le_bytes();
                 vm_ops
                     .pio_write(u64::from(msg.port_number), &data[..len])
-                    .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
+                    .map_err(|e| {
+                        eprintln!(
+                            "\r[THEMIS-IO-ERR] pio_write port=0x{:x} size={} data={:x?}: {:?}",
+                            msg.port_number, len, &data[..len], e
+                        );
+                        HypervisorCpuError::RunVcpu(e.into())
+                    })?;
             }
             // RIP already advanced by capavisor.
             return Ok(());
@@ -937,7 +944,13 @@ impl ThemisVcpu {
         if let Some(vm_ops) = &self.vm_ops {
             vm_ops
                 .pio_read(u64::from(msg.port_number), &mut data[..len])
-                .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
+                .map_err(|e| {
+                    eprintln!(
+                        "\r[THEMIS-IO-ERR] pio_read port=0x{:x} size={}: {:?}",
+                        msg.port_number, len, e
+                    );
+                    HypervisorCpuError::RunVcpu(e.into())
+                })?;
         }
 
         let v = u32::from_le_bytes(data);
