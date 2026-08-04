@@ -119,6 +119,7 @@ pub mod policy_kind {
     pub const MSR_DEFAULT: u64 = 13;
     pub const MSR_RANGE: u64 = 14;
     pub const MSR_EMULATE: u64 = 15;
+    pub const VECTOR_INJECTABLE: u64 = 16;
 }
 
 /// Standard register set queried/restored by the KVM-like get/set_standard_registers

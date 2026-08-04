@@ -15,8 +15,8 @@ use super::consts::*;
 use super::helpers::{ioctl_noarg, ioctl_with_mut_ref};
 use super::mmap::MmapRegion;
 use super::policy_walker::{
-    hypervisor_range_native_segments, walk_cpuid_emulates, walk_exits, walk_msrs, PolicyOp,
-    WalkContext,
+    hypervisor_range_native_segments, walk_cpuid_emulates, walk_exits, walk_interrupts, walk_msrs,
+    PolicyOp, WalkContext,
 };
 use crate::arch::x86::CpuIdEntry;
 
@@ -358,6 +358,21 @@ impl ThemisVmState {
         eprintln!(
             "\r[THEMIS-DBG] pushed VMEXIT policy: {} op(s) from config",
             exit_ops.len()
+        );
+
+        // Apply the config's interrupt-routing policy before sealing.
+        // Previously `policies.interrupts` was parsed/validated by config.rs
+        // but never projected into THHV_SET_POLICY calls, so every child
+        // domain's InterruptPolicy silently stayed at the engine's
+        // `new_restricted()` default regardless of the JSON policy file.
+        let interrupt_ops = walk_interrupts(&self.themis_config)
+            .context("themis config: walk interrupt policy")?;
+        for op in &interrupt_ops {
+            self.emit_policy_op(op)?;
+        }
+        eprintln!(
+            "\r[THEMIS-DBG] pushed interrupt policy: {} op(s) from config",
+            interrupt_ops.len()
         );
 
         // Push CPUID entries as Emulate overrides before sealing.

@@ -471,6 +471,12 @@ pub struct VectorPolicyConfig {
 
     #[serde(default = "RegSet::all")]
     pub write_set: RegSet,
+
+    /// Whether a parent may explicitly inject this vector via
+    /// `THEMIS_INJECT_INTERRUPT`, independent of `visibility` (which only
+    /// governs automatic real-hardware-interrupt routing).
+    #[serde(default = "VectorPolicyConfig::default_injectable")]
+    pub injectable: bool,
 }
 
 impl Default for VectorPolicyConfig {
@@ -479,6 +485,7 @@ impl Default for VectorPolicyConfig {
             visibility: VectorPolicyConfig::default_visibility(),
             read_set: RegSet::all(),
             write_set: RegSet::all(),
+            injectable: VectorPolicyConfig::default_injectable(),
         }
     }
 }
@@ -486,6 +493,10 @@ impl Default for VectorPolicyConfig {
 impl VectorPolicyConfig {
     fn default_visibility() -> Visibility {
         Visibility::Report
+    }
+
+    fn default_injectable() -> bool {
+        true
     }
 }
 
@@ -1138,6 +1149,47 @@ mod tests {
                 o.leaf == Some(0x40000F00) && matches!(o.action, OverrideAction::Emulate)
             });
             assert!(has_disc, "{}: missing 0x40000F00 discriminator", f.display());
+        }
+    }
+
+    /// `eunomia/policies/timer/*.json` — per-vector `injectable` policies
+    /// used to demonstrate the item-2 pattern (vector visibility `Suppress`
+    /// with `injectable: true` retained on the LAPIC-timer vector, `0xEC`/236,
+    /// so the parent keeps sole explicit control over it via
+    /// `THEMIS_INJECT_INTERRUPT` while automatic real-hardware redelivery for
+    /// every other vector is fully suppressed and non-injectable). Must parse
+    /// cleanly and resolve `extends: "standard"`.
+    #[test]
+    fn eunomia_timer_interrupt_policies_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../eunomia/policies/timer");
+        assert!(dir.is_dir(), "policies dir missing: {}", dir.display());
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "expected at least 1 timer policy, got none");
+        for f in &files {
+            let cfg = ThemisConfig::load_from_file(f)
+                .unwrap_or_else(|e| panic!("failed to load {}: {e}", f.display()));
+            let interrupts = &cfg.policies.interrupts;
+            assert!(
+                !interrupts.default.injectable,
+                "{}: expected default.injectable=false",
+                f.display()
+            );
+            let vec_236 = interrupts
+                .overrides
+                .iter()
+                .find(|o| o.vector == 236)
+                .unwrap_or_else(|| panic!("{}: missing vector 236 override", f.display()));
+            assert!(
+                vec_236.policy.injectable,
+                "{}: expected vector 236 override injectable=true",
+                f.display()
+            );
         }
     }
 }

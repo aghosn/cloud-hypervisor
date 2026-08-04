@@ -27,7 +27,7 @@ use themis_abi::vmx_exit_reasons;
 
 use super::config::{
     DefaultAction, ExitReason, MsrOverride, OverrideAction, RegSet, RegSetSymbolic, ThemisConfig,
-    ValueOrExpr,
+    ValueOrExpr, Visibility,
 };
 use super::consts::policy_kind;
 
@@ -73,6 +73,75 @@ pub(super) enum WalkError {
     UnknownExitReason(String),
     #[error("unknown VP register name in register set: {0:?}")]
     UnknownRegister(String),
+}
+
+// ── Interrupt policy walker ──────────────────────────────────────────────── //
+
+/// Map a config `Visibility` to the engine's `InterruptVisibility` wire value.
+/// Ordering must match `capa-engine`'s `visibility_to_u64`: Deliver=0,
+/// Report=1, NotReport=2 (`Suppress` in config terms).
+fn visibility_wire_value(vis: Visibility) -> u64 {
+    match vis {
+        Visibility::Deliver => 0,
+        Visibility::Report => 1,
+        Visibility::Suppress => 2,
+    }
+}
+
+/// Emit the interrupt-routing policy stream for `cfg`:
+///   1. `DEFAULT_INTR_VISIBILITY`
+///   2. Per-vector overrides: visibility, read_set (per word), write_set
+///      (per word), and the `injectable` flag.
+///
+/// Register-access bitmaps and `injectable` are only meaningful as
+/// per-vector overrides today; the wire ABI has no separate "default
+/// read/write set" or "default injectable" op, so `cfg.policies.interrupts
+/// .default`'s read_set/write_set/injectable fields are only applied when a
+/// vector override is also present for the same vector's other fields (this
+/// mirrors the pre-existing engine default: `VectorPolicy::default_report()`).
+pub(super) fn walk_interrupts(cfg: &ThemisConfig) -> Result<Vec<PolicyOp>, WalkError> {
+    let mut out = vec![PolicyOp::new(
+        policy_kind::DEFAULT_INTR_VISIBILITY,
+        0,
+        0,
+        visibility_wire_value(cfg.policies.interrupts.default.visibility),
+    )];
+
+    for ov in &cfg.policies.interrupts.overrides {
+        let vector = ov.vector as u64;
+        out.push(PolicyOp::new(
+            policy_kind::VECTOR_VISIBILITY,
+            vector,
+            0,
+            visibility_wire_value(ov.policy.visibility),
+        ));
+
+        for (word, bits) in reg_set_words(&ov.policy.read_set)?.into_iter().enumerate() {
+            out.push(PolicyOp::new(
+                policy_kind::VECTOR_REG_READ_SET,
+                vector,
+                word as u64,
+                bits,
+            ));
+        }
+        for (word, bits) in reg_set_words(&ov.policy.write_set)?.into_iter().enumerate() {
+            out.push(PolicyOp::new(
+                policy_kind::VECTOR_REG_WRITE_SET,
+                vector,
+                word as u64,
+                bits,
+            ));
+        }
+
+        out.push(PolicyOp::new(
+            policy_kind::VECTOR_INJECTABLE,
+            vector,
+            0,
+            u64::from(ov.policy.injectable),
+        ));
+    }
+
+    Ok(out)
 }
 
 // ── VMEXIT walker ───────────────────────────────────────────────────────── //
@@ -587,6 +656,66 @@ mod tests {
         assert_eq!(ops[5].value, 0);
         assert_eq!(ops[6].value, 0);
         assert_eq!(ops[7].value, 0);
+    }
+
+    #[test]
+    fn interrupt_default_visibility_only() {
+        let cfg = ThemisConfig::from_json_str(
+            r#"{
+                "policies": {
+                    "interrupts": {
+                        "default": { "visibility": "Suppress" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            walk_interrupts(&cfg).unwrap(),
+            vec![PolicyOp::new(policy_kind::DEFAULT_INTR_VISIBILITY, 0, 0, 2)]
+        );
+    }
+
+    #[test]
+    fn interrupt_override_emits_visibility_regsets_and_injectable() {
+        let cfg = ThemisConfig::from_json_str(
+            r#"{
+                "policies": {
+                    "interrupts": {
+                        "default": { "visibility": "Suppress", "injectable": false },
+                        "overrides": [{
+                            "vector": 236,
+                            "visibility": "Suppress",
+                            "read_set": "ALL",
+                            "write_set": "NONE",
+                            "injectable": true
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let ops = walk_interrupts(&cfg).unwrap();
+        assert_eq!(
+            ops[0],
+            PolicyOp::new(policy_kind::DEFAULT_INTR_VISIBILITY, 0, 0, 2)
+        );
+        assert_eq!(
+            ops[1],
+            PolicyOp::new(policy_kind::VECTOR_VISIBILITY, 236, 0, 2)
+        );
+        // read_set = ALL -> 3 words of u64::MAX.
+        assert_eq!(ops[2], PolicyOp::new(policy_kind::VECTOR_REG_READ_SET, 236, 0, u64::MAX));
+        assert_eq!(ops[3], PolicyOp::new(policy_kind::VECTOR_REG_READ_SET, 236, 1, u64::MAX));
+        assert_eq!(ops[4], PolicyOp::new(policy_kind::VECTOR_REG_READ_SET, 236, 2, u64::MAX));
+        // write_set = NONE -> 3 words of 0.
+        assert_eq!(ops[5], PolicyOp::new(policy_kind::VECTOR_REG_WRITE_SET, 236, 0, 0));
+        assert_eq!(ops[6], PolicyOp::new(policy_kind::VECTOR_REG_WRITE_SET, 236, 1, 0));
+        assert_eq!(ops[7], PolicyOp::new(policy_kind::VECTOR_REG_WRITE_SET, 236, 2, 0));
+        // injectable=true, independent of the (also Suppress) visibility.
+        assert_eq!(ops[8], PolicyOp::new(policy_kind::VECTOR_INJECTABLE, 236, 0, 1));
     }
 
     #[test]
