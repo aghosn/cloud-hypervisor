@@ -10,7 +10,7 @@
     "api": { "allow": "ALL" },
     "interrupts": {
       "default": {
-        "visibility": "Report",
+        "visibility": "NotReport",
         "read_set": "ALL",
         "write_set": "ALL"
       }

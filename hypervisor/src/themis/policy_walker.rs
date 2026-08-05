@@ -79,12 +79,12 @@ pub(super) enum WalkError {
 
 /// Map a config `Visibility` to the engine's `InterruptVisibility` wire value.
 /// Ordering must match `capa-engine`'s `visibility_to_u64`: Deliver=0,
-/// Report=1, NotReport=2 (`Suppress` in config terms).
+/// Report=1, NotReport=2.
 fn visibility_wire_value(vis: Visibility) -> u64 {
     match vis {
         Visibility::Deliver => 0,
         Visibility::Report => 1,
-        Visibility::Suppress => 2,
+        Visibility::NotReport => 2,
     }
 }
 
@@ -664,7 +664,7 @@ mod tests {
             r#"{
                 "policies": {
                     "interrupts": {
-                        "default": { "visibility": "Suppress" }
+                        "default": { "visibility": "NotReport" }
                     }
                 }
             }"#,
@@ -683,10 +683,10 @@ mod tests {
             r#"{
                 "policies": {
                     "interrupts": {
-                        "default": { "visibility": "Suppress", "injectable": false },
+                        "default": { "visibility": "NotReport", "injectable": false },
                         "overrides": [{
                             "vector": 236,
-                            "visibility": "Suppress",
+                            "visibility": "NotReport",
                             "read_set": "ALL",
                             "write_set": "NONE",
                             "injectable": true
@@ -714,7 +714,7 @@ mod tests {
         assert_eq!(ops[5], PolicyOp::new(policy_kind::VECTOR_REG_WRITE_SET, 236, 0, 0));
         assert_eq!(ops[6], PolicyOp::new(policy_kind::VECTOR_REG_WRITE_SET, 236, 1, 0));
         assert_eq!(ops[7], PolicyOp::new(policy_kind::VECTOR_REG_WRITE_SET, 236, 2, 0));
-        // injectable=true, independent of the (also Suppress) visibility.
+        // injectable=true, independent of the (also NotReport) visibility.
         assert_eq!(ops[8], PolicyOp::new(policy_kind::VECTOR_INJECTABLE, 236, 0, 1));
     }
 

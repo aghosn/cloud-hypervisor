@@ -492,7 +492,13 @@ impl Default for VectorPolicyConfig {
 
 impl VectorPolicyConfig {
     fn default_visibility() -> Visibility {
-        Visibility::Report
+        // Must match capa-engine's `VectorPolicy::default_not_report()`
+        // blanket default for restricted domains: ambient/unowned vectors
+        // (e.g. the LAPIC timer landing on whatever domain happens to be
+        // scheduled) must NOT be raw re-injected into a domain that never
+        // asked for them. `Report` is opt-in per-vector via an explicit
+        // `overrides` entry, not a safe serde/JSON-omission fallback.
+        Visibility::NotReport
     }
 
     fn default_injectable() -> bool {
@@ -500,11 +506,15 @@ impl VectorPolicyConfig {
     }
 }
 
+/// Matches capa-engine's `InterruptVisibility` 1:1 (same names, same
+/// semantics) -- `NotReport` does **not** mean the interrupt is dropped;
+/// it is still handled by whichever ancestor domain has `Deliver` for this
+/// vector. It only means "don't *also* raw re-inject/notify me about it".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Visibility {
     Deliver,
     Report,
-    Suppress,
+    NotReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -1152,13 +1162,21 @@ mod tests {
         }
     }
 
-    /// `eunomia/policies/timer/*.json` — per-vector `injectable` policies
-    /// used to demonstrate the item-2 pattern (vector visibility `Suppress`
-    /// with `injectable: true` retained on the LAPIC-timer vector, `0xEC`/236,
-    /// so the parent keeps sole explicit control over it via
-    /// `THEMIS_INJECT_INTERRUPT` while automatic real-hardware redelivery for
-    /// every other vector is fully suppressed and non-injectable). Must parse
-    /// cleanly and resolve `extends: "standard"`.
+    /// `eunomia/policies/timer/*.json` — validates the two fixtures used to
+    /// exercise `msr_emulator.rs`'s TSC-deadline (LAPIC timer, vector
+    /// `0xEC`/236) emulation against `VectorPolicy::injectable`, the axis
+    /// `deliver_timer_vector` actually gates on (see
+    /// `capa-engine/src/domain.rs`'s doc comment on `injectable`: it governs
+    /// parent/emulated-device-driven delivery, orthogonal to `visibility`
+    /// which governs only automatic *real hardware* interrupt routing —
+    /// `visibility` defaults to `NotReport` for every vector under
+    /// `DomainPolicy::new_restricted`, so gating this emulation on
+    /// `visibility` instead would break the LAPIC timer for every
+    /// default-policy domain, not just these two fixtures).
+    /// `deliver.json`: vector 236 override `injectable: true` — timer fires.
+    /// `suppress.json`: vector 236 override `injectable: false` — timer
+    /// never fires (deadline still consumed; no hang). Must parse cleanly
+    /// and resolve `extends: "standard"`.
     #[test]
     fn eunomia_timer_interrupt_policies_parse() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1185,11 +1203,44 @@ mod tests {
                 .iter()
                 .find(|o| o.vector == 236)
                 .unwrap_or_else(|| panic!("{}: missing vector 236 override", f.display()));
-            assert!(
-                vec_236.policy.injectable,
-                "{}: expected vector 236 override injectable=true",
+            let name = f.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let expected_injectable = name != "suppress.json";
+            assert_eq!(
+                vec_236.policy.injectable, expected_injectable,
+                "{}: expected vector 236 override injectable={}",
+                f.display(),
+                expected_injectable
+            );
+        }
+    }
+
+    /// `themis/policies/dom1-{standard,confidential}.json` — dom1's own
+    /// explicit `--themis-config` policy files (see `run-dom1.sh`). These
+    /// must exist and parse cleanly so dom1 never silently falls back to
+    /// cloud-hypervisor's builtin standard/confidential profile, whose
+    /// defaults can change independently of dom1's actual requirements.
+    #[test]
+    fn dom1_policy_files_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../themis/policies");
+        assert!(dir.is_dir(), "policies dir missing: {}", dir.display());
+        for (name, extends) in [
+            ("dom1-standard.json", "standard"),
+            ("dom1-confidential.json", "confidential"),
+        ] {
+            let f = dir.join(name);
+            let cfg = ThemisConfig::load_from_file(&f)
+                .unwrap_or_else(|e| panic!("failed to load {}: {e}", f.display()));
+            assert_eq!(
+                cfg.policies.interrupts.default.visibility,
+                Visibility::NotReport,
+                "{}: dom1 must not use the ambient Report default",
                 f.display()
             );
+            // Sanity: confirm the file actually extends the profile it claims to
+            // (re-parse without resolving extends to inspect the raw field).
+            let raw = std::fs::read_to_string(&f).unwrap();
+            let unresolved: ThemisConfig = serde_json::from_str(&raw).unwrap();
+            assert_eq!(unresolved.extends.as_deref(), Some(extends));
         }
     }
 }
