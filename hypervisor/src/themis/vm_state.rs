@@ -397,6 +397,7 @@ impl ThemisVmState {
         let x2apic_virt = themis_x2apic_virt_supported();
         let mut cpuid_entries: Vec<CpuIdEntry> =
             self.cpuid_entries.lock().unwrap().clone();
+        mask_cpuid_for_themis_xsave(&mut cpuid_entries);
         if x2apic_virt {
             for entry in cpuid_entries.iter_mut() {
                 if entry.function == 1 && entry.index == 0 {
@@ -565,6 +566,61 @@ impl ThemisVmState {
     /// have to know about ThemisVmState fields.
     pub(super) fn emit_policy_op(&self, op: &PolicyOp) -> anyhow::Result<()> {
         self.set_policy(op.kind, op.key, op.sub_key, op.value)
+    }
+}
+
+fn mask_cpuid_for_themis_xsave(cpuid_entries: &mut [CpuIdEntry]) {
+    for entry in cpuid_entries {
+        match (entry.function, entry.index) {
+            (0x7, 0) => {
+                entry.ebx &= !((1 << 14)  // MPX: xstate components 3/4
+                    | (1 << 16)          // AVX512F
+                    | (1 << 17)          // AVX512DQ
+                    | (1 << 21)          // AVX512_IFMA
+                    | (1 << 26)          // AVX512PF
+                    | (1 << 27)          // AVX512ER
+                    | (1 << 28)          // AVX512CD
+                    | (1 << 30)          // AVX512BW
+                    | (1 << 31)); // AVX512VL
+                entry.ecx &= !((1 << 1)  // AVX512_VBMI
+                    | (1 << 3)           // PKU: xstate component 9
+                    | (1 << 4)           // OSPKE
+                    | (1 << 5)           // WAITPKG
+                    | (1 << 6)           // AVX512_VBMI2
+                    | (1 << 11)          // AVX512_VNNI
+                    | (1 << 12)          // AVX512_BITALG
+                    | (1 << 14)); // AVX512_VPOPCNTDQ
+                entry.edx &= !((1 << 2)  // AVX512_4VNNIW
+                    | (1 << 3)           // AVX512_4FMAPS
+                    | (1 << 8)           // AVX512_VP2INTERSECT
+                    | (1 << 22)          // AMX_BF16: xstate components 17/18
+                    | (1 << 23)          // AVX512_FP16
+                    | (1 << 24)          // AMX_TILE
+                    | (1 << 25)); // AMX_INT8
+            }
+            (0x7, 1) => {
+                entry.eax &= !(1 << 5); // AVX512_BF16
+            }
+            (0xd, 0) => {
+                entry.eax = 0x7; // x87 + SSE + AVX
+                entry.ebx = 0x340;
+                entry.ecx = 0x340;
+                entry.edx = 0;
+            }
+            (0xd, 1) => {
+                entry.eax = 0;
+                entry.ebx = 0x340;
+                entry.ecx = 0;
+                entry.edx = 0;
+            }
+            (0xd, 3..) => {
+                entry.eax = 0;
+                entry.ebx = 0;
+                entry.ecx = 0;
+                entry.edx = 0;
+            }
+            _ => {}
+        }
     }
 }
 

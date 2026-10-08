@@ -12,7 +12,6 @@ use std::ptr;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::anyhow;
-use vmm_sys_util::eventfd::EventFd;
 
 use super::abi::{
     ThemicInterceptMessage, ThemisStandardRegisters, ThhvInjectInterrupt, ThhvRegNameValue,
@@ -20,14 +19,16 @@ use super::abi::{
     THHV_SET_VP_STATE,
 };
 use super::consts::{
-    APIC_REG_EOI, APIC_REG_ICR_HIGH, APIC_REG_ICR_LOW, CPUID_LEAF_PROC_FREQ, CPUID_LEAF_TSC_FREQ,
-    EMPTY_BOOT_MSRS, EPT_VIOLATION_EXECUTE, EXIT_REASON_APIC_ACCESS, EXIT_REASON_CPUID,
-    EXIT_REASON_CR_ACCESS, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_NMI,
-    EXIT_REASON_EXTERNAL_INTERRUPT, EXIT_REASON_HLT, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR,
-    EXIT_REASON_TRIPLE_FAULT, EXIT_REASON_VMCALL, EXIT_REASON_WRMSR, ICR_DELIVERY_MODE_MASK,
-    ICR_DELIVERY_MODE_SHIFT, ICR_DEST_SHORTHAND_MASK, ICR_DEST_SHORTHAND_SHIFT, ICR_HIGH_DEST_MASK,
-    ICR_HIGH_DEST_SHIFT, ICR_MODE_FIXED, ICR_MODE_INIT, ICR_MODE_LOWEST_PRIORITY, ICR_MODE_SIPI,
-    ICR_VECTOR_MASK, LAPIC_MMIO_BASE, LAPIC_MMIO_END, LAPIC_MMIO_OFFSET_MASK, REALMODE_CODE_SEG_AR,
+    APIC_LVT_MASKED, APIC_REG_EOI, APIC_REG_ICR_HIGH, APIC_REG_ICR_LOW, APIC_REG_ISR_BASE,
+    APIC_REG_LVT_TIMER, APIC_REG_TIMER_CURRENT_COUNT, APIC_REG_TIMER_DIVIDE_CONFIG,
+    APIC_REG_TIMER_INITIAL_COUNT, CPUID_LEAF_PROC_FREQ, CPUID_LEAF_TSC_FREQ, EMPTY_BOOT_MSRS,
+    EPT_VIOLATION_EXECUTE, EXIT_REASON_APIC_ACCESS, EXIT_REASON_CPUID, EXIT_REASON_CR_ACCESS,
+    EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_NMI, EXIT_REASON_EXTERNAL_INTERRUPT,
+    EXIT_REASON_HLT, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR, EXIT_REASON_TRIPLE_FAULT,
+    EXIT_REASON_VMCALL, EXIT_REASON_WRMSR, ICR_DELIVERY_MODE_MASK, ICR_DELIVERY_MODE_SHIFT,
+    ICR_DEST_SHORTHAND_MASK, ICR_DEST_SHORTHAND_SHIFT, ICR_HIGH_DEST_MASK, ICR_HIGH_DEST_SHIFT,
+    ICR_MODE_FIXED, ICR_MODE_INIT, ICR_MODE_LOWEST_PRIORITY, ICR_MODE_SIPI, ICR_VECTOR_MASK,
+    LAPIC_MMIO_BASE, LAPIC_MMIO_END, LAPIC_MMIO_OFFSET_MASK, REALMODE_CODE_SEG_AR,
     REALMODE_DATA_SEG_AR, STANDARD_REGS, THEMIC_MSG_SHUTDOWN, THEMIS_EXIT_DOORBELL, VpRegister,
 };
 use super::emulator;
@@ -41,15 +42,8 @@ use crate::{CpuState, MpState};
 
 // ── Host TSC frequency discovery ───────────────────────────────────────── //
 //
-// Both `Vcpu::tsc_khz()` and the IA32_TSC_DEADLINE WRMSR handler need to
-// know the host TSC rate in kHz.  The value is process-global, so we cache
-// it once via the CPUID-based discovery used by `tsc_khz()`.  Behaviour
-// matches the previous `tsc_khz()` method exactly.
-
-/// Last-resort fallback when CPUID leaves 0x15 *and* 0x16 both fail.  Loud
-/// log line at first use so a wrong value is noticed.  Tracked as the
-/// `chv-tsc-khz-from-cpuid` bug todo if it ever fires in practice.
-const TSC_KHZ_FALLBACK: u32 = 3_000_000;
+// Used to report the guest-visible TSC frequency. Capavisor owns local timer
+// delivery, so CHV no longer uses this for IA32_TSC_DEADLINE arithmetic.
 
 static HOST_TSC_KHZ: OnceLock<Option<u32>> = OnceLock::new();
 
@@ -86,26 +80,6 @@ fn discover_host_tsc_khz() -> Option<u32> {
     })
 }
 
-/// Like [`discover_host_tsc_khz`] but always returns a value.  When CPUID
-/// discovery fails we log once and fall back to a 3 GHz placeholder.  Used
-/// in places (notably TSC-deadline arithmetic) where a panic or `None`
-/// branch would be worse than a stale-but-plausible value.
-fn host_tsc_khz_or_fallback() -> u32 {
-    static WARNED: OnceLock<()> = OnceLock::new();
-    if let Some(v) = discover_host_tsc_khz() {
-        v
-    } else {
-        WARNED.get_or_init(|| {
-            eprintln!(
-                "\r[THEMIS] WARNING: CPUID 0x15/0x16 reported no TSC frequency, \
-                 falling back to {} kHz — TSC-deadline timer accuracy may suffer",
-                TSC_KHZ_FALLBACK
-            );
-        });
-        TSC_KHZ_FALLBACK
-    }
-}
-
 pub struct ThemisVcpu {
     pub(super) fd: OwnedFd,
     pub(super) _vp_index: u32,
@@ -116,12 +90,6 @@ pub struct ThemisVcpu {
     /// CPUID policy set by CHV via set_cpuid2() before the first run.
     /// Searched by (function, index) on every CPUID exit.
     pub(super) cpuid: std::sync::Mutex<Vec<CpuIdEntry>>,
-    /// LAPIC timer emulation: timerfd armed to the TSC deadline.
-    /// A background thread reads the timerfd and signals `timer_irq`.
-    pub(super) timer_fd: OwnedFd,
-    /// EventFd registered as irqfd for LOCAL_TIMER_VECTOR (0xEC).
-    /// Signalled by the timer thread when the deadline fires.
-    pub(super) _timer_irq: EventFd,
     /// Per-vCPU shadow of Trap-policy MSRs.  When the capavisor forwards
     /// a WRMSR exit for an MSR whose per-domain policy is Trap and CHV
     /// has no dedicated emulator (TSC_DEADLINE / X2APIC_ICR), the write
@@ -525,16 +493,15 @@ impl ThemisVcpu {
             return Ok(VmExit::Shutdown);
         }
 
-        // Log the first few exits for visibility (no AP-specific logging today).
-        static EXIT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let en = EXIT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if en < 5 {
-            eprintln!(
-                "\r[THEMIS-EXIT] #{en} vp={} reason={} rip={:#x} msr_num={:#x} qual={:#x} gpa={:#x}",
-                self._vp_index, msg.exit_reason, msg.guest_rip, msg.msr_number,
-                msg.exit_qualification, msg.guest_physical_address
-            );
-        }
+        log::debug!(
+            "[THEMIS-EXIT] vp={} reason={} rip={:#x} msr_num={:#x} qual={:#x} gpa={:#x}",
+            self._vp_index,
+            msg.exit_reason,
+            msg.guest_rip,
+            msg.msr_number,
+            msg.exit_qualification,
+            msg.guest_physical_address
+        );
 
         // Exit reason 33 = VM-entry failure due to invalid guest state.
         // Capavisor should have already panicked with a full VMCS dump, but
@@ -607,32 +574,11 @@ impl ThemisVcpu {
         }
     }
 
-    /// Handle WRMSR exit — specifically IA32_TSC_DEADLINE (0x6E0) for LAPIC
-    /// timer emulation.  The guest wrote a TSC deadline value; we arm a
-    /// timerfd so the interrupt fires at the right wall-clock time.
+    /// Handle WRMSR exits forwarded to CHV.
     ///
-    /// The TSC kHz used here is read from host CPUID (leaf 0x15 / 0x16) via
-    /// [`host_tsc_khz_or_fallback`]; the same value backs the guest-visible
-    /// `Vcpu::tsc_khz()`, so the two cannot drift.
     fn handle_wrmsr_exit(&self, msg: &ThemicInterceptMessage) {
         const IA32_TSC_DEADLINE: u32 = 0x6E0;
         const IA32_X2APIC_ICR: u32 = 0x830;
-        // Host TSC kHz (CPUID 0x15/0x16, falling back to a 3 GHz placeholder
-        // with a one-shot warning).  Same value the guest sees via
-        // `Vcpu::tsc_khz()`, so the two cannot drift.
-        let tsc_khz: u64 = host_tsc_khz_or_fallback() as u64;
-
-        // Log ALL WRMSR exits (first 20 + every 100th) to verify trapping works.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static WRMSR_COUNT: AtomicU64 = AtomicU64::new(0);
-        let n = WRMSR_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 20 || n % 100 == 0 {
-            eprintln!(
-                "\r[THEMIS-MSR] #{n} WRMSR msr={:#x} val={:#x} rip={:#x}",
-                msg.msr_number, msg.msr_value, msg.guest_rip
-            );
-        }
-
         if msg.msr_number == IA32_X2APIC_ICR {
             // x2APIC ICR is a 64-bit MSR: bits [31:0] = ICR_LOW (same
             // layout as xAPIC ICR_LOW), bits [63:32] = destination APIC
@@ -649,93 +595,20 @@ impl ThemisVcpu {
             return;
         }
 
-        if msg.msr_number != IA32_TSC_DEADLINE {
-            // Unknown Trap-forwarded WRMSR: stash the value in the
-            // per-vCPU shadow so a subsequent RDMSR returns it.  The
-            // physical MSR is never touched — Trap means the parent owns
-            // the guest-visible value.  Guest RIP was already advanced
-            // by capavisor's forward_child_exit path (switch.rs), so we
-            // just record the write and return.
-            if let Ok(mut shadow) = self.msr_shadow.lock() {
-                shadow.insert(msg.msr_number, msg.msr_value);
-            }
+        if msg.msr_number == IA32_TSC_DEADLINE {
             return;
         }
 
-        let deadline_tsc = msg.msr_value;
-
-        if deadline_tsc == 0 {
-            // Disarm: guest cancelled the timer.
-            let disarm = libc::itimerspec {
-                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-                it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            };
-            unsafe {
-                libc::timerfd_settime(
-                    self.timer_fd.as_raw_fd(), 0, &disarm, std::ptr::null_mut(),
-                );
-            }
-            return;
+        // Unknown Trap-forwarded WRMSR: stash the value in the per-vCPU shadow
+        // so a subsequent RDMSR returns it. Trap means CHV owns the
+        // guest-visible value, not the physical MSR.
+        if let Ok(mut shadow) = self.msr_shadow.lock() {
+            shadow.insert(msg.msr_number, msg.msr_value);
         }
+    }
 
-        let now_tsc = unsafe { std::arch::x86_64::_rdtsc() };
-
-        // Debug: log timing for first 20 + every 100th
-        if n < 20 || n % 100 == 0 {
-            let diff = if deadline_tsc > now_tsc {
-                deadline_tsc - now_tsc
-            } else {
-                0
-            };
-            // Convert TSC ticks → microseconds exactly:
-            //   us = ticks * 1_000 / tsc_khz
-            // u128 to avoid overflow on multi-second deltas at GHz rates.
-            let diff_us = ((diff as u128) * 1_000 / tsc_khz as u128) as u64;
-            eprintln!(
-                "\r[THEMIS-TIMER] #{n} deadline={:#x} now={:#x} delta_tsc={} ({} us)",
-                deadline_tsc, now_tsc, diff, diff_us
-            );
-        }
-
-        if now_tsc >= deadline_tsc {
-            // Already expired — inject immediately via the irqfd.
-            // The timer thread's EventFd is backed by the same irqfd, but
-            // the fastest path is to arm the timerfd with a minimal delay.
-            let fire_now = libc::itimerspec {
-                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-                it_value: libc::timespec { tv_sec: 0, tv_nsec: 1 },
-            };
-            unsafe {
-                libc::timerfd_settime(
-                    self.timer_fd.as_raw_fd(), 0, &fire_now, std::ptr::null_mut(),
-                );
-            }
-            return;
-        }
-
-        let delta_tsc = deadline_tsc - now_tsc;
-        // Convert TSC ticks → nanoseconds exactly:
-        //   ns = ticks * 1_000_000 / tsc_khz
-        // u128 to avoid overflow on multi-second deltas at GHz rates.
-        // (Worst-case `delta_tsc * 1_000_000` is < 2^84 for a 1-day deadline
-        // at 5 GHz, well within u128.)
-        let delta_ns = ((delta_tsc as u128) * 1_000_000 / tsc_khz as u128) as u64;
-
-        let tv_sec = (delta_ns / 1_000_000_000) as i64;
-        let tv_nsec = (delta_ns % 1_000_000_000) as i64;
-
-        let arm = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec {
-                tv_sec,
-                tv_nsec: if tv_sec == 0 && tv_nsec == 0 { 1 } else { tv_nsec },
-            },
-        };
-        unsafe {
-            libc::timerfd_settime(
-                self.timer_fd.as_raw_fd(), 0, &arm, std::ptr::null_mut(),
-            );
-        }
+    fn reprogram_lapic_mmio_timer(&self, lvtt: u32, initial_count: u32, divide_config: u32) {
+        let _ = (lvtt, initial_count, divide_config);
     }
 
     /// Handle a Trap-forwarded RDMSR VM exit.
@@ -913,15 +786,10 @@ impl ThemisVcpu {
             return Ok(());
         }
 
-        // Debug: log first few IO exits to verify the path works.
-        static IO_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = IO_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 20 || (n < 200 && n % 50 == 0) {
-            eprintln!(
-                "\r[THEMIS-IO] #{} port=0x{:x} size={} write={} rax=0x{:x}",
-                n, msg.port_number, len, msg.is_write, msg.rax
-            );
-        }
+        log::debug!(
+            "[THEMIS-IO] port=0x{:x} size={} write={} rax=0x{:x}",
+            msg.port_number, len, msg.is_write, msg.rax
+        );
 
         if msg.is_write != 0 {
             if let Some(vm_ops) = &self.vm_ops {
@@ -961,6 +829,8 @@ impl ThemisVcpu {
     }
 
     fn handle_mmio_exit(&mut self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
+        use iced_x86::{Code, Decoder, DecoderOptions};
+
         // Strip the VTOM bit from the GPA. CoCo guests set this bit on MMIO
         // addresses to mark them as shared.  The device model only knows the
         // canonical (non-VTOM'd) addresses.  Skip when not confidential.
@@ -993,6 +863,54 @@ impl ThemisVcpu {
             ));
         }
 
+        let mut decoder = Decoder::with_ip(
+            64,
+            &msg.instruction_bytes,
+            msg.guest_rip,
+            DecoderOptions::NONE,
+        );
+        let insn = decoder.decode();
+        let insn_len = insn.len() as u64;
+
+        let read_size = match insn.code() {
+            Code::Mov_r8_rm8 => Some(1usize),
+            Code::Mov_r16_rm16 => Some(2usize),
+            Code::Mov_r32_rm32 => Some(4usize),
+            Code::Mov_r64_rm64 => Some(8usize),
+            _ => None,
+        };
+
+        if let Some(read_size) = read_size {
+            let vm_ops = self.vm_ops().ok_or_else(|| {
+                HypervisorCpuError::RunVcpu(anyhow::anyhow!("MMIO read: no vm_ops").into())
+            })?;
+            let mut data = [0u8; 8];
+            vm_ops.mmio_read(gpa, &mut data[..read_size]).map_err(|e| {
+                HypervisorCpuError::RunVcpu(anyhow::anyhow!("MMIO read: {e}").into())
+            })?;
+            let value = u64::from_le_bytes(data);
+
+            let gregs = self.get_regs().map_err(|e| {
+                HypervisorCpuError::RunVcpu(anyhow::anyhow!("get_regs: {e}").into())
+            })?;
+            let mut gregs = match gregs {
+                crate::StandardRegisters::Themis(r) => r,
+                #[allow(unreachable_patterns)]
+                _ => {
+                    return Err(HypervisorCpuError::RunVcpu(
+                        anyhow::anyhow!("unexpected register type").into(),
+                    ));
+                }
+            };
+            Self::write_iced_reg(&mut gregs, insn.op0_register(), value);
+            gregs.rip += insn_len;
+            self.set_regs(&crate::StandardRegisters::Themis(gregs))
+                .map_err(|e| {
+                    HypervisorCpuError::RunVcpu(anyhow::anyhow!("set_regs: {e}").into())
+                })?;
+            return Ok(());
+        }
+
         // Use the iced-x86 emulator to decode and emulate the faulting instruction.
         // This handles MOV, MOVZX, CMP, MOVS, STOS, OR, etc. — far more than
         // the old hand-rolled decoder in the capavisor.
@@ -1007,8 +925,6 @@ impl ThemisVcpu {
             },
         };
 
-        let old_rip = msg.guest_rip;
-
         let mut emu = crate::arch::x86::emulator::Emulator::new(&mut ctx);
         let new_state = emu
             .emulate_first_insn(0, &msg.instruction_bytes)
@@ -1020,20 +936,12 @@ impl ThemisVcpu {
                 HypervisorCpuError::RunVcpu(anyhow::anyhow!("MMIO emulation failed: {e}").into())
             })?;
 
-        // Debug: log first few MMIO emulations
-        static MMIO_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let mn = MMIO_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let new_rip = match &new_state.regs {
-            crate::StandardRegisters::Themis(r) => r.rip,
-            #[allow(unreachable_patterns)]
-            _ => 0,
-        };
-        if mn < 20 || (mn < 500 && mn % 50 == 0) || mn % 1000 == 0 {
-            eprintln!(
-                "\r[MMIO-DBG] #{mn} gpa={:#x} old_rip={:#x} new_rip={:#x} insn={:02x?}",
-                gpa, old_rip, new_rip, &msg.instruction_bytes[..6],
-            );
-        }
+        log::debug!(
+            "[MMIO] gpa={:#x} rip={:#x} insn={:02x?}",
+            gpa,
+            msg.guest_rip,
+            &msg.instruction_bytes[..6],
+        );
 
         // Write back GP registers + RIP (MMIO instructions don't modify CRs/sregs).
         self.set_regs(&new_state.regs)
@@ -1056,6 +964,15 @@ impl ThemisVcpu {
 
         let offset = (msg.guest_physical_address & LAPIC_MMIO_OFFSET_MASK) as u32;
         let is_write = (msg.exit_qualification >> 1) & 1 != 0;
+        if is_write
+            && offset == APIC_REG_EOI
+            && msg.instruction_bytes[0] == 0x89
+            && msg.instruction_bytes[1] == 0x04
+            && msg.instruction_bytes[2] == 0x25
+        {
+            self.handle_lapic_eoi(msg.guest_rip + 7)?;
+            return Ok(());
+        }
 
         // Decode the faulting instruction.
         let mut decoder = Decoder::with_ip(
@@ -1068,7 +985,7 @@ impl ThemisVcpu {
         let insn_len = insn.len() as u64;
 
         if insn_len == 0 {
-            eprintln!(
+            log::debug!(
                 "\r[LAPIC] failed to decode insn at RIP={:#x} bytes={:02x?}",
                 msg.guest_rip,
                 &msg.instruction_bytes[..8]
@@ -1076,6 +993,10 @@ impl ThemisVcpu {
             return Err(HypervisorCpuError::RunVcpu(
                 anyhow::anyhow!("LAPIC MMIO: instruction decode failed").into(),
             ));
+        }
+        if is_write && offset == APIC_REG_EOI {
+            self.handle_lapic_eoi(msg.guest_rip + insn_len)?;
+            return Ok(());
         }
 
         // Read current GP register state from the guest VMCS.
@@ -1128,6 +1049,9 @@ impl ThemisVcpu {
                 let vp = self._vp_index as usize;
                 if vp < lapic.len() {
                     lapic[vp][(offset / 4) as usize] = value;
+                    if offset == APIC_REG_TIMER_INITIAL_COUNT {
+                        lapic[vp][(APIC_REG_TIMER_CURRENT_COUNT / 4) as usize] = value;
+                    }
                 }
             }
 
@@ -1144,21 +1068,49 @@ impl ThemisVcpu {
                     self.deliver_ipi(value, icr_high);
                 }
                 APIC_REG_EOI => {
-                    // EOI — no action needed; interrupt injection uses VMENTRY.
+                    let mut lapic = self.vm_state.lapic_regs.lock().unwrap();
+                    let vp = self._vp_index as usize;
+                    if vp < lapic.len() {
+                        for word in (0..8usize).rev() {
+                            let idx = (APIC_REG_ISR_BASE / 4) as usize + word;
+                            let isr = lapic[vp][idx];
+                            if isr != 0 {
+                                let bit = 31 - isr.leading_zeros();
+                                lapic[vp][idx] = isr & !(1u32 << bit);
+                                log::debug!(
+                                    "[LAPIC-EOI] vp={} cleared isr_word={} bit={} old={:#x}",
+                                    self._vp_index, word, bit, isr
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                APIC_REG_LVT_TIMER
+                | APIC_REG_TIMER_INITIAL_COUNT
+                | APIC_REG_TIMER_DIVIDE_CONFIG => {
+                    let (lvtt, initial_count, divide_config) = {
+                        let lapic = self.vm_state.lapic_regs.lock().unwrap();
+                        let vp = self._vp_index as usize;
+                        if vp < lapic.len() {
+                            (
+                                lapic[vp][(APIC_REG_LVT_TIMER / 4) as usize],
+                                lapic[vp][(APIC_REG_TIMER_INITIAL_COUNT / 4) as usize],
+                                lapic[vp][(APIC_REG_TIMER_DIVIDE_CONFIG / 4) as usize],
+                            )
+                        } else {
+                            (APIC_LVT_MASKED, 0, 0)
+                        }
+                    };
+                    self.reprogram_lapic_mmio_timer(lvtt, initial_count, divide_config);
                 }
                 _ => {}
             }
 
-            // Debug: log first few LAPIC writes.
-            static LAPIC_W_LOG: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = LAPIC_W_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 30 || n % 500 == 0 {
-                eprintln!(
-                    "\r[LAPIC-W] #{n} vp={} offset={:#x} value={:#x}",
-                    self._vp_index, offset, value
-                );
-            }
+            log::debug!(
+                "[LAPIC-W] vp={} offset={:#x} value={:#x}",
+                self._vp_index, offset, value
+            );
         } else {
             // Read: return per-vCPU register value.
             let value = {
@@ -1176,15 +1128,10 @@ impl ThemisVcpu {
                 Self::write_iced_reg(&mut gregs, insn.op0_register(), value as u64);
             }
 
-            static LAPIC_R_LOG: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = LAPIC_R_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 30 || n % 500 == 0 {
-                eprintln!(
-                    "\r[LAPIC-R] #{n} vp={} offset={:#x} value={:#x}",
-                    self._vp_index, offset, value
-                );
-            }
+            log::debug!(
+                "[LAPIC-R] vp={} offset={:#x} value={:#x}",
+                self._vp_index, offset, value
+            );
         }
 
         // Advance RIP past the faulting instruction.
@@ -1193,6 +1140,36 @@ impl ThemisVcpu {
             .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("set_regs: {e}").into()))?;
 
         Ok(())
+    }
+
+    fn handle_lapic_eoi(&self, next_rip: u64) -> cpu::Result<()> {
+        {
+            let mut lapic = self.vm_state.lapic_regs.lock().unwrap();
+            let vp = self._vp_index as usize;
+            if vp < lapic.len() {
+                lapic[vp][(APIC_REG_EOI / 4) as usize] = 0;
+                for word in (0..8usize).rev() {
+                    let idx = (APIC_REG_ISR_BASE / 4) as usize + word;
+                    let isr = lapic[vp][idx];
+                    if isr != 0 {
+                        let bit = 31 - isr.leading_zeros();
+                        lapic[vp][idx] = isr & !(1u32 << bit);
+                        eprintln!(
+                            "\r[LAPIC-EOI] vp={} cleared isr_word={} bit={} old={:#x}",
+                            self._vp_index, word, bit, isr
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.set_reg_values(&[reg(VpRegister::Rip, next_rip)])
+            .map_err(|e| {
+                HypervisorCpuError::RunVcpu(
+                    anyhow::anyhow!("set RIP after decoded EOI: {e}").into(),
+                )
+            })
     }
 
     /// Read a guest GPR value by iced-x86 Register enum.

@@ -6,11 +6,10 @@
 //! trust model carry `// Owned by capavisor:` comments.
 
 use std::any::Any;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use libc::c_void;
 use vfio_ioctls::VfioDeviceFd;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -106,66 +105,6 @@ impl vm::Vm for ThemisVm {
             ioctl_with_mut_ref_ret_fd(self.state.fd.as_raw_fd(), THHV_CREATE_VP, &mut create)
                 .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
 
-        // ── LAPIC timer emulation ──
-        // Create a timerfd that the vCPU run-loop reprograms on each
-        // WRMSR IA32_TSC_DEADLINE (0x6E0).  A background thread bridges
-        // timerfd expirations to an irqfd → thhv injects vector 0xEC.
-        const LOCAL_TIMER_VECTOR: u32 = 0xEC;
-        let timer_fd = unsafe {
-            let fd = libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC);
-            if fd < 0 {
-                return Err(vm::HypervisorVmError::CreateVcpu(
-                    std::io::Error::last_os_error().into(),
-                ));
-            }
-            OwnedFd::from_raw_fd(fd)
-        };
-
-        let timer_irq = EventFd::new(libc::EFD_CLOEXEC)
-            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-
-        // Register the EventFd as an irqfd for vector 0xEC, targeting this vCPU.
-        {
-            let mut irqfd = ThhvIrqfd {
-                fd: timer_irq.as_raw_fd(),
-                gsi: LOCAL_TIMER_VECTOR,
-                flags: 0,
-                vector: LOCAL_TIMER_VECTOR,
-                vp_index: id as u32,
-                rsvd: 0,
-            };
-            ioctl_with_mut_ref(self.state.fd.as_raw_fd(), THHV_IRQFD, &mut irqfd)
-                .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-        }
-
-        // Spawn a thread that waits on timerfd and signals the irqfd.
-        let irq_clone = timer_irq.try_clone().unwrap();
-        let timer_fd_dup = unsafe {
-            let raw = libc::dup(timer_fd.as_raw_fd());
-            assert!(raw >= 0, "dup(timer_fd) failed");
-            OwnedFd::from_raw_fd(raw)
-        };
-        std::thread::Builder::new()
-            .name(format!("lapic-timer-{id}"))
-            .spawn(move || {
-                let raw = timer_fd_dup.as_raw_fd();
-                let mut buf = [0u8; 8];
-                loop {
-                    let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut c_void, 8) };
-                    if n <= 0 {
-                        break;
-                    }
-                    let _ = irq_clone.write(1);
-                }
-                drop(timer_fd_dup);
-            })
-            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
-
-        eprintln!(
-            "\r[THEMIS-DBG] vCPU {id}: LAPIC timer emulation ready (timerfd={}, irqfd vec=0x{LOCAL_TIMER_VECTOR:X})",
-            timer_fd.as_raw_fd()
-        );
-
         // Register VP fd for cross-vCPU state updates (SIPI delivery).
         {
             let raw_fd = vcpu_fd.as_raw_fd();
@@ -223,8 +162,6 @@ impl vm::Vm for ThemisVm {
             _meta: meta,
             _comm: comm,
             cpuid: std::sync::Mutex::new(Vec::new()),
-            timer_fd,
-            _timer_irq: timer_irq,
             msr_shadow: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
@@ -345,8 +282,8 @@ impl vm::Vm for ThemisVm {
                     if e.is_msi {
                         let vector = (e.msi_data & ICR_VECTOR_MASK) as u8;
                         // MSI address bits [19:12] = destination APIC ID
-                        let dest_apic = ((e.msi_address_lo >> MSI_ADDR_DEST_ID_SHIFT) & MSI_ADDR_DEST_ID_MASK) as u8;
-                        eprintln!("\r[THEMIS-DBG] gsi_routing: gsi={} → msi_vector={} dest_apic={}", e.gsi, vector, dest_apic);
+                        let dest_apic = ((e.msi_address_lo >> MSI_ADDR_DEST_ID_SHIFT)
+                            & MSI_ADDR_DEST_ID_MASK) as u8;
                         map.insert(e.gsi, (vector, dest_apic));
                     }
                 }

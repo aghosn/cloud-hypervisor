@@ -9,18 +9,17 @@
 //! `themis-abi` (the single source of truth shared with capavisor, thhv, and
 //! libthemis) rather than re-defined here.
 
-use crate::arch::x86::MsrEntry;
-
+// SIPI real-mode segment access rights (VMX encoding).
+// Domain-comm message types.
+pub(super) use themis_abi::regs::THEMIC_MSG_SHUTDOWN;
 // ── Re-exports from the shared `themis-abi` crate ────────────────────────── //
 // VpRegister enum (used as u64 register-id over the THHV ioctl wire).
 pub(super) use themis_abi::regs::VpRegister;
+pub(super) use themis_abi::regs::access_rights::{
+    CODE16 as REALMODE_CODE_SEG_AR, DATA16 as REALMODE_DATA_SEG_AR,
+};
 // Synthetic exit reason injected by capavisor (high bit set, not an SDM value).
 pub(super) use themis_abi::synthetic_exits::THEMIS_EXIT_DOORBELL;
-// Domain-comm message types.
-pub(super) use themis_abi::regs::THEMIC_MSG_SHUTDOWN;
-// SIPI real-mode segment access rights (VMX encoding).
-pub(super) use themis_abi::regs::access_rights::CODE16 as REALMODE_CODE_SEG_AR;
-pub(super) use themis_abi::regs::access_rights::DATA16 as REALMODE_DATA_SEG_AR;
 // Intel SDM VMX basic exit reasons (Intel SDM Vol 3C §27.2.1, Appendix C).
 pub(super) use themis_abi::vmx_exit_reasons::{
     APIC_ACCESS as EXIT_REASON_APIC_ACCESS, CPUID as EXIT_REASON_CPUID,
@@ -31,6 +30,8 @@ pub(super) use themis_abi::vmx_exit_reasons::{
     TRIPLE_FAULT as EXIT_REASON_TRIPLE_FAULT, VMCALL as EXIT_REASON_VMCALL,
     WRMSR as EXIT_REASON_WRMSR,
 };
+
+use crate::arch::x86::MsrEntry;
 
 pub(super) const THHV_IOCTL_MAGIC: u8 = 0xB8;
 pub(super) const THHV_SCHED_SYNC: u32 = 0;
@@ -79,7 +80,15 @@ pub(super) use themis_abi::MAX_VPS_PER_DOMAIN as THEMIS_MAX_VCPUS;
 // ── APIC register offsets (Intel SDM Vol 3A §10.4.1) ──────────────────────
 pub(super) const APIC_REG_ICR_LOW: u32 = 0x300;
 pub(super) const APIC_REG_ICR_HIGH: u32 = 0x310;
+pub(super) const APIC_REG_LVT_TIMER: u32 = 0x320;
+pub(super) const APIC_REG_TIMER_INITIAL_COUNT: u32 = 0x380;
+pub(super) const APIC_REG_TIMER_CURRENT_COUNT: u32 = 0x390;
+pub(super) const APIC_REG_TIMER_DIVIDE_CONFIG: u32 = 0x3E0;
 pub(super) const APIC_REG_EOI: u32 = 0x0B0;
+pub(super) const APIC_REG_ISR_BASE: u32 = 0x100;
+
+// ── LAPIC timer bit fields (Intel SDM Vol 3A §10.5.4) ────────────────────
+pub(super) const APIC_LVT_MASKED: u32 = 1 << 16;
 
 // ── ICR bit fields (Intel SDM Vol 3A §10.6.1) ────────────────────────────
 pub(super) const ICR_VECTOR_MASK: u32 = 0xFF;
