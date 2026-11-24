@@ -1236,6 +1236,19 @@ mod tests {
                 "{}: dom1 must not use the ambient Report default",
                 f.display()
             );
+            let deadline = cfg
+                .policies
+                .msrs
+                .overrides
+                .iter()
+                .find(|o| o.msr == Some(0x6E0))
+                .expect("dom1 needs a parent-owned TSC-deadline timer");
+            assert_eq!(
+                deadline.action,
+                OverrideAction::Trap,
+                "{}: the parent timer must wake parked VPs",
+                f.display()
+            );
             // Sanity: confirm the file actually extends the profile it claims to
             // (re-parse without resolving extends to inspect the raw field).
             let raw = std::fs::read_to_string(&f).unwrap();

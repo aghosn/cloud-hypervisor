@@ -278,9 +278,8 @@ impl ThemisVmState {
             // transition entirely.  WRMSR is consumed (no-op) by capavisor's
             // msr_emulator handler to prevent the guest from disabling EXTD.
             //
-            //   bit 8  (BSP):  intentionally NOT set — Linux derives BSP from
-            //                  the MADT, and the per-domain policy is the same
-            //                  value for all vCPUs.
+            //   bit 8  (BSP):  supplied per-VP by capavisor's RDMSR emulator;
+            //                  the remaining policy value is domain-wide.
             //   bit 10 (EXTD): x2APIC mode enabled.
             //   bit 11 (EN):   xAPIC global enable (also required for x2APIC).
             //   bits 35:12     LAPIC base physical frame (0xFEE00 << 12).
