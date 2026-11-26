@@ -9,26 +9,25 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use anyhow::anyhow;
-use vmm_sys_util::eventfd::EventFd;
 
 use super::abi::{
+    THHV_GET_VP_STATE, THHV_INJECT_INTERRUPT, THHV_RUN_VP, THHV_SET_VP_STATE,
     ThemicInterceptMessage, ThemisStandardRegisters, ThhvInjectInterrupt, ThhvRegNameValue,
-    ThhvRunVp, ThhvVpRegisters, THHV_GET_VP_STATE, THHV_INJECT_INTERRUPT, THHV_RUN_VP,
-    THHV_SET_VP_STATE,
+    ThhvRunVp, ThhvVpRegisters,
 };
 use super::consts::{
-    APIC_REG_EOI, APIC_REG_ICR_HIGH, APIC_REG_ICR_LOW, CPUID_LEAF_PROC_FREQ, CPUID_LEAF_TSC_FREQ,
-    EMPTY_BOOT_MSRS, EPT_VIOLATION_EXECUTE, EXIT_REASON_APIC_ACCESS, EXIT_REASON_CPUID,
-    EXIT_REASON_CR_ACCESS, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_NMI,
-    EXIT_REASON_EXTERNAL_INTERRUPT, EXIT_REASON_HLT, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR,
-    EXIT_REASON_TRIPLE_FAULT, EXIT_REASON_VMCALL, EXIT_REASON_WRMSR, ICR_DELIVERY_MODE_MASK,
-    ICR_DELIVERY_MODE_SHIFT, ICR_DEST_SHORTHAND_MASK, ICR_DEST_SHORTHAND_SHIFT, ICR_HIGH_DEST_MASK,
-    ICR_HIGH_DEST_SHIFT, ICR_MODE_FIXED, ICR_MODE_INIT, ICR_MODE_LOWEST_PRIORITY, ICR_MODE_SIPI,
-    ICR_VECTOR_MASK, LAPIC_MMIO_BASE, LAPIC_MMIO_END, LAPIC_MMIO_OFFSET_MASK, REALMODE_CODE_SEG_AR,
-    REALMODE_DATA_SEG_AR, STANDARD_REGS, THEMIC_MSG_SHUTDOWN, THEMIS_EXIT_DOORBELL, VpRegister,
+    APIC_REG_EOI, APIC_REG_ICR_HIGH, APIC_REG_ICR_LOW, EMPTY_BOOT_MSRS, EPT_VIOLATION_EXECUTE,
+    EXIT_REASON_APIC_ACCESS, EXIT_REASON_CPUID, EXIT_REASON_CR_ACCESS, EXIT_REASON_EPT_VIOLATION,
+    EXIT_REASON_EXCEPTION_NMI, EXIT_REASON_EXTERNAL_INTERRUPT, EXIT_REASON_HLT,
+    EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR, EXIT_REASON_TRIPLE_FAULT, EXIT_REASON_VMCALL,
+    EXIT_REASON_WRMSR, ICR_DELIVERY_MODE_MASK, ICR_DELIVERY_MODE_SHIFT, ICR_DEST_SHORTHAND_MASK,
+    ICR_DEST_SHORTHAND_SHIFT, ICR_HIGH_DEST_MASK, ICR_HIGH_DEST_SHIFT, ICR_MODE_FIXED,
+    ICR_MODE_INIT, ICR_MODE_LOWEST_PRIORITY, ICR_MODE_SIPI, ICR_VECTOR_MASK, LAPIC_MMIO_BASE,
+    LAPIC_MMIO_END, LAPIC_MMIO_OFFSET_MASK, REALMODE_CODE_SEG_AR, REALMODE_DATA_SEG_AR,
+    STANDARD_REGS, THEMIC_MSG_SHUTDOWN, VpRegister,
 };
 use super::emulator;
 use super::helpers::{ioctl_with_mut_ref, reg, segment_from_raw, segment_regs};
@@ -38,73 +37,6 @@ use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegist
 use crate::cpu::{self, HypervisorCpuError, Vcpu, VmExit};
 use crate::vm::VmOps;
 use crate::{CpuState, MpState};
-
-// ── Host TSC frequency discovery ───────────────────────────────────────── //
-//
-// Both `Vcpu::tsc_khz()` and the IA32_TSC_DEADLINE WRMSR handler need to
-// know the host TSC rate in kHz.  The value is process-global, so we cache
-// it once via the CPUID-based discovery used by `tsc_khz()`.  Behaviour
-// matches the previous `tsc_khz()` method exactly.
-
-/// Last-resort fallback when CPUID leaves 0x15 *and* 0x16 both fail.  Loud
-/// log line at first use so a wrong value is noticed.  Tracked as the
-/// `chv-tsc-khz-from-cpuid` bug todo if it ever fires in practice.
-const TSC_KHZ_FALLBACK: u32 = 3_000_000;
-
-static HOST_TSC_KHZ: OnceLock<Option<u32>> = OnceLock::new();
-
-/// CPUID-derived host TSC kHz, or `None` if neither leaf 0x15 nor leaf 0x16
-/// produced a usable value.  Computed once and cached.
-fn discover_host_tsc_khz() -> Option<u32> {
-    *HOST_TSC_KHZ.get_or_init(|| {
-        // Leaf 0x15: TSC/Crystal ratio (Intel SDM Vol. 3A §18.7.3).
-        // EBX/EAX is the TSC-to-crystal multiplier/denominator; ECX is the
-        // crystal frequency in Hz.  If ECX is 0 (common on older CPUs) we
-        // fall back to the Tiger/Ice-Lake nominal 19.2 MHz crystal.
-        let leaf15 = std::arch::x86_64::__cpuid(CPUID_LEAF_TSC_FREQ);
-        if leaf15.eax != 0 && leaf15.ebx != 0 {
-            let crystal_hz = if leaf15.ecx != 0 {
-                leaf15.ecx as u64
-            } else {
-                19_200_000u64
-            };
-            let tsc_khz =
-                (crystal_hz * leaf15.ebx as u64 / leaf15.eax as u64 / 1000) as u32;
-            if tsc_khz > 0 {
-                return Some(tsc_khz);
-            }
-        }
-
-        // Leaf 0x16: Processor Frequency Information.
-        // EAX[15:0] = processor base frequency in MHz.
-        let leaf16 = std::arch::x86_64::__cpuid(CPUID_LEAF_PROC_FREQ);
-        if (leaf16.eax & 0xffff) != 0 {
-            return Some((leaf16.eax & 0xffff) * 1000);
-        }
-
-        None
-    })
-}
-
-/// Like [`discover_host_tsc_khz`] but always returns a value.  When CPUID
-/// discovery fails we log once and fall back to a 3 GHz placeholder.  Used
-/// in places (notably TSC-deadline arithmetic) where a panic or `None`
-/// branch would be worse than a stale-but-plausible value.
-fn host_tsc_khz_or_fallback() -> u32 {
-    static WARNED: OnceLock<()> = OnceLock::new();
-    if let Some(v) = discover_host_tsc_khz() {
-        v
-    } else {
-        WARNED.get_or_init(|| {
-            eprintln!(
-                "\r[THEMIS] WARNING: CPUID 0x15/0x16 reported no TSC frequency, \
-                 falling back to {} kHz — TSC-deadline timer accuracy may suffer",
-                TSC_KHZ_FALLBACK
-            );
-        });
-        TSC_KHZ_FALLBACK
-    }
-}
 
 pub struct ThemisVcpu {
     pub(super) fd: OwnedFd,
@@ -116,12 +48,7 @@ pub struct ThemisVcpu {
     /// CPUID policy set by CHV via set_cpuid2() before the first run.
     /// Searched by (function, index) on every CPUID exit.
     pub(super) cpuid: std::sync::Mutex<Vec<CpuIdEntry>>,
-    /// LAPIC timer emulation: timerfd armed to the TSC deadline.
-    /// A background thread reads the timerfd and signals `timer_irq`.
-    pub(super) timer_fd: OwnedFd,
-    /// EventFd registered as irqfd for LOCAL_TIMER_VECTOR (0xEC).
-    /// Signalled by the timer thread when the deadline fires.
-    pub(super) _timer_irq: EventFd,
+    pub(super) timer: super::timer::LapicTimer,
     /// Per-vCPU shadow of Trap-policy MSRs.  When the capavisor forwards
     /// a WRMSR exit for an MSR whose per-domain policy is Trap and CHV
     /// has no dedicated emulator (TSC_DEADLINE / X2APIC_ICR), the write
@@ -138,8 +65,6 @@ impl ThemisVcpu {
         self.vm_ops.as_ref()
     }
 }
-
-
 
 impl Vcpu for ThemisVcpu {
     fn create_standard_regs(&self) -> crate::StandardRegisters {
@@ -201,10 +126,11 @@ impl Vcpu for ThemisVcpu {
             reg(VpRegister::Rip, regs.rip),
             reg(VpRegister::Rflags, regs.rflags),
         ];
-        let result = self.set_reg_values(&regs)
+        let result = self
+            .set_reg_values(&regs)
             .map_err(|e| HypervisorCpuError::SetStandardRegs(anyhow!(e.to_string())));
         if let Err(ref e) = result {
-            eprintln!("\r[THEMIS-DBG] set_regs: THHV_SET_VP_STATE FAILED: {e}");
+            log::error!("Themis set_regs: THHV_SET_VP_STATE failed: {e}");
         }
         result
     }
@@ -374,14 +300,25 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn set_cpuid2(&self, cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
+        let initialized = self.vm_state.initialized.lock().unwrap();
+        if *initialized || *self.vm_state.initialization_failed.lock().unwrap() {
+            return Err(HypervisorCpuError::SetCpuid(anyhow!(
+                "CPUID configuration is closed; recreate the partition"
+            )));
+        }
         // Store per-vCPU for trap-and-emulate fallback.
         let mut guard = self.cpuid.lock().unwrap();
         *guard = cpuid.to_vec();
-        // Also store in VM state for interposition policy push (first wins).
+        // Keep every VP's table for the pre-seal policy push.
         let mut vm_entries = self.vm_state.cpuid_entries.lock().unwrap();
-        if vm_entries.is_empty() {
-            *vm_entries = cpuid.to_vec();
-        }
+        let count = vm_entries.len().max(self._vp_index as usize + 1);
+        vm_entries.resize_with(count, Vec::new);
+        vm_entries[self._vp_index as usize] = cpuid.to_vec();
+        let identity =
+            super::pv::cpuid_apic_ids(&[cpuid.to_vec()]).map_err(HypervisorCpuError::SetCpuid)?[0];
+        self.vm_state.lapic_regs.lock().unwrap()[self._vp_index as usize][0x20 / 4] =
+            identity << 24;
+        drop(initialized);
         Ok(())
     }
 
@@ -437,7 +374,9 @@ impl Vcpu for ThemisVcpu {
     }
 
     fn tsc_khz(&self) -> cpu::Result<Option<u32>> {
-        Ok(discover_host_tsc_khz())
+        super::timer::host_tsc_khz()
+            .map(Some)
+            .map_err(HypervisorCpuError::RunVcpu)
     }
 
     fn state(&self) -> cpu::Result<CpuState> {
@@ -457,8 +396,17 @@ impl Vcpu for ThemisVcpu {
     fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError> {
         self.vm_state
             .ensure_initialized()
-            .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
+            .map_err(HypervisorCpuError::RunVcpu)?;
 
+        if let Some(pv) = self.vm_state.pv.get() {
+            pv.service_vp(
+                self._vp_index,
+                self.vm_ops.as_deref(),
+                &self.vm_state.ioevents,
+                Some(&|request| self.handle_pv_cpu(request)),
+            )
+            .map_err(HypervisorCpuError::RunVcpu)?;
+        }
         let mut run = ThhvRunVp::default();
         match ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_RUN_VP, &mut run) {
             Ok(()) => self.handle_run_exit(run),
@@ -489,6 +437,22 @@ impl Vcpu for ThemisVcpu {
 }
 
 impl ThemisVcpu {
+    fn handle_pv_cpu(&self, request: super::pv::CpuRequest) -> anyhow::Result<()> {
+        match request {
+            super::pv::CpuRequest::TscDeadline { deadline } => self.timer.arm(deadline),
+            super::pv::CpuRequest::TimerConfig(lvt) => self.timer.configure(lvt),
+            super::pv::CpuRequest::FixedIpi {
+                vector,
+                shorthand,
+                logical,
+                destination,
+            } => {
+                let targets = self.ipi_targets(shorthand, logical, destination, true)?;
+                self.inject_fixed_targets(vector, &targets)
+            }
+        }
+    }
+
     fn get_reg_values(&self, names: &[VpRegister]) -> cpu::Result<Vec<u64>> {
         let mut regs: Vec<ThhvRegNameValue> =
             names.iter().copied().map(|name| reg(name, 0)).collect();
@@ -525,17 +489,6 @@ impl ThemisVcpu {
             return Ok(VmExit::Shutdown);
         }
 
-        // Log the first few exits for visibility (no AP-specific logging today).
-        static EXIT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let en = EXIT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if en < 5 {
-            eprintln!(
-                "\r[THEMIS-EXIT] #{en} vp={} reason={} rip={:#x} msr_num={:#x} qual={:#x} gpa={:#x}",
-                self._vp_index, msg.exit_reason, msg.guest_rip, msg.msr_number,
-                msg.exit_qualification, msg.guest_physical_address
-            );
-        }
-
         // Exit reason 33 = VM-entry failure due to invalid guest state.
         // Capavisor should have already panicked with a full VMCS dump, but
         // if we somehow reach here it means the capavisor build is stale.
@@ -551,30 +504,32 @@ impl ThemisVcpu {
         }
 
         match msg.exit_reason {
-            EXIT_REASON_EXCEPTION_NMI
-            | EXIT_REASON_EXTERNAL_INTERRUPT
-            | EXIT_REASON_VMCALL => Ok(VmExit::Ignore),
+            EXIT_REASON_EXCEPTION_NMI | EXIT_REASON_EXTERNAL_INTERRUPT | EXIT_REASON_VMCALL => {
+                Ok(VmExit::Ignore)
+            }
             EXIT_REASON_RDMSR => {
                 self.handle_rdmsr_exit(&msg)?;
                 Ok(VmExit::Ignore)
             }
             EXIT_REASON_WRMSR => {
-                self.handle_wrmsr_exit(&msg);
+                self.handle_wrmsr_exit(&msg)?;
                 Ok(VmExit::Ignore)
             }
             EXIT_REASON_TRIPLE_FAULT => {
-                let cr0  = self.get_reg_values(&[VpRegister::Cr0]).unwrap_or_default();
-                let cr3  = self.get_reg_values(&[VpRegister::Cr3]).unwrap_or_default();
-                let cr4  = self.get_reg_values(&[VpRegister::Cr4]).unwrap_or_default();
+                let cr0 = self.get_reg_values(&[VpRegister::Cr0]).unwrap_or_default();
+                let cr3 = self.get_reg_values(&[VpRegister::Cr3]).unwrap_or_default();
+                let cr4 = self.get_reg_values(&[VpRegister::Cr4]).unwrap_or_default();
                 let efer = self.get_reg_values(&[VpRegister::Efer]).unwrap_or_default();
-                let rax  = self.get_reg_values(&[VpRegister::Rax]).unwrap_or_default();
-                eprintln!("\r[TRIPLE-FAULT] rip={:#x} cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} rax={:#x}",
+                let rax = self.get_reg_values(&[VpRegister::Rax]).unwrap_or_default();
+                eprintln!(
+                    "\r[TRIPLE-FAULT] rip={:#x} cr0={:#x} cr3={:#x} cr4={:#x} efer={:#x} rax={:#x}",
                     msg.guest_rip,
                     cr0.first().copied().unwrap_or(0),
                     cr3.first().copied().unwrap_or(0),
                     cr4.first().copied().unwrap_or(0),
                     efer.first().copied().unwrap_or(0),
-                    rax.first().copied().unwrap_or(0));
+                    rax.first().copied().unwrap_or(0)
+                );
                 Ok(VmExit::Reset)
             }
             EXIT_REASON_CPUID => {
@@ -599,10 +554,10 @@ impl ThemisVcpu {
                 Ok(VmExit::Ignore)
             }
             EXIT_REASON_APIC_ACCESS => {
-                self.handle_apic_access_exit(&msg);
+                self.handle_apic_access_exit(&msg)?;
                 Ok(VmExit::Ignore)
             }
-            THEMIS_EXIT_DOORBELL => Ok(VmExit::Ignore),
+            themis_abi::synthetic_exits::THEMIS_EXIT_YIELD => Ok(VmExit::Ignore),
             _ => Ok(VmExit::Ignore),
         }
     }
@@ -611,44 +566,25 @@ impl ThemisVcpu {
     /// timer emulation.  The guest wrote a TSC deadline value; we arm a
     /// timerfd so the interrupt fires at the right wall-clock time.
     ///
-    /// The TSC kHz used here is read from host CPUID (leaf 0x15 / 0x16) via
-    /// [`host_tsc_khz_or_fallback`]; the same value backs the guest-visible
-    /// `Vcpu::tsc_khz()`, so the two cannot drift.
-    fn handle_wrmsr_exit(&self, msg: &ThemicInterceptMessage) {
+    fn handle_wrmsr_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
         const IA32_TSC_DEADLINE: u32 = 0x6E0;
         const IA32_X2APIC_ICR: u32 = 0x830;
-        // Host TSC kHz (CPUID 0x15/0x16, falling back to a 3 GHz placeholder
-        // with a one-shot warning).  Same value the guest sees via
-        // `Vcpu::tsc_khz()`, so the two cannot drift.
-        let tsc_khz: u64 = host_tsc_khz_or_fallback() as u64;
-
-        // Log ALL WRMSR exits (first 20 + every 100th) to verify trapping works.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static WRMSR_COUNT: AtomicU64 = AtomicU64::new(0);
-        let n = WRMSR_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 20 || n % 100 == 0 {
-            eprintln!(
-                "\r[THEMIS-MSR] #{n} WRMSR msr={:#x} val={:#x} rip={:#x}",
-                msg.msr_number, msg.msr_value, msg.guest_rip
-            );
-        }
-
+        const IA32_X2APIC_LVT_TIMER: u32 = 0x832;
         if msg.msr_number == IA32_X2APIC_ICR {
-            // x2APIC ICR is a 64-bit MSR: bits [31:0] = ICR_LOW (same
-            // layout as xAPIC ICR_LOW), bits [63:32] = destination APIC
-            // ID (32-bit, no shift, unlike xAPIC ICR_HIGH which puts the
-            // 8-bit dest in bits [31:24]).  Repack into xAPIC layout so
-            // deliver_ipi (originally written for xAPIC ICR writes) can
-            // decode unchanged.  Themis APIC IDs are vp_index 1:1 and fit
-            // in 8 bits, so the upper bits of the x2APIC dest field are
-            // never used.
             let icr_low = msg.msr_value as u32;
             let dest_apic_id_x2 = (msg.msr_value >> 32) as u32;
-            let icr_high = (dest_apic_id_x2 & 0xFF) << ICR_HIGH_DEST_SHIFT;
-            self.deliver_ipi(icr_low, icr_high);
-            return;
+            return self.deliver_ipi(icr_low, dest_apic_id_x2, true);
         }
 
+        if msg.msr_number == IA32_X2APIC_LVT_TIMER {
+            self.timer
+                .configure(
+                    msg.msr_value
+                        .try_into()
+                        .map_err(|error| HypervisorCpuError::RunVcpu(anyhow!("{error}")))?,
+                )
+                .map_err(HypervisorCpuError::RunVcpu)?;
+        }
         if msg.msr_number != IA32_TSC_DEADLINE {
             // Unknown Trap-forwarded WRMSR: stash the value in the
             // per-vCPU shadow so a subsequent RDMSR returns it.  The
@@ -659,83 +595,12 @@ impl ThemisVcpu {
             if let Ok(mut shadow) = self.msr_shadow.lock() {
                 shadow.insert(msg.msr_number, msg.msr_value);
             }
-            return;
+            return Ok(());
         }
 
-        let deadline_tsc = msg.msr_value;
-
-        if deadline_tsc == 0 {
-            // Disarm: guest cancelled the timer.
-            let disarm = libc::itimerspec {
-                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-                it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            };
-            unsafe {
-                libc::timerfd_settime(
-                    self.timer_fd.as_raw_fd(), 0, &disarm, std::ptr::null_mut(),
-                );
-            }
-            return;
-        }
-
-        let now_tsc = unsafe { std::arch::x86_64::_rdtsc() };
-
-        // Debug: log timing for first 20 + every 100th
-        if n < 20 || n % 100 == 0 {
-            let diff = if deadline_tsc > now_tsc {
-                deadline_tsc - now_tsc
-            } else {
-                0
-            };
-            // Convert TSC ticks → microseconds exactly:
-            //   us = ticks * 1_000 / tsc_khz
-            // u128 to avoid overflow on multi-second deltas at GHz rates.
-            let diff_us = ((diff as u128) * 1_000 / tsc_khz as u128) as u64;
-            eprintln!(
-                "\r[THEMIS-TIMER] #{n} deadline={:#x} now={:#x} delta_tsc={} ({} us)",
-                deadline_tsc, now_tsc, diff, diff_us
-            );
-        }
-
-        if now_tsc >= deadline_tsc {
-            // Already expired — inject immediately via the irqfd.
-            // The timer thread's EventFd is backed by the same irqfd, but
-            // the fastest path is to arm the timerfd with a minimal delay.
-            let fire_now = libc::itimerspec {
-                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-                it_value: libc::timespec { tv_sec: 0, tv_nsec: 1 },
-            };
-            unsafe {
-                libc::timerfd_settime(
-                    self.timer_fd.as_raw_fd(), 0, &fire_now, std::ptr::null_mut(),
-                );
-            }
-            return;
-        }
-
-        let delta_tsc = deadline_tsc - now_tsc;
-        // Convert TSC ticks → nanoseconds exactly:
-        //   ns = ticks * 1_000_000 / tsc_khz
-        // u128 to avoid overflow on multi-second deltas at GHz rates.
-        // (Worst-case `delta_tsc * 1_000_000` is < 2^84 for a 1-day deadline
-        // at 5 GHz, well within u128.)
-        let delta_ns = ((delta_tsc as u128) * 1_000_000 / tsc_khz as u128) as u64;
-
-        let tv_sec = (delta_ns / 1_000_000_000) as i64;
-        let tv_nsec = (delta_ns % 1_000_000_000) as i64;
-
-        let arm = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec {
-                tv_sec,
-                tv_nsec: if tv_sec == 0 && tv_nsec == 0 { 1 } else { tv_nsec },
-            },
-        };
-        unsafe {
-            libc::timerfd_settime(
-                self.timer_fd.as_raw_fd(), 0, &arm, std::ptr::null_mut(),
-            );
-        }
+        self.timer
+            .arm(msg.msr_value)
+            .map_err(HypervisorCpuError::RunVcpu)
     }
 
     /// Handle a Trap-forwarded RDMSR VM exit.
@@ -769,39 +634,39 @@ impl ThemisVcpu {
     /// Intel register encoding (qual bits 11:8):
     ///   0=RAX 1=RCX 2=RDX 3=RBX 4=RSP 5=RBP 6=RSI 7=RDI 8-15=R8-R15
     fn handle_cr_access_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
-        let qual    = msg.exit_qualification;
-        let cr_num  = (qual & 0xF) as u32;
-        let acc     = ((qual >> 4) & 0x3) as u32;
+        let qual = msg.exit_qualification;
+        let cr_num = (qual & 0xF) as u32;
+        let acc = ((qual >> 4) & 0x3) as u32;
         let reg_idx = ((qual >> 8) & 0xF) as u32;
 
         // Map Intel qualification register index to THHV_VP_REG_* discriminant.
         // Note: VpRegister ordering differs from Intel's.
         let thhv_gpr = |idx: u32| -> VpRegister {
             match idx {
-                0  => VpRegister::Rax,
-                1  => VpRegister::Rcx,
-                2  => VpRegister::Rdx,
-                3  => VpRegister::Rbx,
-                4  => VpRegister::Rsp,
-                5  => VpRegister::Rbp,
-                6  => VpRegister::Rsi,
-                7  => VpRegister::Rdi,
-                8  => VpRegister::R8,
-                9  => VpRegister::R9,
+                0 => VpRegister::Rax,
+                1 => VpRegister::Rcx,
+                2 => VpRegister::Rdx,
+                3 => VpRegister::Rbx,
+                4 => VpRegister::Rsp,
+                5 => VpRegister::Rbp,
+                6 => VpRegister::Rsi,
+                7 => VpRegister::Rdi,
+                8 => VpRegister::R8,
+                9 => VpRegister::R9,
                 10 => VpRegister::R10,
                 11 => VpRegister::R11,
                 12 => VpRegister::R12,
                 13 => VpRegister::R13,
                 14 => VpRegister::R14,
                 15 => VpRegister::R15,
-                _  => VpRegister::Rax,
+                _ => VpRegister::Rax,
             }
         };
 
         if acc == 0 {
             // MOV to CR: get source register value, write to the appropriate CR.
-            let src_reg  = thhv_gpr(reg_idx);
-            let src_val  = self.get_reg_values(&[src_reg])?[0];
+            let src_reg = thhv_gpr(reg_idx);
+            let src_val = self.get_reg_values(&[src_reg])?[0];
 
             match cr_num {
                 0 => {
@@ -811,7 +676,7 @@ impl ThemisVcpu {
                     // Keep bits that the host must own (in FIXED0 mask) that guest wants to clear.
                     let forced_bits = old_cr0 & !src_val;
                     let new_cr0 = src_val | forced_bits;
-                    let pg_bit  = 1u64 << 31;
+                    let pg_bit = 1u64 << 31;
                     let mut updates = vec![reg(VpRegister::Cr0, new_cr0)];
                     if (old_cr0 & pg_bit) == 0 && (new_cr0 & pg_bit) != 0 {
                         let efer = self.get_reg_values(&[VpRegister::Efer])?[0];
@@ -841,7 +706,7 @@ impl ThemisVcpu {
                 _ => None,
             };
             if let Some(r) = cr_reg {
-                let cr_val  = self.get_reg_values(&[r])?[0];
+                let cr_val = self.get_reg_values(&[r])?[0];
                 self.set_reg_values(&[reg(thhv_gpr(reg_idx), cr_val)])?;
             }
         }
@@ -857,43 +722,26 @@ impl ThemisVcpu {
 
         // Use the CPUID policy set by CHV (via set_cpuid2), which applies correct
         // masking for vCPU count, topology, VMX hiding, etc.
-        // Fall back to raw hardware CPUID only if no policy has been set yet
-        // (e.g. early firmware execution before CHV installs the policy).
         let (eax, ebx, ecx, edx) = {
             let guard = self.cpuid.lock().unwrap();
             if guard.is_empty() {
-                // No policy yet — pass through host CPUID as-is.
-                // CPUID is always available on x86_64 and has no side effects.
-                let r = std::arch::x86_64::__cpuid_count(leaf, subleaf);
-                (r.eax, r.ebx, r.ecx, r.edx)
-            } else {
-                // Search stored policy. Most leaves use index=0 only; indexed
-                // sub-leaf leaves (0x4, 0x7, 0xB, 0x1F, 0x8000001D) store each
-                // sub-leaf separately.
-                //
-                // For topology enumeration leaves (0xB, 0x1F) we must NOT fall
-                // back to sub-leaf 0 for an unknown sub-leaf: those leaves signal
-                // end-of-enumeration with ECX[15:8]=0 (level_type=0), which only
-                // appears when the caller queries a sub-leaf beyond the last valid
-                // one and gets all-zeros back.  Returning the sub-leaf-0 entry
-                // (ECX[15:8]≠0) for every missing sub-leaf causes Linux's topology
-                // scan to loop forever.
-                const INDEXED_LEAVES: &[u32] = &[0x4, 0xb, 0x1f, 0x8000_001d];
-                let entry = guard
-                    .iter()
-                    .find(|e| e.function == leaf && e.index == subleaf)
-                    .or_else(|| {
-                        if INDEXED_LEAVES.contains(&leaf) {
-                            None // return (0,0,0,0) → end-of-enumeration
-                        } else {
-                            guard.iter().find(|e| e.function == leaf && e.index == 0)
-                        }
-                    })
-                    .copied();
-                match entry {
-                    Some(e) => (e.eax, e.ebx, e.ecx, e.edx),
-                    None => (0, 0, 0, 0),
-                }
+                return Err(HypervisorCpuError::RunVcpu(anyhow::anyhow!(
+                    "CPUID exit before this VP's CPUID policy was installed"
+                )));
+            }
+            // Use the same explicit index flag as pre-seal translation.
+            // Missing indexed subleaves return zero, never subleaf zero.
+            let entry = guard
+                .iter()
+                .find(|e| {
+                    e.function == leaf
+                        && (e.flags & crate::arch::x86::CPUID_FLAG_VALID_INDEX == 0
+                            || e.index == subleaf)
+                })
+                .copied();
+            match entry {
+                Some(e) => (e.eax, e.ebx, e.ecx, e.edx),
+                None => (0, 0, 0, 0),
             }
         };
 
@@ -913,25 +761,31 @@ impl ThemisVcpu {
             return Ok(());
         }
 
-        // Debug: log first few IO exits to verify the path works.
-        static IO_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = IO_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 20 || (n < 200 && n % 50 == 0) {
-            eprintln!(
-                "\r[THEMIS-IO] #{} port=0x{:x} size={} write={} rax=0x{:x}",
-                n, msg.port_number, len, msg.is_write, msg.rax
-            );
-        }
-
         if msg.is_write != 0 {
+            let data = msg.rax.to_le_bytes();
+            if self
+                .vm_state
+                .ioevents
+                .lock()
+                .unwrap()
+                .write(
+                    crate::IoEventAddress::Pio(u64::from(msg.port_number)),
+                    &data[..len],
+                )
+                .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?
+            {
+                return Ok(());
+            }
             if let Some(vm_ops) = &self.vm_ops {
-                let data = msg.rax.to_le_bytes();
                 vm_ops
                     .pio_write(u64::from(msg.port_number), &data[..len])
                     .map_err(|e| {
                         eprintln!(
                             "\r[THEMIS-IO-ERR] pio_write port=0x{:x} size={} data={:x?}: {:?}",
-                            msg.port_number, len, &data[..len], e
+                            msg.port_number,
+                            len,
+                            &data[..len],
+                            e
                         );
                         HypervisorCpuError::RunVcpu(e.into())
                     })?;
@@ -971,10 +825,17 @@ impl ThemisVcpu {
             msg.guest_physical_address
         };
 
+        if self.vm_state.confidential {
+            return Err(HypervisorCpuError::RunVcpu(anyhow::anyhow!(
+                "confidential guest MMIO at GPA {gpa:#x} requires a declared PV service; \
+                 legacy instruction emulation is disabled"
+            )));
+        }
+
         // LAPIC MMIO fast-path: when VIRTUALIZE_APIC_ACCESSES is not
         // supported, LAPIC accesses cause EPT violations.  Handle them
         // here with per-vCPU software LAPIC state + instruction decode.
-        if gpa >= LAPIC_MMIO_BASE && gpa < LAPIC_MMIO_END {
+        if (LAPIC_MMIO_BASE..LAPIC_MMIO_END).contains(&gpa) {
             return self.handle_lapic_mmio(msg);
         }
 
@@ -982,15 +843,12 @@ impl ThemisVcpu {
         let ept_entry_present = (msg.exit_qualification >> 3) & 0x7 != 0;
 
         if is_exec && !ept_entry_present {
-            return Err(HypervisorCpuError::RunVcpu(
-                anyhow::anyhow!(
-                    "EPT execute fault on unmapped GPA {:#x} (RIP {:#x} qual={:#x})",
-                    msg.guest_physical_address,
-                    msg.guest_rip,
-                    msg.exit_qualification,
-                )
-                .into(),
-            ));
+            return Err(HypervisorCpuError::RunVcpu(anyhow::anyhow!(
+                "EPT execute fault on unmapped GPA {:#x} (RIP {:#x} qual={:#x})",
+                msg.guest_physical_address,
+                msg.guest_rip,
+                msg.exit_qualification,
+            )));
         }
 
         // Use the iced-x86 emulator to decode and emulate the faulting instruction.
@@ -999,7 +857,6 @@ impl ThemisVcpu {
         let mut ctx = emulator::ThemisEmulatorContext {
             vcpu: self,
             mmio_gpa: gpa,
-            insn_bytes: msg.instruction_bytes,
             vtom_mask: if self.vm_state.confidential {
                 1u64 << self.vm_state.vtom_bit
             } else {
@@ -1008,36 +865,24 @@ impl ThemisVcpu {
         };
 
         let old_rip = msg.guest_rip;
+        let insn_bytes = ctx
+            .instruction_bytes(old_rip)
+            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow!("instruction fetch: {e}")))?;
 
         let mut emu = crate::arch::x86::emulator::Emulator::new(&mut ctx);
-        let new_state = emu
-            .emulate_first_insn(0, &msg.instruction_bytes)
-            .map_err(|e| {
-                eprintln!(
-                    "\r[MMIO-EMU] emulation failed: gpa={:#x} rip={:#x} insn={:02x?}: {e}",
-                    gpa, msg.guest_rip, &msg.instruction_bytes[..8],
-                );
-                HypervisorCpuError::RunVcpu(anyhow::anyhow!("MMIO emulation failed: {e}").into())
-            })?;
-
-        // Debug: log first few MMIO emulations
-        static MMIO_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let mn = MMIO_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let new_rip = match &new_state.regs {
-            crate::StandardRegisters::Themis(r) => r.rip,
-            #[allow(unreachable_patterns)]
-            _ => 0,
-        };
-        if mn < 20 || (mn < 500 && mn % 50 == 0) || mn % 1000 == 0 {
+        let new_state = emu.emulate_first_insn(0, &insn_bytes).map_err(|e| {
             eprintln!(
-                "\r[MMIO-DBG] #{mn} gpa={:#x} old_rip={:#x} new_rip={:#x} insn={:02x?}",
-                gpa, old_rip, new_rip, &msg.instruction_bytes[..6],
+                "\r[MMIO-EMU] emulation failed: gpa={:#x} rip={:#x} insn={:02x?}: {e}",
+                gpa,
+                msg.guest_rip,
+                &insn_bytes[..8],
             );
-        }
+            HypervisorCpuError::RunVcpu(anyhow::anyhow!("MMIO emulation failed: {e}"))
+        })?;
 
         // Write back GP registers + RIP (MMIO instructions don't modify CRs/sregs).
         self.set_regs(&new_state.regs)
-            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("set_regs: {e}").into()))?;
+            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("set_regs: {e}")))?;
 
         Ok(())
     }
@@ -1056,14 +901,16 @@ impl ThemisVcpu {
 
         let offset = (msg.guest_physical_address & LAPIC_MMIO_OFFSET_MASK) as u32;
         let is_write = (msg.exit_qualification >> 1) & 1 != 0;
+        let insn_bytes = emulator::ThemisEmulatorContext {
+            vcpu: self,
+            mmio_gpa: msg.guest_physical_address,
+            vtom_mask: 0,
+        }
+        .instruction_bytes(msg.guest_rip)
+        .map_err(|e| HypervisorCpuError::RunVcpu(anyhow!("LAPIC instruction fetch: {e}")))?;
 
         // Decode the faulting instruction.
-        let mut decoder = Decoder::with_ip(
-            64,
-            &msg.instruction_bytes,
-            msg.guest_rip,
-            DecoderOptions::NONE,
-        );
+        let mut decoder = Decoder::with_ip(64, &insn_bytes, msg.guest_rip, DecoderOptions::NONE);
         let insn = decoder.decode();
         let insn_len = insn.len() as u64;
 
@@ -1071,24 +918,24 @@ impl ThemisVcpu {
             eprintln!(
                 "\r[LAPIC] failed to decode insn at RIP={:#x} bytes={:02x?}",
                 msg.guest_rip,
-                &msg.instruction_bytes[..8]
+                &insn_bytes[..8]
             );
-            return Err(HypervisorCpuError::RunVcpu(
-                anyhow::anyhow!("LAPIC MMIO: instruction decode failed").into(),
-            ));
+            return Err(HypervisorCpuError::RunVcpu(anyhow::anyhow!(
+                "LAPIC MMIO: instruction decode failed"
+            )));
         }
 
         // Read current GP register state from the guest VMCS.
         let gregs = self
             .get_regs()
-            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("get_regs: {e}").into()))?;
+            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("get_regs: {e}")))?;
         let mut gregs = match gregs {
             crate::StandardRegisters::Themis(r) => r,
             #[allow(unreachable_patterns)]
             _ => {
-                return Err(HypervisorCpuError::RunVcpu(
-                    anyhow::anyhow!("unexpected register type").into(),
-                ))
+                return Err(HypervisorCpuError::RunVcpu(anyhow::anyhow!(
+                    "unexpected register type"
+                )));
             }
         };
 
@@ -1098,9 +945,7 @@ impl ThemisVcpu {
             //                  or: MOV dword [mem], imm  (op0=mem, op1=imm)
             let value = if insn.op_count() >= 2 {
                 match insn.op1_kind() {
-                    OpKind::Register => {
-                        Self::read_iced_reg(&gregs, insn.op1_register()) as u32
-                    }
+                    OpKind::Register => Self::read_iced_reg(&gregs, insn.op1_register()) as u32,
                     OpKind::Immediate32 | OpKind::Immediate32to64 => insn.immediate32(),
                     OpKind::Immediate8 | OpKind::Immediate8to32 => insn.immediate8to32() as u32,
                     OpKind::Immediate16 => insn.immediate16() as u32,
@@ -1133,31 +978,28 @@ impl ThemisVcpu {
 
             // Handle side effects for specific registers.
             match offset {
+                0x320 => self
+                    .timer
+                    .configure(value)
+                    .map_err(HypervisorCpuError::RunVcpu)?,
                 APIC_REG_ICR_LOW => {
                     // ICR low write — detect INIT/SIPI.
                     // Read ICR_HIGH from internal LAPIC state.
                     let icr_high = {
                         let lapic = self.vm_state.lapic_regs.lock().unwrap();
                         let vp = self._vp_index as usize;
-                        if vp < lapic.len() { lapic[vp][(APIC_REG_ICR_HIGH / 4) as usize] } else { 0 }
+                        if vp < lapic.len() {
+                            lapic[vp][(APIC_REG_ICR_HIGH / 4) as usize]
+                        } else {
+                            0
+                        }
                     };
-                    self.deliver_ipi(value, icr_high);
+                    self.deliver_ipi(value, icr_high >> ICR_HIGH_DEST_SHIFT, false)?;
                 }
                 APIC_REG_EOI => {
                     // EOI — no action needed; interrupt injection uses VMENTRY.
                 }
                 _ => {}
-            }
-
-            // Debug: log first few LAPIC writes.
-            static LAPIC_W_LOG: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = LAPIC_W_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 30 || n % 500 == 0 {
-                eprintln!(
-                    "\r[LAPIC-W] #{n} vp={} offset={:#x} value={:#x}",
-                    self._vp_index, offset, value
-                );
             }
         } else {
             // Read: return per-vCPU register value.
@@ -1175,22 +1017,12 @@ impl ThemisVcpu {
             if insn.op_count() >= 1 && insn.op0_kind() == OpKind::Register {
                 Self::write_iced_reg(&mut gregs, insn.op0_register(), value as u64);
             }
-
-            static LAPIC_R_LOG: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = LAPIC_R_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 30 || n % 500 == 0 {
-                eprintln!(
-                    "\r[LAPIC-R] #{n} vp={} offset={:#x} value={:#x}",
-                    self._vp_index, offset, value
-                );
-            }
         }
 
         // Advance RIP past the faulting instruction.
         gregs.rip += insn_len;
         self.set_regs(&crate::StandardRegisters::Themis(gregs))
-            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("set_regs: {e}").into()))?;
+            .map_err(|e| HypervisorCpuError::RunVcpu(anyhow::anyhow!("set_regs: {e}")))?;
 
         Ok(())
     }
@@ -1221,7 +1053,7 @@ impl ThemisVcpu {
             CH => (gregs.rcx >> 8) & 0xFF,
             DH => (gregs.rdx >> 8) & 0xFF,
             _ => {
-                eprintln!("\r[LAPIC] read_iced_reg: unhandled register {:?}", r);
+                eprintln!("\r[LAPIC] read_iced_reg: unhandled register {r:?}");
                 0
             }
         }
@@ -1300,105 +1132,96 @@ impl ThemisVcpu {
             R15W => gregs.r15 = (gregs.r15 & !0xFFFF) | (val & 0xFFFF),
             R15L => gregs.r15 = (gregs.r15 & !0xFF) | (val & 0xFF),
             _ => {
-                eprintln!("\r[LAPIC] write_iced_reg: unhandled register {:?}", r);
+                eprintln!("\r[LAPIC] write_iced_reg: unhandled register {r:?}");
             }
         }
     }
 
     /// Deliver an IPI based on the ICR low value.
     /// Handles IPI delivery modes: Fixed (0), INIT (5), and SIPI (6).
-    fn deliver_ipi(&self, icr_low: u32, icr_high: u32) {
+    fn deliver_ipi(&self, icr_low: u32, destination: u32, x2apic: bool) -> cpu::Result<()> {
         let delivery_mode = (icr_low >> ICR_DELIVERY_MODE_SHIFT) & ICR_DELIVERY_MODE_MASK;
         let vector = icr_low & ICR_VECTOR_MASK;
         let dest_shorthand = (icr_low >> ICR_DEST_SHORTHAND_SHIFT) & ICR_DEST_SHORTHAND_MASK;
 
-        // Destination APIC ID from ICR_HIGH bits [31:24], passed by capavisor
-        // from VAPIC[0x310].
-        let dest_apic_id = (icr_high >> ICR_HIGH_DEST_SHIFT) & ICR_HIGH_DEST_MASK;
-
-        eprintln!(
-            "\r[LAPIC-IPI] vp={} icr_low={:#x} mode={} vector={:#x} shorthand={} dest_apic={}",
-            self._vp_index, icr_low, delivery_mode, vector, dest_shorthand, dest_apic_id
-        );
+        let logical = icr_low & (1 << 11) != 0;
+        let targets = self
+            .ipi_targets(dest_shorthand as u8, logical, destination, x2apic)
+            .map_err(HypervisorCpuError::RunVcpu)?;
 
         match delivery_mode {
             ICR_MODE_FIXED | ICR_MODE_LOWEST_PRIORITY => {
                 // Fixed (0) or Lowest Priority (1) — inject vector into target VP.
-                self.deliver_fixed_ipi(vector as u8, dest_shorthand, dest_apic_id);
+                self.inject_fixed_targets(vector as u8, &targets)
+                    .map_err(HypervisorCpuError::RunVcpu)?;
             }
             ICR_MODE_INIT => {
                 // INIT — AP is already in wait-for-SIPI (set at create_vcpu).
-                eprintln!("\r[LAPIC-IPI] INIT IPI — no-op (AP in wait-for-SIPI)");
+                log::debug!("Themis INIT IPI: target APs await SIPI");
             }
             ICR_MODE_SIPI => {
                 // Startup IPI (SIPI) — wake target AP with CS:IP from vector.
-                self.deliver_sipi(vector);
+                self.deliver_sipi(vector, &targets)?;
             }
             _ => {
-                eprintln!(
-                    "\r[LAPIC-IPI] unhandled delivery mode {} — ignored",
-                    delivery_mode
-                );
+                return Err(HypervisorCpuError::RunVcpu(anyhow!(
+                    "unsupported IPI delivery mode {delivery_mode}"
+                )));
             }
         }
+        Ok(())
     }
 
-    /// Deliver a Fixed-mode IPI: inject vector into target VP(s) via THHV_INJECT_INTERRUPT.
-    fn deliver_fixed_ipi(&self, vector: u8, dest_shorthand: u32, dest_apic_id: u32) {
-        let fds = self.vm_state.vp_fds.lock().unwrap();
-        let num_vps = fds.len();
-
-        // Determine target VP indices based on destination shorthand.
-        let targets: Vec<usize> = match dest_shorthand {
-            0 => {
-                // No shorthand — use dest_apic_id.
-                // APIC ID = vp_index (simple 1:1 mapping).
-                let target = dest_apic_id as usize;
-                if target < num_vps { vec![target] } else { vec![] }
-            }
-            1 => vec![self._vp_index as usize], // Self
-            2 => (0..num_vps).collect(),         // All including self
-            3 => {
-                // All excluding self
-                (0..num_vps).filter(|&i| i != self._vp_index as usize).collect()
-            }
-            _ => vec![],
+    fn ipi_targets(
+        &self,
+        shorthand: u8,
+        logical: bool,
+        destination: u32,
+        x2apic: bool,
+    ) -> anyhow::Result<Vec<usize>> {
+        let tables = self.vm_state.cpuid_entries.lock().unwrap();
+        let apic_ids = super::pv::cpuid_apic_ids(&tables)?;
+        if !x2apic && logical && shorthand == 0 {
+            let lapic = self.vm_state.lapic_regs.lock().unwrap();
+            return super::pv::xapic_logical_targets(destination, &lapic);
+        }
+        let destination = if !x2apic && destination == 0xff {
+            u32::MAX
+        } else {
+            destination
         };
+        super::pv::ipi_targets(self._vp_index, shorthand, logical, destination, &apic_ids)
+    }
 
+    fn inject_fixed_targets(&self, vector: u8, targets: &[usize]) -> anyhow::Result<()> {
         let part_fd = self.vm_state.fd.as_raw_fd();
-        for target_vp in targets {
+        for &target_vp in targets {
             let mut ii = ThhvInjectInterrupt {
                 vp_index: target_vp as u32,
                 vector,
                 pad: [0; 3],
             };
-            let ret = unsafe {
-                libc::ioctl(part_fd, THHV_INJECT_INTERRUPT as libc::c_ulong, &mut ii)
-            };
-            if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                eprintln!(
-                    "\r[LAPIC-IPI] Fixed IPI inject failed: vp={} vector={:#x} err={:?}",
-                    target_vp, vector, err
-                );
-            }
+            ioctl_with_mut_ref(part_fd, THHV_INJECT_INTERRUPT, &mut ii).map_err(|error| {
+                anyhow!("IPI target VP {target_vp}, vector {vector:#x}: {error}")
+            })?;
         }
+        Ok(())
     }
 
-    /// Deliver SIPI to all non-self vCPUs: set full real-mode state and wake AP.
+    /// Deliver SIPI to the resolved target VPs.
     ///
     /// After SIPI, the AP must be in real mode with CS:IP from the SIPI vector
     /// and all other segments in their reset defaults.  We also clear GP regs
     /// and set RFLAGS=0x2, CR0=0 (real mode; capavisor adjusts NE/ET), CR3/CR4/EFER=0.
-    fn deliver_sipi(&self, vector: u32) {
+    fn deliver_sipi(&self, vector: u32, targets: &[usize]) -> cpu::Result<()> {
         let fds = self.vm_state.vp_fds.lock().unwrap();
-        let my_id = self._vp_index as usize;
 
-        for (target_id, &target_fd) in fds.iter().enumerate() {
-            if target_id == my_id || target_fd < 0 {
-                continue;
-            }
-
+        for &target_id in targets {
+            let target_fd = *fds.get(target_id).filter(|&&fd| fd >= 0).ok_or_else(|| {
+                HypervisorCpuError::RunVcpu(anyhow!("missing SIPI target VP {target_id}"))
+            })?;
+            // thhv owns software wait-for-SIPI and ignores duplicate startup
+            // batches. The monitor's ActivityState does not reflect that wait.
             // Intel SDM §8.4.4: SIPI vector × 4 KiB = real-mode entry address
             let startup_addr = (vector as u64) << 12;
             // Intel SDM §8.4.4: CS selector = SIPI vector × 256
@@ -1465,12 +1288,10 @@ impl ThemisVcpu {
                 rsvd: 0,
                 regs: regs.as_mut_ptr() as usize as u64,
             };
-            let res = ioctl_with_mut_ref(target_fd, THHV_SET_VP_STATE, &mut header);
-            eprintln!(
-                "\r[LAPIC-IPI] SIPI vector={:#x} → vCPU {} CS:IP={:#x}:{:#x} result={:?}",
-                vector, target_id, cs_selector, 0, res
-            );
+            ioctl_with_mut_ref(target_fd, THHV_SET_VP_STATE, &mut header)
+                .map_err(|error| HypervisorCpuError::RunVcpu(error.into()))?;
         }
+        Ok(())
     }
 
     /// Handle APIC-access exit forwarded by capavisor (Mode A — APICv).
@@ -1479,11 +1300,11 @@ impl ThemisVcpu {
     /// value to detect INIT (delivery mode 5) and Startup IPI (delivery mode 6).
     /// For SIPI, we configure the target AP's CS:IP from the SIPI vector and
     /// transition it from wait-for-SIPI to runnable via THHV_SET_VP_STATE.
-    fn handle_apic_access_exit(&self, msg: &ThemicInterceptMessage) {
+    fn handle_apic_access_exit(&self, msg: &ThemicInterceptMessage) -> cpu::Result<()> {
         // RAX = ICR_LOW value (decoded by capavisor from guest instruction).
         // RCX (msr_number) = ICR_HIGH value (read from VAPIC[0x310] by capavisor).
         let icr_val = msg.rax as u32;
-        let icr_high = msg.msr_number;
-        self.deliver_ipi(icr_val, icr_high);
+        let destination = (msg.msr_number >> ICR_HIGH_DEST_SHIFT) & ICR_HIGH_DEST_MASK;
+        self.deliver_ipi(icr_val, destination, false)
     }
 }

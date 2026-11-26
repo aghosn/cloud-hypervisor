@@ -117,26 +117,10 @@ const BLKZEROOUT: u64 = 0x127f; // _IO(0x12, 127)
 // MSHV IOCTL code. This is unstable until the kernel code has been declared stable.
 #[cfg(feature = "mshv")]
 use hypervisor::mshv::mshv_ioctls::*;
+#[cfg(all(feature = "themis", target_arch = "x86_64"))]
+use hypervisor::themis::ioctl::*;
 #[cfg(feature = "kvm")]
 use kvm::*;
-
-#[cfg(all(feature = "themis", target_arch = "x86_64"))]
-mod themis {
-    pub const THHV_CREATE_PARTITION: u64 = 0xc020_b801;
-    pub const THHV_QUERY: u64 = 0xc010_b803;
-    pub const THHV_INITIALIZE_PARTITION: u64 = 0x0000_b810;
-    pub const THHV_CREATE_VP: u64 = 0xc020_b811;
-    pub const THHV_SET_GUEST_MEMORY: u64 = 0x4130_b812;
-    pub const THHV_IRQFD: u64 = 0x4010_b813;
-    pub const THHV_IOEVENTFD: u64 = 0x4020_b814;
-    pub const THHV_SEND_SHARED_META: u64 = 0x4010_b817;
-    pub const THHV_SET_POLICY: u64 = 0x4020_b81a;
-    pub const THHV_RUN_VP: u64 = 0xc100_b820;
-    pub const THHV_GET_VP_STATE: u64 = 0xc010_b821;
-    pub const THHV_SET_VP_STATE: u64 = 0x4010_b822;
-}
-#[cfg(all(feature = "themis", target_arch = "x86_64"))]
-use themis::*;
 
 #[cfg(feature = "mshv")]
 fn create_vmm_ioctl_seccomp_rule_common_mshv() -> Result<Vec<SeccompRule>, BackendError> {
@@ -273,7 +257,10 @@ fn create_vmm_ioctl_seccomp_rule_common_themis() -> Result<Vec<SeccompRule>, Bac
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_CREATE_VP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_SET_GUEST_MEMORY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_IRQFD)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, THHV_IOEVENTFD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_INJECT_INTERRUPT)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_CREATE_DOORBELL)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_DOORBELL_EVENTFD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_SEND_CAP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_SEND_SHARED_META)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_SET_POLICY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_RUN_VP)?],
@@ -841,7 +828,12 @@ fn create_vcpu_ioctl_seccomp_rule_mshv() -> Result<Vec<SeccompRule>, BackendErro
 #[cfg(all(feature = "themis", target_arch = "x86_64"))]
 fn create_vcpu_ioctl_seccomp_rule_themis() -> Result<Vec<SeccompRule>, BackendError> {
     Ok(or![
-        and![Cond::new(1, ArgLen::Dword, Eq, THHV_IOEVENTFD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_INJECT_INTERRUPT)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_CREATE_DOORBELL)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_DOORBELL_EVENTFD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_SEND_CAP)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_SET_POLICY)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, THHV_INITIALIZE_PARTITION)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_IRQFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_RUN_VP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, THHV_GET_VP_STATE)?],
@@ -912,7 +904,7 @@ fn create_vcpu_ioctl_seccomp_rule(
 fn vcpu_thread_rules(
     hypervisor_type: HypervisorType,
 ) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
-    Ok(vec![
+    let rules = vec![
         (libc::SYS_brk, vec![]),
         (libc::SYS_clock_gettime, vec![]),
         (libc::SYS_clock_nanosleep, vec![]),
@@ -963,7 +955,18 @@ fn vcpu_thread_rules(
         (libc::SYS_writev, vec![]),
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_getcwd, vec![]),
-    ])
+    ];
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    if matches!(hypervisor_type, HypervisorType::Themis) {
+        return Ok(rules
+            .into_iter()
+            .chain([
+                (libc::SYS_eventfd2, vec![]),
+                (libc::SYS_timerfd_settime, vec![]),
+            ])
+            .collect());
+    }
+    Ok(rules)
 }
 
 // The filter containing the white listed syscall rules required by the HTTP API to
@@ -1101,5 +1104,105 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+#[cfg(all(test, feature = "themis", target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn themis_filters_allow_current_launch_and_timer_ioctls() {
+        const ROLE: &str = "THEMIS_SECCOMP_REGRESSION_ROLE";
+        if let Ok(role) = std::env::var(ROLE) {
+            let thread = if role == "vmm" {
+                Thread::Vmm
+            } else {
+                Thread::Vcpu
+            };
+            let mut ioctls = vec![
+                THHV_SET_GUEST_MEMORY,
+                THHV_IRQFD,
+                THHV_INJECT_INTERRUPT,
+                THHV_CREATE_DOORBELL,
+                THHV_DOORBELL_EVENTFD,
+                THHV_SEND_CAP,
+                THHV_SET_POLICY,
+                THHV_INITIALIZE_PARTITION,
+                THHV_RUN_VP,
+                THHV_GET_VP_STATE,
+                THHV_SET_VP_STATE,
+            ];
+            if role == "vmm" {
+                ioctls.extend([
+                    THHV_CREATE_PARTITION,
+                    THHV_CREATE_VP,
+                    THHV_QUERY,
+                    THHV_SEND_SHARED_META,
+                ]);
+            }
+            let mut rules = get_seccomp_rules(thread, HypervisorType::Themis).unwrap();
+            // Permit only subprocess termination in addition to the real rules.
+            rules.push((libc::SYS_exit_group, vec![]));
+            let filter: BpfProgram = SeccompFilter::new(
+                rules.into_iter().collect(),
+                SeccompAction::Trap,
+                SeccompAction::Allow,
+                std::env::consts::ARCH.try_into().unwrap(),
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+            seccompiler::apply_filter(&filter).unwrap();
+            for request in ioctls {
+                // SAFETY: fd -1 cannot address a device; no pointer is dereferenced.
+                assert_eq!(unsafe { libc::ioctl(-1, request, 0) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF)
+                );
+            }
+            // SAFETY: eventfd2 has no pointer arguments.
+            let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+            assert!(event >= 0);
+            // SAFETY: event is a live descriptor owned by this test.
+            assert_eq!(unsafe { libc::close(event) }, 0);
+            let arm = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            };
+            // SAFETY: arm is live and initialized; -1 is deliberately invalid.
+            assert_eq!(
+                unsafe { libc::timerfd_settime(-1, 0, &arm, std::ptr::null_mut()) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+            // SAFETY: this isolated subprocess must not run test-harness cleanup
+            // under the filter installed on its test thread.
+            unsafe { libc::_exit(0) }
+        }
+        for role in ["vmm", "vcpu"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "seccomp_filters::tests::themis_filters_allow_current_launch_and_timer_ioctls",
+                ])
+                .env(ROLE, role)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "{role} filter rejected a backend operation: {status}"
+            );
+        }
     }
 }

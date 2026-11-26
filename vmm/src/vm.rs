@@ -470,6 +470,25 @@ impl VmOps for VmOpsHandler {
         Ok(())
     }
 
+    #[cfg(feature = "themis")]
+    fn device_mmio_read(&self, gpa: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
+        self.mmio_bus
+            .read(gpa, data)
+            .map_err(|error| HypervisorVmError::MmioBusRead(error.into()))
+    }
+
+    #[cfg(feature = "themis")]
+    fn device_mmio_write(&self, gpa: u64, data: &[u8]) -> result::Result<(), HypervisorVmError> {
+        if let Some(barrier) = self
+            .mmio_bus
+            .write(gpa, data)
+            .map_err(|error| HypervisorVmError::MmioBusWrite(error.into()))?
+        {
+            barrier.wait();
+        }
+        Ok(())
+    }
+
     #[cfg(target_arch = "x86_64")]
     fn pio_read(&self, port: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
         if let Err(vm_device::BusError::MissingAddressRange) = self.io_bus.read(port, data) {
@@ -493,6 +512,28 @@ impl VmOps for VmOpsHandler {
         }
         Ok(())
     }
+}
+
+#[cfg(all(test, feature = "themis", target_arch = "x86_64"))]
+#[test]
+fn shared_mmio_rejects_missing_devices_without_changing_legacy_holes() {
+    let ops = VmOpsHandler {
+        memory: GuestMemoryAtomic::new(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap(),
+        ),
+        io_bus: Arc::new(Bus::new()),
+        mmio_bus: Arc::new(Bus::new()),
+    };
+    assert!(matches!(
+        ops.device_mmio_read(0x1000, &mut [0; 4]),
+        Err(HypervisorVmError::MmioBusRead(_))
+    ));
+    assert!(matches!(
+        ops.device_mmio_write(0x1000, &[0; 4]),
+        Err(HypervisorVmError::MmioBusWrite(_))
+    ));
+    assert!(ops.mmio_read(0x1000, &mut [0; 4]).is_ok());
+    assert!(ops.mmio_write(0x1000, &[0; 4]).is_ok());
 }
 
 pub fn physical_bits(hypervisor: &dyn hypervisor::Hypervisor, max_phys_bits: u8) -> u8 {
@@ -561,6 +602,8 @@ impl Vm {
 
         // Determine if IOMMU should be forced based on confidential computing features
         let force_iommu = Self::should_force_iommu(&config);
+        #[cfg(feature = "themis")]
+        let force_iommu = force_iommu || vm.shared_device_memory().is_some();
 
         let stop_on_boot = Self::should_stop_on_boot(&config);
 
@@ -2710,6 +2753,13 @@ impl Vm {
         // Load kernel synchronously or if asynchronous then wait for load to
         // finish.
         let entry_point = self.entry_point()?;
+
+        #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+        if self.cpu_manager.lock().unwrap().uses_guest_mp_wakeup() {
+            let memory = self.memory_manager.lock().unwrap().guest_memory().memory();
+            arch::mp_wakeup::prepare(&memory)
+                .map_err(|e| Error::ConfigureSystem(arch::Error::MpWakeup(e)))?;
+        }
 
         #[cfg(feature = "tdx")]
         let tdx_enabled = self.config.lock().unwrap().is_tdx_enabled();

@@ -22,6 +22,10 @@ type GuestRegionMmap = vm_memory::GuestRegionMmap<vm_memory::bitmap::AtomicBitma
 #[derive(Debug, Error)]
 pub enum Error {
     #[cfg(target_arch = "x86_64")]
+    #[error("Error configuring guest multiprocessor wakeup firmware")]
+    MpWakeup(#[source] anyhow::Error),
+
+    #[cfg(target_arch = "x86_64")]
     #[error("Platform specific error (x86_64)")]
     PlatformSpecific(#[from] x86_64::Error),
     #[cfg(target_arch = "aarch64")]
@@ -101,7 +105,7 @@ pub mod x86_64;
 pub use x86_64::{
     _NSIG, CpuidConfig, CpuidFeatureEntry, EntryPoint, arch_memory_regions, configure_system,
     configure_vcpu, generate_common_cpuid, generate_ram_ranges, get_host_cpu_phys_bits,
-    initramfs_load_addr, layout, layout::CMDLINE_MAX_SIZE, layout::CMDLINE_START, regs,
+    initramfs_load_addr, layout, layout::CMDLINE_MAX_SIZE, layout::CMDLINE_START, mp_wakeup, regs,
 };
 
 /// Safe wrapper for `sysconf(_SC_PAGESIZE)`.

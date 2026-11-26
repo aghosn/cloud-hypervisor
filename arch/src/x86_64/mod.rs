@@ -9,6 +9,7 @@
 
 pub mod interrupts;
 pub mod layout;
+pub mod mp_wakeup;
 pub mod regs;
 
 #[cfg(feature = "tdx")]

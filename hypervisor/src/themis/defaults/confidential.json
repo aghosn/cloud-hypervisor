@@ -3,7 +3,10 @@
     "name": "themis-default-confidential",
     "confidential": true,
     "vtom_bit": null,
-    "shared_regions": []
+    "shared_regions": [
+      { "name": "EBDA/ACPI-low", "gpa": "0xA0000", "size": "0x48000" },
+      { "name": "ACPI-high", "gpa": "0xED000", "size": "0x13000" }
+    ]
   },
   "policies": {
     "cores": {},
@@ -11,15 +14,15 @@
     "interrupts": {
       "default": {
         "visibility": "NotReport",
-        "read_set": "ALL",
-        "write_set": "ALL"
+        "read_set": "NONE",
+        "write_set": "NONE"
       }
     },
     "exits": {
       "default": {
         "trap": true,
-        "read_set": "ALL",
-        "write_set": "ALL"
+        "read_set": "NONE",
+        "write_set": "NONE"
       }
     },
     "msrs": {

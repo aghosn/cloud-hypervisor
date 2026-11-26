@@ -9,15 +9,12 @@
 //! `themis-abi` (the single source of truth shared with capavisor, thhv, and
 //! libthemis) rather than re-defined here.
 
-use crate::arch::x86::MsrEntry;
-
+// Synthetic exit reason injected by capavisor (high bit set, not an SDM value).
+// Domain-comm message types.
+pub(super) use themis_abi::regs::THEMIC_MSG_SHUTDOWN;
 // ── Re-exports from the shared `themis-abi` crate ────────────────────────── //
 // VpRegister enum (used as u64 register-id over the THHV ioctl wire).
 pub(super) use themis_abi::regs::VpRegister;
-// Synthetic exit reason injected by capavisor (high bit set, not an SDM value).
-pub(super) use themis_abi::synthetic_exits::THEMIS_EXIT_DOORBELL;
-// Domain-comm message types.
-pub(super) use themis_abi::regs::THEMIC_MSG_SHUTDOWN;
 // SIPI real-mode segment access rights (VMX encoding).
 pub(super) use themis_abi::regs::access_rights::CODE16 as REALMODE_CODE_SEG_AR;
 pub(super) use themis_abi::regs::access_rights::DATA16 as REALMODE_DATA_SEG_AR;
@@ -32,6 +29,8 @@ pub(super) use themis_abi::vmx_exit_reasons::{
     WRMSR as EXIT_REASON_WRMSR,
 };
 
+use crate::arch::x86::MsrEntry;
+
 pub(super) const THHV_IOCTL_MAGIC: u8 = 0xB8;
 pub(super) const THHV_SCHED_SYNC: u32 = 0;
 pub(super) const THHV_MEM_F_UNMAP: u32 = 1 << 0;
@@ -40,10 +39,7 @@ pub(super) const THHV_MEM_R_READ: u32 = 1 << 0;
 pub(super) const THHV_MEM_R_WRITE: u32 = 1 << 1;
 pub(super) const THHV_MEM_R_EXEC: u32 = 1 << 2;
 pub(super) const THHV_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
-pub(super) const THHV_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 0;
-pub(super) const THHV_IOEVENTFD_FLAG_PIO: u32 = 1 << 1;
-pub(super) const THHV_IOEVENTFD_FLAG_DEASSIGN: u32 = 1 << 2;
-pub(super) const THHV_META_PAGES_PER_VP: usize = 3;
+pub(super) const THHV_META_PAGES_PER_VP: usize = 7;
 pub(super) const THHV_META_PAGES_SHARED: usize = 4;
 pub(super) const THHV_QUERY_META_PAGES_PER_VP: u32 = 1;
 pub(super) const THHV_QUERY_META_PAGES_SHARED: u32 = 2;
@@ -66,10 +62,6 @@ pub(super) const LAPIC_MMIO_OFFSET_MASK: u64 = LAPIC_MMIO_SIZE - 1;
 /// Intel SDM Vol 3A §18.7.3 — Time Stamp Counter and Nominal Core Crystal
 /// Clock Information leaf.  EAX/EBX/ECX expose the TSC ↔ crystal ratio.
 pub(super) const CPUID_LEAF_TSC_FREQ: u32 = 0x15;
-/// Intel SDM Vol 3A §3.2 — Processor Frequency Information leaf.
-/// EAX = base MHz, EBX = max MHz, ECX = bus reference MHz.
-pub(super) const CPUID_LEAF_PROC_FREQ: u32 = 0x16;
-
 /// Maximum number of vCPUs the Themis backend advertises to upper layers.
 /// Sourced from `themis_abi::MAX_VPS_PER_DOMAIN` so the cap matches what the
 /// capavisor and thhv enforce.  Renamed here to keep the CHV-side name
@@ -100,27 +92,7 @@ pub(super) const ICR_MODE_SIPI: u32 = 6;
 pub(super) const MSI_ADDR_DEST_ID_SHIFT: u32 = 12;
 pub(super) const MSI_ADDR_DEST_ID_MASK: u32 = 0xFF;
 
-// Policy-kind discriminants for THHV_SET_POLICY (mirrors THEMIS_POLICY_* in thhv.h).
-#[allow(dead_code)]
-pub mod policy_kind {
-    pub const CORES: u64 = 0;
-    pub const API_MONITOR: u64 = 1;
-    pub const DEFAULT_INTR_VISIBILITY: u64 = 2;
-    pub const VECTOR_VISIBILITY: u64 = 3;
-    pub const VECTOR_REG_READ_SET: u64 = 4;
-    pub const VECTOR_REG_WRITE_SET: u64 = 5;
-    pub const DEFAULT_EXIT_TRAP: u64 = 6;
-    pub const EXIT_REASON_TRAP: u64 = 7;
-    pub const EXIT_REASON_REG_READ_SET: u64 = 8;
-    pub const EXIT_REASON_REG_WRITE_SET: u64 = 9;
-    pub const CPUID_DEFAULT: u64 = 10;
-    pub const CPUID_RANGE: u64 = 11;
-    pub const CPUID_EMULATE: u64 = 12;
-    pub const MSR_DEFAULT: u64 = 13;
-    pub const MSR_RANGE: u64 = 14;
-    pub const MSR_EMULATE: u64 = 15;
-    pub const VECTOR_INJECTABLE: u64 = 16;
-}
+pub use themis_abi::policy_kind;
 
 /// Standard register set queried/restored by the KVM-like get/set_standard_registers
 /// path: 16 GP regs + RIP + RFLAGS (matches `StandardRegisters` layout).

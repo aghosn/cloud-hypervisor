@@ -1120,6 +1120,14 @@ pub fn create_acpi_tables(
         tpm_enabled,
     );
 
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    if cpu_manager.lock().unwrap().uses_guest_mp_wakeup() {
+        assert!(
+            dsdt_addr.0 + tables_bytes.len() as u64 <= arch::layout::MP_WAKEUP_START.0,
+            "ACPI tables overlap private multiprocessor wakeup firmware"
+        );
+    }
+
     guest_mem
         .write_slice(rsdp.as_bytes(), rsdp_addr)
         .expect("Error writing RSDP");

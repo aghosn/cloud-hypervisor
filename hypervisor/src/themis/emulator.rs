@@ -5,29 +5,27 @@
 // Instead of decoding MMIO instructions in the capavisor (which only handled
 // a handful of opcodes), we use CHV's existing iced-x86 emulator infrastructure
 // (MOV, MOVZX, CMP, MOVS, STOS, OR, etc.) to emulate the faulting instruction
-// in userspace.  The capavisor only needs to supply the instruction bytes and
-// the faulting GPA; all decode, register update, and RIP advancement happens here.
+// in userspace. Instructions are fetched through CHV's own guest-memory access;
+// the capavisor supplies only exit metadata, never guest instruction bytes.
 //
 // See P16.6i in todo.md for the full design rationale.
 
 use anyhow::anyhow;
+use iced_x86::{Decoder, DecoderError, DecoderOptions};
 use log::debug;
 
+use super::ThemisVcpu;
 use crate::arch::emulator::{PlatformEmulator, PlatformError};
 use crate::arch::x86::emulator::EmulatorCpuState;
 use crate::cpu::Vcpu;
 
-use super::ThemisVcpu;
-
 /// Emulator context for a single MMIO EPT-violation exit.
 ///
-/// Created per-exit with the faulting GPA and the instruction bytes from the
-/// capavisor intercept message.  Implements `PlatformEmulator` so it can be
+/// Created per-exit with the faulting GPA. Implements `PlatformEmulator` so it can be
 /// passed to `Emulator::emulate_first_insn()`.
 pub struct ThemisEmulatorContext<'a> {
     pub vcpu: &'a ThemisVcpu,
     pub mmio_gpa: u64,
-    pub insn_bytes: [u8; 16],
     /// Mask with the VTOM bit set (e.g. `1 << 38`).  CoCo guests set this bit
     /// in page-table entries for shared (MMIO / DMA) pages.  We strip it from
     /// GPAs before passing them to the device model so that addresses match the
@@ -52,18 +50,31 @@ impl ThemisEmulatorContext<'_> {
             .vm_ops()
             .ok_or_else(|| PlatformError::TranslateVirtualAddress(anyhow!("no vm_ops")))?;
 
-        let cr3 = self
+        let sregs = self
             .vcpu
             .get_sregs()
-            .map_err(|e| PlatformError::TranslateVirtualAddress(e.into()))?
-            .cr3;
+            .map_err(|e| PlatformError::TranslateVirtualAddress(e.into()))?;
+        let cr3 = sregs.cr3;
+        if sregs.cr0 & (1 << 31) == 0 {
+            return Ok(gva & !self.vtom_mask);
+        }
+        if sregs.efer & (1 << 10) == 0 || sregs.cr4 & (1 << 12) != 0 {
+            return Err(PlatformError::TranslateVirtualAddress(anyhow!(
+                "Themis MMIO emulation requires four-level long-mode paging"
+            )));
+        }
 
         let read_entry = |table_phys: u64, index: u64| -> Result<u64, PlatformError> {
             let addr = (table_phys & PHYS_ADDR_MASK) | (index * 8);
             let mut buf = [0u8; 8];
-            vm_ops
+            let count = vm_ops
                 .guest_mem_read(addr, &mut buf)
                 .map_err(|e| PlatformError::TranslateVirtualAddress(e.into()))?;
+            if count != buf.len() {
+                return Err(PlatformError::TranslateVirtualAddress(anyhow!(
+                    "short page-table read"
+                )));
+            }
             Ok(u64::from_le_bytes(buf))
         };
 
@@ -135,6 +146,17 @@ impl ThemisEmulatorContext<'_> {
     /// Write to guest memory at a guest virtual address.
     fn write_gva(&self, gva: u64, data: &[u8]) -> Result<(), PlatformError> {
         let gpa = self.translate_gva(gva)?;
+        if self
+            .vcpu
+            .vm_state
+            .ioevents
+            .lock()
+            .unwrap()
+            .write(crate::IoEventAddress::Mmio(gpa), data)
+            .map_err(|e| PlatformError::MemoryWriteFailure(e.into()))?
+        {
+            return Ok(());
+        }
         let vm_ops = self
             .vcpu
             .vm_ops()
@@ -152,6 +174,59 @@ impl ThemisEmulatorContext<'_> {
         }
         Ok(())
     }
+
+    pub(super) fn instruction_bytes(&self, ip: u64) -> Result<[u8; 16], PlatformError> {
+        let vm_ops = self
+            .vcpu
+            .vm_ops()
+            .ok_or_else(|| PlatformError::MemoryReadFailure(anyhow!("no vm_ops")))?;
+        let sregs = self
+            .vcpu
+            .get_sregs()
+            .map_err(|e| PlatformError::GetCpuStateFailure(e.into()))?;
+        if sregs.cs.l == 0 || sregs.efer & (1 << 10) == 0 {
+            return Err(PlatformError::MemoryReadFailure(anyhow!(
+                "Themis instruction emulator requires 64-bit code"
+            )));
+        }
+        fetch_instruction(ip, |gva, bytes| {
+            let gpa = self.translate_gva(gva)?;
+            let count = vm_ops
+                .guest_mem_read(gpa, bytes)
+                .map_err(|e| PlatformError::MemoryReadFailure(e.into()))?;
+            if count != bytes.len() {
+                return Err(PlatformError::MemoryReadFailure(anyhow!(
+                    "short instruction read"
+                )));
+            }
+            Ok(())
+        })
+    }
+}
+
+fn fetch_instruction(
+    ip: u64,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), PlatformError>,
+) -> Result<[u8; 16], PlatformError> {
+    let mut bytes = [0; 16];
+    let first = (0x1000 - (ip & 0xfff) as usize).min(15);
+    read(ip, &mut bytes[..first])?;
+    let mut decoder = Decoder::with_ip(64, &bytes[..first], ip, DecoderOptions::NONE);
+    let _ = decoder.decode();
+    if decoder.last_error() == DecoderError::NoMoreBytes && first < 15 {
+        let next = ip.checked_add(first as u64).ok_or_else(|| {
+            PlatformError::MemoryReadFailure(anyhow!("instruction address overflow"))
+        })?;
+        read(next, &mut bytes[first..15])?;
+        decoder = Decoder::with_ip(64, &bytes[..15], ip, DecoderOptions::NONE);
+        let _ = decoder.decode();
+    }
+    if decoder.last_error() != DecoderError::None {
+        return Err(PlatformError::MemoryReadFailure(anyhow!(
+            "invalid or incomplete instruction"
+        )));
+    }
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -208,11 +283,58 @@ impl PlatformEmulator for ThemisEmulatorContext<'_> {
         Ok(())
     }
 
-    fn fetch(&self, _ip: u64, instruction_bytes: &mut [u8]) -> Result<(), PlatformError> {
-        // The capavisor already read 16 instruction bytes from guest memory
-        // and placed them in the intercept message.  Return those directly.
-        let n = instruction_bytes.len().min(self.insn_bytes.len());
-        instruction_bytes[..n].copy_from_slice(&self.insn_bytes[..n]);
+    fn fetch(&self, ip: u64, instruction_bytes: &mut [u8]) -> Result<(), PlatformError> {
+        let bytes = self.instruction_bytes(ip)?;
+        let source = bytes.get(..instruction_bytes.len()).ok_or_else(|| {
+            PlatformError::MemoryReadFailure(anyhow!("instruction buffer too large"))
+        })?;
+        instruction_bytes.copy_from_slice(source);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_instruction_does_not_read_an_unmapped_next_page() {
+        let mut reads = Vec::new();
+        let bytes = fetch_instruction(0xfff, |addr, bytes| {
+            reads.push(addr);
+            assert_eq!(addr, 0xfff);
+            bytes[0] = 0x90;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(bytes[0], 0x90);
+        assert_eq!(reads, vec![0xfff]);
+    }
+
+    #[test]
+    fn cross_page_instruction_is_fetched_from_both_pages() {
+        let bytes = fetch_instruction(0xffe, |addr, bytes| {
+            match addr {
+                0xffe => bytes.copy_from_slice(&[0x48, 0x8b]),
+                0x1000 => bytes[0] = 0x00,
+                _ => panic!("unexpected fetch address"),
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(&bytes[..3], &[0x48, 0x8b, 0x00]);
+    }
+
+    #[test]
+    fn inaccessible_instruction_memory_returns_an_error() {
+        let result = fetch_instruction(0xfff, |addr, bytes| {
+            if addr == 0xfff {
+                bytes[0] = 0x48;
+                Ok(())
+            } else {
+                Err(PlatformError::MemoryReadFailure(anyhow!("unmapped")))
+            }
+        });
+        result.unwrap_err();
     }
 }

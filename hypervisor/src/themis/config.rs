@@ -14,18 +14,18 @@
 //!
 //! `policies` mirrors `capa-engine::domain::DomainPolicy` 1-to-1.
 //!
-//! This module owns only the *parsed* representation.  Applying the config
-//! to actual THHV_SET_POLICY calls is done in
-//! `cloud-hypervisor/hypervisor/src/themis/vm_state.rs` and is scheduled
-//! for a later task (`chv-themis-config-apply`).  Reconciliation with the
-//! CLI `--ivshmem` list happens in `vmm/src/config.rs` and is scheduled
-//! for `chv-themis-config-ivshmem-merge`.
+//! This module parses and validates declarations. `policy_walker` and
+//! `vm_state` apply them; `vmm/src/config.rs` reconciles CLI ivshmem devices.
 
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod pv;
+pub(super) use pv::ResolvedPv;
+pub use pv::{PvChannel, PvRegion};
 
 // ── Embedded default profiles ───────────────────────────────────────────── //
 
@@ -237,9 +237,8 @@ impl ThemisConfig {
         // Otherwise treat as a path.  Reject anything that "looks like" a
         // built-in name a user might have typo'd (no path separator, no
         // extension) — this is friendlier than a Read error.
-        let looks_like_bare_name = !extends.contains('/')
-            && !extends.contains('\\')
-            && !extends.contains('.');
+        let looks_like_bare_name =
+            !extends.contains('/') && !extends.contains('\\') && !extends.contains('.');
         if looks_like_bare_name {
             return Err(ThemisConfigError::ExtendsUnknownBuiltin { name: extends });
         }
@@ -248,10 +247,7 @@ impl ThemisConfig {
         let base_path = if path.is_absolute() {
             path
         } else {
-            caller_path
-                .parent()
-                .map(|d| d.join(&path))
-                .unwrap_or(path)
+            caller_path.parent().map(|d| d.join(&path)).unwrap_or(path)
         };
 
         let base_raw =
@@ -293,7 +289,39 @@ impl ThemisConfig {
     }
 
     /// Cheap sanity checks that don't require touching the runtime.
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
+        self.policies.cores.resolved_mask()?;
+        let mut shared = self.general.shared_regions().to_vec();
+        shared.sort_by_key(|region| region.gpa);
+        let mut end = 0;
+        for region in shared {
+            let next = region.gpa.checked_add(region.size);
+            if region.size == 0
+                || (region.gpa | region.size) & 0xfff != 0
+                || next.is_none()
+                || region.gpa < end
+            {
+                return Err(ThemisConfigError::Validation(
+                    "shared regions must be nonempty, page-aligned, nonoverlapping ranges".into(),
+                ));
+            }
+            end = next.unwrap();
+            if self.general.uses_pv_devices() && region.gpa < 0xed000 && end > 0xe8000 {
+                return Err(ThemisConfigError::Validation(
+                    "shared region overlaps private AP startup firmware at 0xe8000..0xed000".into(),
+                ));
+            }
+        }
+        if self.general.confidential
+            && self.general.device_transport == Some(DeviceTransport::Legacy)
+        {
+            return Err(ThemisConfigError::Validation(
+                "confidential guests require PV device transport".into(),
+            ));
+        }
+        if let Some(comm) = &self.comm {
+            comm.validate_pv()?;
+        }
         // Reject overlapping MSR overrides at the same time.
         // TODO(chv-themis-config-apply): stronger validation once we know the
         // full apply semantics.
@@ -320,14 +348,51 @@ pub struct GeneralConfig {
     #[serde(default)]
     pub confidential: bool,
 
+    /// Defaults to PV for confidential guests, legacy otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_transport: Option<DeviceTransport>,
+
     /// `null` (or absent) means "auto-derive from CPUID leaf 0x80000008".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vtom_bit: Option<u8>,
 
-    /// Confidential-mode plaintext carve-outs (EBDA/ACPI/etc).  Empty for
-    /// non-confidential guests.  NOT ivshmem — see docs/chv-themis-config.md.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub shared_regions: Vec<SharedRegion>,
+    /// Omitted uses the platform's EBDA/ACPI defaults; an explicit empty
+    /// list shares no RAM. These are not ivshmem mappings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_regions: Option<Vec<SharedRegion>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceTransport {
+    Legacy,
+    Pv,
+}
+
+impl GeneralConfig {
+    pub(super) fn shared_regions(&self) -> &[SharedRegion] {
+        const DEFAULT: [SharedRegion; 2] = [
+            SharedRegion {
+                name: None,
+                gpa: 0xa0000,
+                size: 0x48000,
+            },
+            SharedRegion {
+                name: None,
+                gpa: 0xed000,
+                size: 0x13000,
+            },
+        ];
+        self.shared_regions.as_deref().unwrap_or(&DEFAULT)
+    }
+
+    pub fn uses_pv_devices(&self) -> bool {
+        self.device_transport.unwrap_or(if self.confidential {
+            DeviceTransport::Pv
+        } else {
+            DeviceTransport::Legacy
+        }) == DeviceTransport::Pv
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -371,8 +436,8 @@ pub struct PoliciesConfig {
 
 // ── policies.cores ──────────────────────────────────────────────────────── //
 
-/// Allowed physical cores.  Either an explicit list or a bitmask.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+/// Allowed physical cores. Either an explicit list or a bitmask.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoresConfig {
     /// Explicit list of allowed core indices (0-based).  Mutually exclusive
@@ -382,16 +447,43 @@ pub struct CoresConfig {
 
     /// Bitmap of allowed cores (bit i = core i).  Mutually exclusive with
     /// `allowed`.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "hex_or_dec_u64_opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "hex_or_dec_u64_opt"
+    )]
     pub mask: Option<u64>,
 }
 
-impl Default for CoresConfig {
-    fn default() -> Self {
-        Self {
-            allowed: None,
-            mask: None,
+impl CoresConfig {
+    pub(super) fn resolved_mask(&self) -> Result<u64> {
+        let mask = match (&self.allowed, self.mask) {
+            (Some(_), Some(_)) => {
+                return Err(ThemisConfigError::Validation(
+                    "cores.allowed and cores.mask are mutually exclusive".into(),
+                ));
+            }
+            (Some(cores), None) => {
+                let mut mask = 0;
+                for &core in cores {
+                    if core >= u64::BITS || mask & (1u64 << core) != 0 {
+                        return Err(ThemisConfigError::Validation(
+                            "cores.allowed must contain unique core indices below 64".into(),
+                        ));
+                    }
+                    mask |= 1u64 << core;
+                }
+                mask
+            }
+            (None, Some(mask)) => mask,
+            (None, None) => u64::MAX,
+        };
+        if mask == 0 {
+            return Err(ThemisConfigError::Validation(
+                "core mask must not be empty".into(),
+            ));
         }
+        Ok(mask)
     }
 }
 
@@ -430,7 +522,8 @@ pub enum ApiAllow {
 
 /// serde helper: accept the literal string `"ALL"` for `ApiAllow::All`.
 mod api_all_marker {
-    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str("ALL")
@@ -631,7 +724,11 @@ pub enum OverrideAction {
 #[serde(deny_unknown_fields)]
 pub struct MsrOverride {
     /// Single-MSR form.  Mutually exclusive with `range`.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "hex_or_dec_u32_opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "hex_or_dec_u32_opt"
+    )]
     pub msr: Option<u32>,
 
     /// Inclusive `[lo, hi]` range.  Mutually exclusive with `msr`.
@@ -708,7 +805,11 @@ impl CpuidConfig {
 #[serde(deny_unknown_fields)]
 pub struct CpuidOverride {
     /// Single leaf.  Mutually exclusive with `range`.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "hex_or_dec_u32_opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "hex_or_dec_u32_opt"
+    )]
     pub leaf: Option<u32>,
 
     /// Subleaf for a single-leaf override (defaults to 0).
@@ -749,6 +850,10 @@ pub enum CpuidCoord {
 pub struct CommConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ivshmem: Vec<IvshmemEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<PvRegion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<PvChannel>,
 }
 
 /// Mirror of the Themis-relevant subset of
@@ -801,17 +906,18 @@ pub enum RegSet {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum RegSetSymbolic {
-    ALL,
-    NONE,
+    All,
+    None,
 }
 
 impl RegSet {
     pub fn all() -> Self {
-        RegSet::Symbolic(RegSetSymbolic::ALL)
+        RegSet::Symbolic(RegSetSymbolic::All)
     }
     pub fn none() -> Self {
-        RegSet::Symbolic(RegSetSymbolic::NONE)
+        RegSet::Symbolic(RegSetSymbolic::None)
     }
 }
 
@@ -830,7 +936,8 @@ pub enum ValueOrExpr {
 // ── serde helpers: hex-or-decimal integers ──────────────────────────────── //
 
 mod hex_or_dec_u64 {
-    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_u64(*v)
@@ -948,6 +1055,61 @@ impl<'de> Deserialize<'de> for HexOrDecU32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn core_restrictions_resolve_and_reject_invalid_masks() {
+        use super::*;
+        let list =
+            ThemisConfig::from_json_str(r#"{"policies":{"cores":{"allowed":[1,4,63]}}}"#).unwrap();
+        assert_eq!(
+            list.policies.cores.resolved_mask().unwrap(),
+            (1 << 1) | (1 << 4) | (1 << 63)
+        );
+        let mask =
+            ThemisConfig::from_json_str(r#"{"policies":{"cores":{"mask":"0x12"}}}"#).unwrap();
+        assert_eq!(mask.policies.cores.resolved_mask().unwrap(), 0x12);
+        for cores in [
+            r#"{"allowed":[]}"#,
+            r#"{"allowed":[64]}"#,
+            r#"{"allowed":[1,1]}"#,
+            r#"{"mask":0}"#,
+            r#"{"mask":1,"allowed":[0]}"#,
+        ] {
+            assert!(
+                ThemisConfig::from_json_str(&format!(r#"{{"policies":{{"cores":{cores}}}}}"#))
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_ranges_reject_aliases_of_firmware_and_malformed_ranges() {
+        use super::*;
+        for regions in [
+            r#"[{"gpa":"0xe8000","size":"0x1000"}]"#,
+            r#"[{"gpa":1,"size":"0x1000"}]"#,
+            r#"[{"gpa":0,"size":0}]"#,
+            r#"[{"gpa":"0xfffffffffffff000","size":"0x2000"}]"#,
+            r#"[{"gpa":"0x1000","size":"0x2000"},{"gpa":"0x2000","size":"0x1000"}]"#,
+        ] {
+            let json =
+                format!(r#"{{"general":{{"confidential":true,"shared_regions":{regions}}}}}"#);
+            assert!(
+                ThemisConfig::from_json_str(&json)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "{json}"
+            );
+        }
+        let no_shared =
+            ThemisConfig::from_json_str(r#"{"general":{"confidential":true,"shared_regions":[]}}"#)
+                .unwrap();
+        assert!(no_shared.general.shared_regions().is_empty());
+        assert!(!GeneralConfig::default().shared_regions().is_empty());
+    }
+
     use super::*;
 
     #[test]
@@ -969,6 +1131,31 @@ mod tests {
         .expect("parse");
         assert!(cfg.general.confidential);
         assert_eq!(cfg.general.vtom_bit, Some(46));
+    }
+
+    #[test]
+    fn device_transport_is_explicit_and_confidential_cannot_use_legacy() {
+        for (confidential, transport, expected) in [
+            (false, None, false),
+            (true, None, true),
+            (false, Some("legacy"), false),
+            (false, Some("pv"), true),
+            (true, Some("pv"), true),
+        ] {
+            let mut value = serde_json::json!({"general": {"confidential": confidential}});
+            if let Some(transport) = transport {
+                value["general"]["device_transport"] = transport.into();
+            }
+            let config = ThemisConfig::from_json_str(&value.to_string()).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.general.uses_pv_devices(), expected);
+        }
+        let invalid = ThemisConfig::from_json_str(
+            r#"{"general":{"confidential":true,"device_transport":"legacy"}}"#,
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
+        ThemisConfig::from_json_str(r#"{"general":{"device_transport":"automatic"}}"#).unwrap_err();
     }
 
     #[test]
@@ -997,10 +1184,9 @@ mod tests {
     fn api_allow_string_and_list() {
         let all = ThemisConfig::from_json_str(r#"{"policies":{"api":{"allow":"ALL"}}}"#).unwrap();
         assert!(matches!(all.policies.api.allow, ApiAllow::All));
-        let list = ThemisConfig::from_json_str(
-            r#"{"policies":{"api":{"allow":["carve","seal"]}}}"#,
-        )
-        .unwrap();
+        let list =
+            ThemisConfig::from_json_str(r#"{"policies":{"api":{"allow":["carve","seal"]}}}"#)
+                .unwrap();
         assert!(matches!(list.policies.api.allow, ApiAllow::List(_)));
     }
 
@@ -1024,6 +1210,10 @@ mod tests {
             cfg.policies.interrupts.overrides[0].policy.visibility,
             Visibility::Deliver
         );
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        let interrupts = &serialized["policies"]["interrupts"];
+        assert_eq!(interrupts["default"]["read_set"], "ALL");
+        assert_eq!(interrupts["overrides"][0]["write_set"], "NONE");
     }
 
     #[test]
@@ -1035,12 +1225,13 @@ mod tests {
             .unwrap();
         assert!(!cfg.general.confidential);
         // The standard profile installs an Emulate(0x6E0) override.
-        assert!(cfg
-            .policies
-            .msrs
-            .overrides
-            .iter()
-            .any(|o| o.msr == Some(0x6E0)));
+        assert!(
+            cfg.policies
+                .msrs
+                .overrides
+                .iter()
+                .any(|o| o.msr == Some(0x6E0))
+        );
     }
 
     #[test]
@@ -1050,12 +1241,13 @@ mod tests {
             .unwrap();
         assert!(cfg.general.confidential);
         // Confidential profile adds the CoCo detection CPUID leaf.
-        assert!(cfg
-            .policies
-            .cpuid
-            .overrides
-            .iter()
-            .any(|o| o.leaf == Some(0x40000100)));
+        assert!(
+            cfg.policies
+                .cpuid
+                .overrides
+                .iter()
+                .any(|o| o.leaf == Some(0x40000100))
+        );
     }
 
     #[test]
@@ -1082,11 +1274,7 @@ mod tests {
     fn extends_path_shallow_merges() {
         // Base file on disk with a non-default general section.
         let tmp = std::env::temp_dir().join("themis-config-test-base.json");
-        std::fs::write(
-            &tmp,
-            r#"{"general":{"confidential":true,"vtom_bit":42}}"#,
-        )
-        .unwrap();
+        std::fs::write(&tmp, r#"{"general":{"confidential":true,"vtom_bit":42}}"#).unwrap();
 
         let child_json = format!(
             r#"{{"extends":"{}"}}"#,
@@ -1104,8 +1292,7 @@ mod tests {
 
     #[test]
     fn unknown_field_rejected() {
-        let err =
-            ThemisConfig::from_json_str(r#"{"general":{"typo_field":true}}"#).unwrap_err();
+        let err = ThemisConfig::from_json_str(r#"{"general":{"typo_field":true}}"#).unwrap_err();
         assert!(matches!(err, ThemisConfigError::Parse { .. }));
     }
 
@@ -1139,8 +1326,8 @@ mod tests {
     /// resolve `extends: "standard"`, and pass full validation.
     #[test]
     fn eunomia_wrmsr_policies_parse() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../eunomia/policies/wrmsr");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eunomia/policies/wrmsr");
         assert!(dir.is_dir(), "policies dir missing: {}", dir.display());
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -1148,17 +1335,22 @@ mod tests {
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
             .collect();
         files.sort();
-        assert_eq!(files.len(), 4, "expected 4 wrmsr policies, got {:?}", files);
+        assert_eq!(files.len(), 4, "expected 4 wrmsr policies, got {files:?}");
         for f in &files {
             let cfg = ThemisConfig::load_from_file(f)
                 .unwrap_or_else(|e| panic!("failed to load {}: {e}", f.display()));
             // Every policy carries the "Euno" discriminator via CPUID 0x40000F00
             // as an Emulate override.
             let cpuid = &cfg.policies.cpuid;
-            let has_disc = cpuid.overrides.iter().any(|o| {
-                o.leaf == Some(0x40000F00) && matches!(o.action, OverrideAction::Emulate)
-            });
-            assert!(has_disc, "{}: missing 0x40000F00 discriminator", f.display());
+            let has_disc = cpuid
+                .overrides
+                .iter()
+                .any(|o| o.leaf == Some(0x40000F00) && matches!(o.action, OverrideAction::Emulate));
+            assert!(
+                has_disc,
+                "{}: missing 0x40000F00 discriminator",
+                f.display()
+            );
         }
     }
 
@@ -1179,8 +1371,8 @@ mod tests {
     /// and resolve `extends: "standard"`.
     #[test]
     fn eunomia_timer_interrupt_policies_parse() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../eunomia/policies/timer");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eunomia/policies/timer");
         assert!(dir.is_dir(), "policies dir missing: {}", dir.display());
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -1188,7 +1380,10 @@ mod tests {
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
             .collect();
         files.sort();
-        assert!(!files.is_empty(), "expected at least 1 timer policy, got none");
+        assert!(
+            !files.is_empty(),
+            "expected at least 1 timer policy, got none"
+        );
         for f in &files {
             let cfg = ThemisConfig::load_from_file(f)
                 .unwrap_or_else(|e| panic!("failed to load {}: {e}", f.display()));
@@ -1206,7 +1401,8 @@ mod tests {
             let name = f.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let expected_injectable = name != "suppress.json";
             assert_eq!(
-                vec_236.policy.injectable, expected_injectable,
+                vec_236.policy.injectable,
+                expected_injectable,
                 "{}: expected vector 236 override injectable={}",
                 f.display(),
                 expected_injectable
@@ -1225,11 +1421,40 @@ mod tests {
         assert!(dir.is_dir(), "policies dir missing: {}", dir.display());
         for (name, extends) in [
             ("dom1-standard.json", "standard"),
+            ("dom1-pv.json", "standard"),
             ("dom1-confidential.json", "confidential"),
         ] {
             let f = dir.join(name);
             let cfg = ThemisConfig::load_from_file(&f)
                 .unwrap_or_else(|e| panic!("failed to load {}: {e}", f.display()));
+            let base = ThemisConfig::builtin_default(if extends == "confidential" {
+                DefaultProfile::Confidential
+            } else {
+                DefaultProfile::Standard
+            })
+            .unwrap();
+            assert_eq!(cfg.general.confidential, base.general.confidential);
+            assert_eq!(
+                cfg.policies.exits.default,
+                base.policies.exits.default,
+                "{}: dom1 must preserve its profile's default exit-register masks",
+                f.display()
+            );
+            let coco_leaf = |config: &ThemisConfig| {
+                config
+                    .policies
+                    .cpuid
+                    .overrides
+                    .iter()
+                    .find(|entry| entry.leaf == Some(0x40000100))
+                    .cloned()
+            };
+            assert_eq!(
+                coco_leaf(&cfg),
+                coco_leaf(&base),
+                "{}: timer overrides must preserve confidential-mode discovery",
+                f.display()
+            );
             assert_eq!(
                 cfg.policies.interrupts.default.visibility,
                 Visibility::NotReport,

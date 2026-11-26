@@ -96,6 +96,7 @@ const IOAPIC_REG_ARBITRATION_ID: u8 = 0x02;
 // Register offsets
 const IOREGSEL_OFF: u8 = 0x0;
 const IOWIN_OFF: u8 = 0x10;
+const IOEOI_OFF: u8 = 0x40;
 const IOWIN_SCALE: u8 = 0x2;
 const REG_MAX_OFFSET: u8 = IOWIN_OFF + (NUM_IOAPIC_PINS as u8 * 2) - 1;
 
@@ -185,6 +186,7 @@ impl BusDevice for Ioapic {
         match offset as u8 {
             IOREGSEL_OFF => self.reg_sel = value,
             IOWIN_OFF => self.ioapic_write(value),
+            IOEOI_OFF => self.end_of_interrupt(value as u8),
             _ => {
                 error!("IOAPIC: failed writing at offset {offset}");
             }
@@ -455,4 +457,58 @@ impl Snapshottable for Ioapic {
 
 impl Pausable for Ioapic {}
 impl Transportable for Ioapic {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct NoInterrupts;
+
+    impl InterruptSourceGroup for NoInterrupts {
+        fn trigger(&self, _: InterruptIndex) -> std::io::Result<()> {
+            panic!("EOI must not inject an interrupt");
+        }
+        fn notifier(&self, _: InterruptIndex) -> Option<EventFd> {
+            None
+        }
+        fn update(
+            &self,
+            _: InterruptIndex,
+            _: InterruptSourceConfig,
+            _: bool,
+            _: bool,
+        ) -> std::io::Result<()> {
+            panic!("EOI must not reconfigure interrupt routing");
+        }
+        fn set_gsi(&self) -> std::io::Result<()> {
+            panic!("EOI must not reconfigure interrupt routing");
+        }
+    }
+
+    #[test]
+    fn direct_eoi_reaches_ioapic_through_the_registered_bus_aperture() {
+        use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
+        let mut ioapic = Ioapic {
+            id: "test".into(),
+            id_reg: 0,
+            reg_sel: 0,
+            reg_entries: [0; NUM_IOAPIC_PINS],
+            used_entries: [false; NUM_IOAPIC_PINS],
+            apic_address: APIC_START,
+            interrupt_source_group: Arc::new(NoInterrupts),
+        };
+        ioapic.reg_entries[0] = (1 << 15) | (1 << 14) | 0x40;
+        ioapic.reg_entries[1] = (1 << 15) | (1 << 14) | 0x41;
+        ioapic.reg_entries[2] = (1 << 14) | 0x40;
+        let device = Arc::new(Mutex::new(ioapic));
+        let bus = vm_device::Bus::new();
+        bus.insert(device.clone(), IOAPIC_START.0, IOAPIC_SIZE).unwrap();
+        bus.write(IOAPIC_START.0 + 0x40, &0x40u32.to_le_bytes()).unwrap();
+        let device = device.lock().unwrap();
+        assert_eq!(remote_irr(device.reg_entries[0]), 0);
+        assert_eq!(remote_irr(device.reg_entries[1]), 1);
+        assert_eq!(remote_irr(device.reg_entries[2]), 1);
+    }
+}
 impl Migratable for Ioapic {}

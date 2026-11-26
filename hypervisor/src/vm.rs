@@ -31,6 +31,11 @@ use crate::arch::x86::CpuIdEntry;
 use crate::cpu::Vcpu;
 use crate::{IoEventAddress, IrqRoutingEntry};
 
+#[cfg(feature = "themis")]
+pub type SharedDeviceMemory = vm_memory::GuestMemoryAtomic<
+    vm_memory::GuestMemoryMmap<vm_memory::bitmap::AtomicBitmap>,
+>;
+
 ///
 /// I/O events data matches (32 or 64 bits).
 ///
@@ -446,6 +451,15 @@ pub trait Vm: Send + Sync + Any {
     fn init(&self) -> Result<()> {
         Ok(())
     }
+
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    fn uses_guest_mp_wakeup(&self) -> bool {
+        false
+    }
+    #[cfg(feature = "themis")]
+    fn shared_device_memory(&self) -> Option<SharedDeviceMemory> {
+        None
+    }
     /// Pause the VM
     fn pause(&self) -> Result<()> {
         Ok(())
@@ -496,6 +510,14 @@ pub trait VmOps: Send + Sync {
     fn guest_mem_read(&self, gpa: u64, buf: &mut [u8]) -> Result<usize>;
     fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> Result<()>;
     fn mmio_write(&self, gpa: u64, data: &[u8]) -> Result<()>;
+    #[cfg(feature = "themis")]
+    fn device_mmio_read(&self, gpa: u64, data: &mut [u8]) -> Result<()> {
+        self.mmio_read(gpa, data)
+    }
+    #[cfg(feature = "themis")]
+    fn device_mmio_write(&self, gpa: u64, data: &[u8]) -> Result<()> {
+        self.mmio_write(gpa, data)
+    }
     #[cfg(target_arch = "x86_64")]
     fn pio_read(&self, port: u64, data: &mut [u8]) -> Result<()>;
     #[cfg(target_arch = "x86_64")]

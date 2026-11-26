@@ -4231,6 +4231,8 @@ impl DeviceManager {
         }
 
         let memory = self.memory_manager.lock().unwrap().guest_memory();
+        #[cfg(feature = "themis")]
+        let memory = self.address_manager.vm.shared_device_memory().unwrap_or(memory);
 
         // Map DMA ranges if a DMA handler is available and if the device is
         // not attached to a virtual IOMMU.
@@ -4478,9 +4480,7 @@ impl DeviceManager {
                 loop {
                     match doorbell_clone.read() {
                         Ok(count) => {
-                            eprintln!(
-                                "\r[IVSHMEM] doorbell[{dev_idx}] rang! (count={count})"
-                            );
+                            debug!("ivshmem[{dev_idx}] doorbell count={count}");
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(std::time::Duration::from_millis(10));

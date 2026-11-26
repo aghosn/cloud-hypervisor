@@ -28,19 +28,48 @@ const fn ioctl_io(ty: u8, nr: u8) -> c_ulong {
     ioctl_code(0, ty, nr, 0)
 }
 
-pub(super) const THHV_CREATE_PARTITION: c_ulong = ioctl_iowr::<ThhvCreatePartition>(THHV_IOCTL_MAGIC, 0x01);
-pub(super) const THHV_QUERY: c_ulong = ioctl_iowr::<ThhvQuery>(THHV_IOCTL_MAGIC, 0x03);
-pub(super) const THHV_INITIALIZE_PARTITION: c_ulong = ioctl_io(THHV_IOCTL_MAGIC, 0x10);
-pub(super) const THHV_CREATE_VP: c_ulong = ioctl_iowr::<ThhvCreateVp>(THHV_IOCTL_MAGIC, 0x11);
-pub(super) const THHV_SET_GUEST_MEMORY: c_ulong = ioctl_iow::<ThhvSetGuestMemory>(THHV_IOCTL_MAGIC, 0x12);
-pub(super) const THHV_IRQFD: c_ulong = ioctl_iow::<ThhvIrqfd>(THHV_IOCTL_MAGIC, 0x13);
-pub(super) const THHV_IOEVENTFD: c_ulong = ioctl_iow::<ThhvIoeventfd>(THHV_IOCTL_MAGIC, 0x14);
-pub(super) const THHV_SEND_SHARED_META: c_ulong = ioctl_iow::<ThhvInitializePartition>(THHV_IOCTL_MAGIC, 0x17);
-pub(super) const THHV_RUN_VP: c_ulong = ioctl_iowr::<ThhvRunVp>(THHV_IOCTL_MAGIC, 0x20);
-pub(super) const THHV_GET_VP_STATE: c_ulong = ioctl_iowr::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x21);
-pub(super) const THHV_SET_VP_STATE: c_ulong = ioctl_iow::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x22);
-pub(super) const THHV_INJECT_INTERRUPT: c_ulong = ioctl_iow::<ThhvInjectInterrupt>(THHV_IOCTL_MAGIC, 0x19);
-pub(super) const THHV_SET_POLICY: c_ulong = ioctl_iow::<ThhvSetPolicy>(THHV_IOCTL_MAGIC, 0x1a);
+pub const THHV_CREATE_PARTITION: c_ulong =
+    ioctl_iowr::<ThhvCreatePartition>(THHV_IOCTL_MAGIC, 0x01);
+pub const THHV_QUERY: c_ulong = ioctl_iowr::<ThhvQuery>(THHV_IOCTL_MAGIC, 0x03);
+pub const THHV_CREATE_DOORBELL: c_ulong = ioctl_iowr::<ThhvCreateDoorbell>(THHV_IOCTL_MAGIC, 0x07);
+pub const THHV_DOORBELL_EVENTFD: c_ulong = ioctl_iow::<ThhvDoorbellEventfd>(THHV_IOCTL_MAGIC, 0x08);
+pub const THHV_SEND_CAP: c_ulong = ioctl_iow::<ThhvSendCap>(THHV_IOCTL_MAGIC, 0x1b);
+pub const THHV_INITIALIZE_PARTITION: c_ulong = ioctl_io(THHV_IOCTL_MAGIC, 0x10);
+pub const THHV_CREATE_VP: c_ulong = ioctl_iowr::<ThhvCreateVp>(THHV_IOCTL_MAGIC, 0x11);
+pub const THHV_SET_GUEST_MEMORY: c_ulong = ioctl_iow::<ThhvSetGuestMemory>(THHV_IOCTL_MAGIC, 0x12);
+pub const THHV_IRQFD: c_ulong = ioctl_iow::<ThhvIrqfd>(THHV_IOCTL_MAGIC, 0x13);
+pub const THHV_SEND_SHARED_META: c_ulong =
+    ioctl_iow::<ThhvInitializePartition>(THHV_IOCTL_MAGIC, 0x17);
+pub const THHV_RUN_VP: c_ulong = ioctl_iowr::<ThhvRunVp>(THHV_IOCTL_MAGIC, 0x20);
+pub const THHV_GET_VP_STATE: c_ulong = ioctl_iowr::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x21);
+pub const THHV_SET_VP_STATE: c_ulong = ioctl_iow::<ThhvVpRegisters>(THHV_IOCTL_MAGIC, 0x22);
+pub const THHV_INJECT_INTERRUPT: c_ulong = ioctl_iow::<ThhvInjectInterrupt>(THHV_IOCTL_MAGIC, 0x19);
+pub const THHV_SET_POLICY: c_ulong = ioctl_iow::<ThhvSetPolicy>(THHV_IOCTL_MAGIC, 0x1a);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ThhvCreateDoorbell {
+    pub kind: u64,
+    pub vp: u64,
+    pub handle: u64,
+    pub port: u64,
+    pub recipient: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ThhvDoorbellEventfd {
+    pub port: u64,
+    pub fd: i32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ThhvSendCap {
+    pub handle: u64,
+    pub attrs: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -121,19 +150,9 @@ pub(super) struct ThhvIrqfd {
     pub fd: i32,
     pub gsi: u32,
     pub flags: u32,
-    pub vector: u32,     // MSI vector to inject (0 = use gsi as vector)
-    pub vp_index: u32,   // Target VP for injection (0 = BSP)
+    pub vector: u32,   // MSI vector to inject (0 = use gsi as vector)
+    pub vp_index: u32, // Target VP for injection (0 = BSP)
     pub rsvd: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ThhvIoeventfd {
-    pub fd: i32,
-    pub flags: u32,
-    pub addr: u64,
-    pub len: u32,
-    pub datamatch: u32,
 }
 
 #[repr(C)]
@@ -192,7 +211,7 @@ pub(super) struct ThemicMessageHeader {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ThemicInterceptMessage {
     pub header: ThemicMessageHeader,
     pub exit_reason: u32,
@@ -212,31 +231,6 @@ pub(super) struct ThemicInterceptMessage {
     pub msr_number: u32,
     pub rsvd2: u32,
     pub msr_value: u64,
-}
-
-impl Default for ThemicInterceptMessage {
-    fn default() -> Self {
-        Self {
-            header: ThemicMessageHeader::default(),
-            exit_reason: 0,
-            instruction_length: 0,
-            exit_qualification: 0,
-            guest_physical_address: 0,
-            guest_rip: 0,
-            guest_rflags: 0,
-            port_number: 0,
-            access_size: 0,
-            is_write: 0,
-            reserved: 0,
-            rax: 0,
-            instruction_bytes: [0; 16],
-            cpuid_rax: 0,
-            cpuid_rcx: 0,
-            msr_number: 0,
-            rsvd2: 0,
-            msr_value: 0,
-        }
-    }
 }
 
 // ── Public state types referenced from `crate::CpuState` / `IrqRoutingEntry` ──

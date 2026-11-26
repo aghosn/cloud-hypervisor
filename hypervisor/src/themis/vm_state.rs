@@ -1,7 +1,7 @@
 //! Per-VM state shared between `ThemisVm` and its `ThemisVcpu`s.
 //!
 //! Holds the THHV partition fd, mmap'd meta pages, deferred-init queues
-//! (memory regions, ioeventfds), per-vCPU LAPIC software state, and the
+//! (memory regions), userspace I/O event matching, per-vCPU LAPIC state, and the
 //! interposition-policy bookkeeping pushed before sealing the partition.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -15,14 +15,17 @@ use super::consts::*;
 use super::helpers::{ioctl_noarg, ioctl_with_mut_ref};
 use super::mmap::MmapRegion;
 use super::policy_walker::{
-    hypervisor_range_native_segments, walk_cpuid_emulates, walk_exits, walk_interrupts, walk_msrs,
-    PolicyOp, WalkContext,
+    PolicyOp, WalkContext, cpuid_policy_ranges, cpuid_range_segments, walk_api, walk_cpuid,
+    walk_exits, walk_interrupts, walk_msrs,
 };
 use crate::arch::x86::CpuIdEntry;
 
 pub(crate) struct ThemisVmState {
     pub fd: Arc<OwnedFd>,
     pub initialized: Mutex<bool>,
+    pub initialization_failed: Mutex<bool>,
+    pub pv: std::sync::OnceLock<super::pv::PvResources>,
+    pub device_memory: crate::vm::SharedDeviceMemory,
     /// Whether the per-domain MSR interposition policy has been pushed to
     /// the capa engine. Pushed lazily but **before** the first
     /// `THHV_CREATE_VP`, because capavisor's `do_add_vp` builds the VMCS
@@ -35,9 +38,6 @@ pub(crate) struct ThemisVmState {
     pub page_size: usize,
     pub vp_meta_pages: usize,
     pub _shared_meta: MmapRegion,
-    /// APIC-access sentinel page mapped at GPA 0xFEE00000 in the child domain.
-    /// Kept alive here so the pinned page is not freed while the domain runs.
-    pub _apic_access: MmapRegion,
     /// EventFd for the periodic timer interrupt injection.
     /// Kept alive so the IRQFd registration in thhv.ko remains valid.
     pub _timer_eventfd: Mutex<Option<EventFd>>,
@@ -58,16 +58,12 @@ pub(crate) struct ThemisVmState {
     /// Used when VIRTUALIZE_APIC_ACCESSES is not available: LAPIC MMIO
     /// accesses cause EPT violations that are emulated here in software.
     pub lapic_regs: Mutex<Vec<[u32; 1024]>>,
-    /// CPUID entries to push as interposition Emulate policy before sealing.
-    /// Populated by the first vCPU's set_cpuid2() call.
-    pub cpuid_entries: Mutex<Vec<CpuIdEntry>>,
+    /// CPUID entries by VP index, pushed as scoped policy before sealing.
+    pub cpuid_entries: Mutex<Vec<Vec<CpuIdEntry>>>,
     /// ivshmem BAR addresses for CPUID leaf 0x40000004 (Emulate override).
     /// Each entry: (index, bar0_gpa, bar2_gpa).
     pub ivshmem_bars: Mutex<Vec<(u32, u64, u64)>>,
-    /// IOEVENTFDs deferred until ensure_initialized().  The THHV_IOEVENTFD
-    /// ioctl calls REGISTER_DOORBELL which needs the child domain to exist
-    /// (after creation) but must happen before seal.
-    pub pending_ioeventfds: Mutex<Vec<(ThhvIoeventfd, EventFd)>>,
+    pub ioevents: Mutex<super::ioevent::IoEvents>,
     /// VTOM bit position (MAXPHYADDR - 1). Used to strip the VTOM bit from
     /// MMIO GPAs when the CoCo kernel marks device accesses as shared.
     pub vtom_bit: u32,
@@ -82,12 +78,6 @@ pub(crate) struct ThemisVmState {
 }
 
 impl ThemisVmState {
-    /// Known shared regions in a confidential guest.  These need ALIAS slots
-    /// (parent retains access) instead of CARVE, plus a vTOM mirror ALIAS.
-    const SHARED_REGIONS: &'static [(u64, u64)] = &[
-        (0xA0000, 0x100000), // EBDA / legacy ACPI firmware area
-    ];
-
     /// Split pending memory regions for confidential mode.
     ///
     /// Any region that overlaps a known shared area is split into up to 3 parts:
@@ -100,7 +90,20 @@ impl ThemisVmState {
     pub(super) fn split_confidential_regions(
         regions: &[ThhvSetGuestMemory],
         vtom_bit: u32,
-    ) -> Vec<ThhvSetGuestMemory> {
+        shared: &[super::config::SharedRegion],
+    ) -> anyhow::Result<Vec<ThhvSetGuestMemory>> {
+        let limit = 1u64
+            .checked_shl(vtom_bit)
+            .ok_or_else(|| anyhow::anyhow!("invalid vTOM bit"))?;
+        for region in shared {
+            anyhow::ensure!(
+                region
+                    .gpa
+                    .checked_add(region.size)
+                    .is_some_and(|end| end <= limit),
+                "shared region exceeds private GPA address space",
+            );
+        }
         let all_rights = THHV_MEM_R_READ | THHV_MEM_R_WRITE | THHV_MEM_R_EXEC;
         let mut out = Vec::new();
 
@@ -116,7 +119,9 @@ impl ThemisVmState {
 
             // Collect shared sub-ranges that overlap this region.
             let mut cuts: Vec<(u64, u64)> = Vec::new();
-            for &(s_start, s_end) in Self::SHARED_REGIONS {
+            for shared in shared {
+                let s_start = shared.gpa;
+                let s_end = s_start + shared.size;
                 let lo = s_start.max(r_start);
                 let hi = s_end.min(r_end);
                 if lo < hi {
@@ -193,7 +198,7 @@ impl ThemisVmState {
             }
         }
 
-        out
+        Ok(out)
     }
 
     /// Push the per-domain MSR interposition policy to the capa engine.
@@ -232,9 +237,11 @@ impl ThemisVmState {
         // module produces the exact stream that used to be hardcoded here;
         // see `policy_walker::tests` for the byte-identical regression
         // check on the default profiles.
-        let ctx = WalkContext { vtom_bit: self.vtom_bit };
-        let baseline_ops = walk_msrs(&self.themis_config, ctx)
-            .context("themis config: walk MSR policy")?;
+        let ctx = WalkContext {
+            vtom_bit: self.vtom_bit,
+        };
+        let baseline_ops =
+            walk_msrs(&self.themis_config, ctx).context("themis config: walk MSR policy")?;
         for op in &baseline_ops {
             self.emit_policy_op(op)?;
         }
@@ -270,7 +277,13 @@ impl ThemisVmState {
         if x2apic_virt {
             self.set_policy(policy_kind::MSR_RANGE, 0x800, 0x82F, 1)?; // Native
             self.set_policy(policy_kind::MSR_RANGE, 0x830, 0x830, 0)?; // Trap (ICR)
-            self.set_policy(policy_kind::MSR_RANGE, 0x831, 0x83F, 1)?; // Native
+            if self.themis_config.general.uses_pv_devices() {
+                self.set_policy(policy_kind::MSR_RANGE, 0x831, 0x83F, 1)?;
+            } else {
+                self.set_policy(policy_kind::MSR_RANGE, 0x831, 0x831, 1)?;
+                self.set_policy(policy_kind::MSR_RANGE, 0x832, 0x832, 0)?; // Trap timer LVT
+                self.set_policy(policy_kind::MSR_RANGE, 0x833, 0x83F, 1)?;
+            }
 
             // IA32_APIC_BASE (0x1B): Emulate.  Stored value advertises the
             // architectural LAPIC base with EN (bit 11) and EXTD (bit 10) set
@@ -298,8 +311,8 @@ impl ThemisVmState {
             )?;
         }
 
-        eprintln!(
-            "\r[THEMIS-DBG] pushed MSR policy: {} baseline op(s) from config, x2apic_virt={}",
+        log::debug!(
+            "Themis pushed MSR policy: {} baseline op(s), x2apic_virt={}",
             baseline_ops.len(),
             x2apic_virt
         );
@@ -312,50 +325,166 @@ impl ThemisVmState {
         if *initialized {
             return Ok(());
         }
+        {
+            let mut failed = self.initialization_failed.lock().unwrap();
+            if *failed {
+                anyhow::bail!("previous Themis initialization failed; recreate the partition");
+            }
+            *failed = true;
+        }
+
+        let api_op = walk_api(&self.themis_config).context("themis config: walk API policy")?;
+        let exit_ops =
+            walk_exits(&self.themis_config).context("themis config: walk VMEXIT policy")?;
+        let interrupt_ops =
+            walk_interrupts(&self.themis_config).context("themis config: walk interrupt policy")?;
+        let ctx = WalkContext {
+            vtom_bit: self.vtom_bit,
+        };
+        let (cpuid_emulate_ops, config_emulate_leaves) =
+            walk_cpuid(&self.themis_config, ctx).context("themis config: walk CPUID overrides")?;
 
         // Flush all deferred SET_GUEST_MEMORY calls before sealing.
         // After this point dom0 loses EPT access to dom1's guest pages.
         let raw_regions: Vec<ThhvSetGuestMemory> =
             self.pending_memory.lock().unwrap().drain(..).collect();
 
+        let bits = if self.confidential {
+            self.vtom_bit
+        } else {
+            (core::arch::x86_64::__cpuid(0x80000008).eax & 0xFF).min(48)
+        };
+        let limit = 1u64
+            .checked_shl(bits)
+            .ok_or_else(|| anyhow::anyhow!("invalid GPA width"))?;
+        let mut occupied = raw_regions
+            .iter()
+            .map(|r| {
+                let gpa = r
+                    .guest_pfn
+                    .checked_mul(themis_abi::pv::PAGE_SIZE as u64)
+                    .ok_or_else(|| anyhow::anyhow!("guest memory GPA overflow"))?;
+                themis_abi::pv::descriptor::range_end(gpa, r.size, limit)
+                    .map_err(|e| anyhow::anyhow!("invalid guest memory range: {e:?}"))?;
+                Ok((gpa, r.size))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        occupied.push((
+            super::consts::LAPIC_MMIO_BASE,
+            themis_abi::pv::PAGE_SIZE as u64,
+        ));
+
         // In confidential mode, split regions around known shared areas (EBDA/ACPI).
         // Shared regions become ALIAS slots (+ vTOM mirror), the rest stays CARVE.
-        let regions = if self.confidential {
-            Self::split_confidential_regions(&raw_regions, self.vtom_bit)
+        let mut regions = if self.confidential {
+            Self::split_confidential_regions(
+                &raw_regions,
+                self.vtom_bit,
+                self.themis_config.general.shared_regions(),
+            )?
         } else {
             raw_regions
         };
 
-        eprintln!("\r[THEMIS-DBG] ensure_initialized: flushing {} memory regions", regions.len());
+        let num_vps = {
+            let fds = self.vp_fds.lock().unwrap();
+            if fds.iter().any(|&fd| fd < 0) {
+                anyhow::bail!("PV launch requires contiguous created VP indices");
+            }
+            fds.len() as u32
+        };
+        if let Some(mut pv) =
+            super::pv::PvResources::prepare(&self.themis_config, num_vps, &occupied, limit)?
+        {
+            let pv_start = u64::from(themis_abi::cpuid::LEAF_PV) << 32;
+            let pv_end = pv_start | u64::from(u32::MAX);
+            if cpuid_policy_ranges(&cpuid_emulate_ops)
+                .iter()
+                .any(|&(lo, hi)| lo <= pv_end && pv_start <= hi)
+                || self
+                    .cpuid_entries
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .any(|e| e.function == themis_abi::cpuid::LEAF_PV)
+            {
+                anyhow::bail!("PV discovery CPUID leaf conflicts with configured entries");
+            }
+            for entry in &self.themis_config.policies.cpuid.overrides {
+                let conflicts = if entry.leaf == Some(themis_abi::cpuid::LEAF_PV) {
+                    true
+                } else if let Some(
+                    [
+                        super::config::CpuidCoord::Pair(start),
+                        super::config::CpuidCoord::Pair(end),
+                    ],
+                ) = &entry.range
+                {
+                    let lo = super::policy_walker::resolve_scalar(&start[0], ctx)?;
+                    let hi = super::policy_walker::resolve_scalar(&end[0], ctx)?;
+                    (lo..=hi).contains(&u64::from(themis_abi::cpuid::LEAF_PV))
+                } else {
+                    false
+                };
+                if conflicts {
+                    anyhow::bail!("PV discovery CPUID leaf overlaps an explicit policy override");
+                }
+            }
+            pv.register_doorbells(self.fd.as_raw_fd(), limit)?;
+            if self.themis_config.general.uses_pv_devices() {
+                self.device_memory
+                    .lock()
+                    .unwrap()
+                    .replace(pv.device_memory()?);
+            }
+            regions.extend(pv.memory_regions(if self.confidential {
+                1u64 << self.vtom_bit
+            } else {
+                0
+            }));
+            self.pv
+                .set(pv)
+                .map_err(|_| anyhow::anyhow!("PV resources already initialized"))?;
+        }
+
+        log::debug!("Themis flushing {} memory regions", regions.len());
         for (i, mut region) in regions.iter().cloned().enumerate() {
-            let kind = if region.flags & THHV_MEM_F_ALIAS != 0 { "ALIAS" } else { "CARVE" };
+            let kind = if region.flags & THHV_MEM_F_ALIAS != 0 {
+                "ALIAS"
+            } else {
+                "CARVE"
+            };
             let shmem_info = if region.shmem_mode != 0 {
                 let path = std::str::from_utf8(&region.shmem_path)
                     .unwrap_or("<invalid>")
                     .trim_end_matches('\0');
-                format!(" shmem_mode={} count={} path=\"{}\"",
-                    region.shmem_mode, region.shmem_count, path)
+                format!(
+                    " shmem_mode={} count={} path=\"{}\"",
+                    region.shmem_mode, region.shmem_count, path
+                )
             } else {
                 String::new()
             };
-            eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] gfn=0x{:x} size=0x{:x} {kind}{shmem_info}",
-                region.guest_pfn, region.size);
+            log::debug!(
+                "Themis SET_GUEST_MEMORY[{i}] gfn=0x{:x} size=0x{:x} {kind}{shmem_info}",
+                region.guest_pfn,
+                region.size
+            );
             ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_SET_GUEST_MEMORY, &mut region)
                 .context("deferred THHV_SET_GUEST_MEMORY failed")?;
-            eprintln!("\r[THEMIS-DBG] SET_GUEST_MEMORY[{i}] done");
+            log::debug!("Themis SET_GUEST_MEMORY[{i}] done");
         }
 
         // Apply the config's VMEXIT routing before sealing. Previously the
         // JSON parser accepted `policies.exits`, but no THHV_SET_POLICY calls
         // were emitted, so every child silently retained the engine's
         // trap-all default.
-        let exit_ops =
-            walk_exits(&self.themis_config).context("themis config: walk VMEXIT policy")?;
         for op in &exit_ops {
             self.emit_policy_op(op)?;
         }
-        eprintln!(
-            "\r[THEMIS-DBG] pushed VMEXIT policy: {} op(s) from config",
+        log::debug!(
+            "Themis pushed VMEXIT policy: {} op(s) from config",
             exit_ops.len()
         );
 
@@ -364,13 +493,11 @@ impl ThemisVmState {
         // but never projected into THHV_SET_POLICY calls, so every child
         // domain's InterruptPolicy silently stayed at the engine's
         // `new_restricted()` default regardless of the JSON policy file.
-        let interrupt_ops = walk_interrupts(&self.themis_config)
-            .context("themis config: walk interrupt policy")?;
         for op in &interrupt_ops {
             self.emit_policy_op(op)?;
         }
-        eprintln!(
-            "\r[THEMIS-DBG] pushed interrupt policy: {} op(s) from config",
+        log::debug!(
+            "Themis pushed interrupt policy: {} op(s) from config",
             interrupt_ops.len()
         );
 
@@ -380,13 +507,6 @@ impl ThemisVmState {
         // Word 1: value = (ecx << 32) | edx — updates remaining fields.
         // Key encodes (leaf << 32 | subleaf), sub_key = word index.
         //
-        // Patch leaf 1 ECX bit 21 (X2APIC) to 1 unconditionally — children
-        // are pinned to x2APIC mode by the VMCS controls (see
-        // vmcs/controls.rs and the MSR_EMULATE(0x1B) policy above).  The
-        // bit is normally set on modern Intel hosts, but the capa engine
-        // is the only source of truth for the guest's CPUID, so we force
-        // it here to keep the policy self-consistent independent of host
-        // CPUID quirks.
         // Patch leaf 1 ECX bit 21 (X2APIC) to 1 only when capavisor
         // advertises FEATURE_X2APIC_VIRT and we therefore pushed the
         // x2APIC MSR policy in ensure_msr_policy_pushed.  Forcing the bit
@@ -394,26 +514,12 @@ impl ThemisVmState {
         // x2APIC ops with no hardware virtualization, #GP'ing on the
         // first RDMSR 0x802.
         let x2apic_virt = themis_x2apic_virt_supported();
-        let mut cpuid_entries: Vec<CpuIdEntry> =
-            self.cpuid_entries.lock().unwrap().clone();
+        let mut cpuid_entries = self.cpuid_entries.lock().unwrap().clone();
         if x2apic_virt {
-            for entry in cpuid_entries.iter_mut() {
+            for entry in cpuid_entries.iter_mut().flatten() {
                 if entry.function == 1 && entry.index == 0 {
                     entry.ecx |= 1 << 21; // X2APIC
                 }
-            }
-        }
-        if !cpuid_entries.is_empty() {
-            eprintln!(
-                "\r[THEMIS-DBG] pushing {} CPUID entries as Emulate policy",
-                cpuid_entries.len()
-            );
-            for entry in &cpuid_entries {
-                let key = ((entry.function as u64) << 32) | (entry.index as u64);
-                let word0 = ((entry.eax as u64) << 32) | (entry.ebx as u64);
-                let word1 = ((entry.ecx as u64) << 32) | (entry.edx as u64);
-                self.set_policy(policy_kind::CPUID_EMULATE, key, 0, word0)?;
-                self.set_policy(policy_kind::CPUID_EMULATE, key, 1, word1)?;
             }
         }
 
@@ -424,10 +530,7 @@ impl ThemisVmState {
         let ivshmem_bars = self.ivshmem_bars.lock().unwrap().clone();
         if !ivshmem_bars.is_empty() {
             let count = ivshmem_bars.len() as u32;
-            eprintln!(
-                "\r[THEMIS-DBG] pushing {} ivshmem CPUID entries (leaf 0x40000004)",
-                count
-            );
+            log::debug!("Themis pushing {count} ivshmem CPUID entries (leaf 0x40000004)");
             for &(index, bar0_gpa, bar2_gpa) in &ivshmem_bars {
                 let leaf: u64 = (0x40000004_u64 << 32) | (index as u64);
                 let eax = bar0_gpa as u32;
@@ -438,9 +541,7 @@ impl ThemisVmState {
                 let word1 = ((ecx as u64) << 32) | (edx as u64);
                 self.set_policy(policy_kind::CPUID_EMULATE, leaf, 0, word0)?;
                 self.set_policy(policy_kind::CPUID_EMULATE, leaf, 1, word1)?;
-                eprintln!(
-                    "\r[THEMIS-DBG]   ivshmem[{index}]: bar0=0x{bar0_gpa:x} bar2=0x{bar2_gpa:x}"
-                );
+                log::debug!("Themis ivshmem[{index}]: bar0=0x{bar0_gpa:x} bar2=0x{bar2_gpa:x}");
             }
         }
 
@@ -448,49 +549,43 @@ impl ThemisVmState {
         // can discover the capavisor.  The capavisor handles these natively
         // (signature, features, domcomm, limits, etc.).
         //
-        // We must split the Native range around any Emulate leaves (ivshmem,
-        // CoCo detection) because the engine rejects overlapping entries.
-        // Collect Emulate leaf numbers (from both runtime injections and the
-        // config-declared Emulate overrides), then delegate the split to
-        // `policy_walker::hypervisor_range_native_segments`.
-        //
-        // CPUID_RANGE encoding: key = (start_leaf << 32) | start_sub,
-        //                       sub_key = (end_leaf << 32) | end_sub,
-        //                       value = 1 (Native).
-        //
-        // Config-declared Emulate overrides (e.g. CoCo detection leaf
-        // 0x40000100 in `confidential.json`) are pushed BEFORE the Native
-        // range segments so the seal-time stream stays in the same order as
-        // the pre-refactor implementation: [runtime CPUID entries, ivshmem
-        // BARs, Native ranges (split), config-declared CPUID Emulate
-        // overrides].
-        //
-        // For the confidential default profile this reproduces the exact
-        // sequence of `THHV_SET_POLICY` ops that used to be hardcoded
-        // (see `policy_walker::tests::confidential_default_...`).
-        let ctx = WalkContext { vtom_bit: self.vtom_bit };
-        let (cpuid_emulate_ops, config_emulate_leaves) =
-            walk_cpuid_emulates(&self.themis_config, ctx)
-                .context("themis config: walk CPUID Emulate overrides")?;
+        // The engine rejects overlapping entries. Exclude runtime discovery
+        // leaves and every configured override from the automatic Native range.
 
         let range_start: u32 = 0x40000000;
         let range_end: u32 = 0x4FFFFFFF;
         let mut emulate_leaves: Vec<u32> = Vec::new();
+        if let Some(pv) = self.pv.get() {
+            let key = u64::from(themis_abi::cpuid::LEAF_PV) << 32;
+            let word0 = ((pv.descriptor_gpa as u32 as u64) << 32) | (pv.descriptor_gpa >> 32);
+            let word1 = ((themis_abi::pv::PAGE_SIZE as u64) << 32)
+                | u64::from(themis_abi::pv::descriptor::VERSION);
+            self.set_policy(policy_kind::CPUID_EMULATE, key, 0, word0)?;
+            self.set_policy(policy_kind::CPUID_EMULATE, key, 1, word1)?;
+            let identity = key | u64::from(themis_abi::cpuid::PV_SUBLEAF_IDENTITY);
+            self.set_policy(policy_kind::CPUID_RANGE, identity, identity, 1)?;
+            emulate_leaves.push(themis_abi::cpuid::LEAF_PV);
+        }
         if !ivshmem_bars.is_empty() {
             emulate_leaves.push(0x40000004);
         }
         emulate_leaves.extend(config_emulate_leaves.iter().copied());
 
         if self.themis_config.policies.cpuid.hypervisor_range_native {
-            for (lo, hi) in
-                hypervisor_range_native_segments(range_start, range_end, emulate_leaves.clone())
-            {
-                let s: u64 = (lo as u64) << 32;
-                let e: u64 = ((hi as u64) << 32) | 0xFFFFFFFF;
-                self.set_policy(policy_kind::CPUID_RANGE, s, e, 1)?;
+            let mut excluded = cpuid_policy_ranges(&cpuid_emulate_ops);
+            excluded.extend(emulate_leaves.iter().map(|&leaf| {
+                let start = u64::from(leaf) << 32;
+                (start, start | u64::from(u32::MAX))
+            }));
+            for (lo, hi) in cpuid_range_segments(
+                u64::from(range_start) << 32,
+                (u64::from(range_end) << 32) | u64::from(u32::MAX),
+                &excluded,
+            ) {
+                self.set_policy(policy_kind::CPUID_RANGE, lo, hi, 1)?;
             }
-            eprintln!(
-                "\r[THEMIS-DBG] pushed Native CPUID ranges (split around {} emulate leaves)",
+            log::debug!(
+                "Themis pushed Native CPUID ranges (split around {} emulate leaves)",
                 emulate_leaves.len()
             );
         }
@@ -502,10 +597,23 @@ impl ThemisVmState {
             self.emit_policy_op(op)?;
         }
         if !cpuid_emulate_ops.is_empty() {
-            eprintln!(
-                "\r[THEMIS-DBG] pushed {} CPUID Emulate op(s) from themis config",
+            log::debug!(
+                "Themis pushed {} CPUID policy op(s) from config",
                 cpuid_emulate_ops.len()
             );
+        }
+
+        // Install common discovery/configuration first: each explicit VP
+        // CPUID category starts from that complete domain baseline.
+        for (vp, entries) in cpuid_entries.iter().enumerate() {
+            log::debug!(
+                "Themis VP {vp} pre-seal CPUID table: {} entries ({} flagged)",
+                entries.len(),
+                entries.iter().filter(|entry| entry.flags != 0).count()
+            );
+        }
+        for op in super::policy_walker::walk_vp_cpuid(&cpuid_entries, &cpuid_emulate_ops)? {
+            self.emit_policy_op(&op)?;
         }
 
         // ── MSR interposition policy ───────────────────────────────────
@@ -518,25 +626,13 @@ impl ThemisVmState {
         // default (Trap) is projected, every MSR exits, and boot dies.
         self.ensure_msr_policy_pushed()?;
 
-        // Flush deferred IOEVENTFDs — registers doorbells with capavisor.
-        // Must happen after domain creation but before seal.
-        {
-            let pending = self.pending_ioeventfds.lock().unwrap().drain(..).collect::<Vec<_>>();
-            for (mut ioevent, _owner) in pending {
-                eprintln!(
-                    "\r[THEMIS-DBG] deferred IOEVENTFD addr=0x{:x} fd={}",
-                    ioevent.addr, ioevent.fd
-                );
-                ioctl_with_mut_ref(self.fd.as_raw_fd(), THHV_IOEVENTFD, &mut ioevent)
-                    .context("deferred THHV_IOEVENTFD failed")?;
-            }
-        }
-
-        eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION (seal)...");
+        self.emit_policy_op(&api_op)?;
+        log::debug!("Themis INITIALIZE_PARTITION (seal)...");
         ioctl_noarg(self.fd.as_raw_fd(), THHV_INITIALIZE_PARTITION)
             .context("failed to initialize Themis partition")?;
-        eprintln!("\r[THEMIS-DBG] INITIALIZE_PARTITION done");
+        log::debug!("Themis INITIALIZE_PARTITION done");
         *initialized = true;
+        *self.initialization_failed.lock().unwrap() = false;
 
         // LAPIC timer emulation is set up per-vCPU in create_vcpu():
         // timerfd + irqfd + background thread.  WRMSR 0x6E0 exits
@@ -547,7 +643,13 @@ impl ThemisVmState {
     }
 
     /// Unified policy-setting ioctl — wraps THHV_SET_POLICY.
-    pub(super) fn set_policy(&self, kind: u64, key: u64, sub_key: u64, value: u64) -> anyhow::Result<()> {
+    pub(super) fn set_policy(
+        &self,
+        kind: u64,
+        key: u64,
+        sub_key: u64,
+        value: u64,
+    ) -> anyhow::Result<()> {
         let mut sp = ThhvSetPolicy {
             kind,
             key,
@@ -585,14 +687,87 @@ fn themis_x2apic_virt_supported() -> bool {
     }
     // SAFETY: CPUID is unprivileged. Capavisor intercepts the Themis leaf
     // range and synthesises the response.
-    let supported = unsafe {
-        let r = std::arch::x86_64::__cpuid(themis_abi::cpuid::LEAF_FEATURES);
-        (r.eax & themis_abi::cpuid::feature_bits::FEATURE_X2APIC_VIRT) != 0
-    };
+    let r = std::arch::x86_64::__cpuid(themis_abi::cpuid::LEAF_FEATURES);
+    let supported = (r.eax & themis_abi::cpuid::feature_bits::FEATURE_X2APIC_VIRT) != 0;
     CACHED.store(if supported { 2 } else { 1 }, Ordering::Relaxed);
-    eprintln!(
-        "\r[THEMIS-DBG] Themis CPUID 0x40000001 -> FEATURE_X2APIC_VIRT={}",
-        supported
-    );
+    log::debug!("Themis CPUID 0x40000001 -> FEATURE_X2APIC_VIRT={supported}");
     supported
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confidential_split_uses_declared_ranges_and_honors_explicit_empty() {
+        let cfg = super::super::config::ThemisConfig::from_json_str(
+            r#"{"general":{"confidential":true,"shared_regions":[{"gpa":"0x3000","size":"0x2000"}]}}"#,
+        ).unwrap();
+        let input = [ThhvSetGuestMemory {
+            userspace_addr: 0x1000_0000,
+            size: 0x10_0000,
+            ..Default::default()
+        }];
+        let regions =
+            ThemisVmState::split_confidential_regions(&input, 39, cfg.general.shared_regions())
+                .unwrap();
+        let shared = regions
+            .iter()
+            .filter(|r| r.flags & THHV_MEM_F_ALIAS != 0)
+            .collect::<Vec<_>>();
+        assert_eq!(shared.len(), 2);
+        assert_eq!(
+            (shared[0].guest_pfn << 12, shared[0].size),
+            (0x3000, 0x2000)
+        );
+        assert_eq!(shared[1].guest_pfn << 12, (1 << 39) | 0x3000);
+        assert_eq!(shared[0].userspace_addr, 0x1000_3000);
+        assert!(
+            regions
+                .iter()
+                .any(|r| r.guest_pfn << 12 == 0x5000 && r.flags == 0)
+        );
+        let private = ThemisVmState::split_confidential_regions(&input, 39, &[]).unwrap();
+        assert_eq!(private.len(), 1);
+        assert_eq!(private[0].flags, 0);
+        ThemisVmState::split_confidential_regions(&input, 12, cfg.general.shared_regions())
+            .unwrap_err();
+    }
+
+    #[test]
+    fn confidential_ap_firmware_has_no_parent_alias_or_vtom_mirror() {
+        let host_base = 0x1000_0000;
+        let regions = ThemisVmState::split_confidential_regions(
+            &[ThhvSetGuestMemory {
+                userspace_addr: host_base,
+                size: 0x20_0000,
+                ..ThhvSetGuestMemory::default()
+            }],
+            39,
+            super::super::config::GeneralConfig::default().shared_regions(),
+        )
+        .unwrap();
+        let firmware = regions
+            .iter()
+            .find(|region| region.guest_pfn << 12 == 0xe8000)
+            .unwrap();
+        assert_eq!(firmware.size, 0x5000);
+        assert_eq!(firmware.flags, 0);
+        assert_eq!(firmware.userspace_addr, host_base + 0xe8000);
+
+        for region in &regions {
+            let start = region.guest_pfn << 12;
+            let end = start + region.size;
+            let mirror = 1u64 << 39;
+            assert!(end <= mirror + 0xe8000 || start >= mirror + 0xed000);
+            if region.flags & THHV_MEM_F_ALIAS != 0 {
+                assert!(end <= 0xe8000 || start >= 0xed000);
+            }
+        }
+        for gpa in [0xa0000, 0xed000, (1 << 39) | 0xa0000, (1 << 39) | 0xed000] {
+            assert!(regions.iter().any(|region| {
+                region.guest_pfn << 12 == gpa && region.flags & THHV_MEM_F_ALIAS != 0
+            }));
+        }
+    }
 }

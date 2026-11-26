@@ -26,7 +26,7 @@
 //! - [`emulator`]        — instruction emulation for trap-and-emulate paths.
 //! - [`abi`]             — THHV ioctl numbers + `Thhv*` wire structs.
 //! - [`consts`]          — flag/exit-reason/APIC bit definitions, plus
-//!                          re-exports of shared types from `themis-abi`.
+//!   re-exports of shared types from `themis-abi`.
 //! - [`mmap`]             — `MmapRegion` Send/Sync wrapper for shared meta/comm pages.
 //! - [`helpers`]          — register-tuple builders and ioctl wrappers.
 //! - [`vm_state`]         — deferred-initialization per-VM state.
@@ -41,15 +41,28 @@ mod config;
 mod consts;
 mod helpers;
 mod hypervisor_impl;
+mod ioevent;
 mod mmap;
 mod policy_walker;
+mod pv;
+mod timer;
 mod vcpu;
 mod vm_impl;
 mod vm_state;
 
-pub use abi::{shmem_mode, ThemisIrqRoutingEntry, ThemisStandardRegisters, VcpuThemisState};
-pub use config::{set_default_override, DefaultProfile, ThemisConfig, ThemisConfigError};
+pub use abi::{ThemisIrqRoutingEntry, ThemisStandardRegisters, VcpuThemisState, shmem_mode};
+pub use config::{DefaultProfile, ThemisConfig, ThemisConfigError, set_default_override};
 pub use consts::policy_kind;
 pub use hypervisor_impl::ThemisHypervisor;
 pub use vcpu::ThemisVcpu;
 pub use vm_impl::ThemisVm;
+
+/// Backend-derived ioctl numbers shared with the VMM seccomp filters.
+pub mod ioctl {
+    pub use super::abi::{
+        THHV_CREATE_DOORBELL, THHV_CREATE_PARTITION, THHV_CREATE_VP, THHV_DOORBELL_EVENTFD,
+        THHV_GET_VP_STATE, THHV_INITIALIZE_PARTITION, THHV_INJECT_INTERRUPT, THHV_IRQFD,
+        THHV_QUERY, THHV_RUN_VP, THHV_SEND_CAP, THHV_SEND_SHARED_META, THHV_SET_GUEST_MEMORY,
+        THHV_SET_POLICY, THHV_SET_VP_STATE,
+    };
+}

@@ -73,6 +73,10 @@ pub const EBDA_START: GuestAddress = GuestAddress(0xa0000);
 // ACPI RSDP table
 pub const RSDP_POINTER: GuestAddress = EBDA_START;
 
+/// Private direct-boot firmware for the ACPI multiprocessor wakeup mailbox.
+pub const MP_WAKEUP_START: GuestAddress = GuestAddress(0xe8000);
+pub const MP_WAKEUP_MAILBOX: GuestAddress = GuestAddress(0xe9000);
+
 pub const SMBIOS_START: u64 = 0xf0000; // First possible location per the spec.
 
 // == End of "EBDA" range ==
@@ -114,7 +118,7 @@ pub const TPM_SIZE: u64 = 0x1000;
 
 // IOAPIC
 pub const IOAPIC_START: GuestAddress = GuestAddress(0xfec0_0000);
-pub const IOAPIC_SIZE: u64 = 0x20;
+pub const IOAPIC_SIZE: u64 = 0x44;
 
 // APIC
 pub const APIC_START: GuestAddress = GuestAddress(0xfee0_0000);

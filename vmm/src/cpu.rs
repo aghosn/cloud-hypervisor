@@ -1078,6 +1078,15 @@ impl CpuManager {
             self.config.nested,
         )?;
 
+        #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+        if self.uses_guest_mp_wakeup() && vcpu.id > 0 && boot_setup.is_some() {
+            arch::mp_wakeup::configure_vcpu(
+                vcpu.vcpu.as_ref(),
+                get_x2apic_id(vcpu.id, Some(topology)),
+            )
+            .map_err(|e| Error::VcpuConfiguration(arch::Error::MpWakeup(e)))?;
+        }
+
         #[cfg(target_arch = "aarch64")]
         vcpu.configure(self.vm.as_ref(), boot_setup)?;
 
@@ -1708,6 +1717,11 @@ impl CpuManager {
         })
     }
 
+    #[cfg(all(feature = "themis", target_arch = "x86_64"))]
+    pub fn uses_guest_mp_wakeup(&self) -> bool {
+        self.config.boot_vcpus > 1 && self.vm.uses_guest_mp_wakeup()
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     pub fn create_madt(&self, #[cfg(target_arch = "aarch64")] vgic: Arc<Mutex<dyn Vgic>>) -> Sdt {
         use crate::acpi;
@@ -1754,6 +1768,11 @@ impl CpuManager {
                 gsi: 4,
                 flags: 0,
             });
+
+            #[cfg(feature = "themis")]
+            if self.uses_guest_mp_wakeup() {
+                madt.append_slice(&arch::mp_wakeup::madt_entry());
+            }
         }
 
         #[cfg(target_arch = "aarch64")]
